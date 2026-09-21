@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
-from openai import AsyncOpenAI
+from openai import OpenAI
 
 from .models import ModelRequest, ModelResponse, ModelRoute, ToolCall
 
@@ -88,12 +88,13 @@ class OpenAIChatTransport:
         kwargs: dict[str, Any] = {
             "api_key": api_key,
             "timeout": route.timeout_seconds,
+            "max_retries": 0,
         }
         if route.base_url:
             kwargs["base_url"] = route.base_url
-        self._client = AsyncOpenAI(**kwargs)
+        self._client = OpenAI(**kwargs)
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    def complete(self, request: ModelRequest) -> ModelResponse:
         kwargs: dict[str, Any] = {
             "model": self.route.model,
             "messages": request.messages,
@@ -101,7 +102,7 @@ class OpenAIChatTransport:
         if request.tools:
             kwargs["tools"] = request.tools
         try:
-            response = await self._client.chat.completions.create(**kwargs)
+            response = self._client.chat.completions.create(**kwargs)
             if not response.choices:
                 raise ProviderError(
                     "provider returned no choices",
@@ -133,9 +134,7 @@ class OpenAIChatTransport:
         except Exception as exc:
             raise normalize_provider_exception(exc) from exc
 
-    async def aclose(self) -> None:
+    def close(self) -> None:
         close = getattr(self._client, "close", None)
         if close is not None:
-            result = close()
-            if hasattr(result, "__await__"):
-                await result
+            close()

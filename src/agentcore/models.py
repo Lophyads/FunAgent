@@ -18,6 +18,22 @@ class RetryPolicy(StrictModel):
     max_retry_after_seconds: float = Field(default=10.0, ge=0, le=300)
 
 
+class WorkerPolicy(StrictModel):
+    turn_workers: int = Field(default=4, ge=1, le=64)
+    operation_workers: int = Field(default=8, ge=1, le=128)
+    queue_capacity: int = Field(default=128, ge=1, le=10_000)
+
+
+class TimeoutPolicy(StrictModel):
+    run_budget_seconds: float | None = Field(default=300.0, gt=0, le=86_400)
+    tool_seconds: float = Field(default=60.0, gt=0, le=3_600)
+    memory_seconds: float = Field(default=5.0, gt=0, le=300)
+    middleware_seconds: float = Field(default=2.0, gt=0, le=300)
+    policy_seconds: float = Field(default=30.0, gt=0, le=600)
+    review_schedule_seconds: float = Field(default=1.0, gt=0, le=300)
+    finalize_seconds: float = Field(default=5.0, gt=0, le=300)
+
+
 class ModelRoute(StrictModel):
     name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     provider: str = Field(min_length=1, max_length=80)
@@ -44,6 +60,8 @@ class AgentConfig(StrictModel):
     tool_result_max_chars: int = Field(default=32_768, ge=256, le=1_000_000)
     memory_max_chars: int = Field(default=4_000, ge=0, le=100_000)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    workers: WorkerPolicy = Field(default_factory=WorkerPolicy)
+    timeouts: TimeoutPolicy = Field(default_factory=TimeoutPolicy)
     routes: list[ModelRoute] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -91,6 +109,7 @@ class Message(StrictModel):
     tool_call_id: str | None = None
     tool_name: str | None = None
     finish_reason: str | None = None
+    effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
@@ -130,6 +149,15 @@ class TurnError(StrictModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class ToolOutcome(StrictModel):
+    tool_call_id: str
+    tool_name: str
+    state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"]
+    effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"]
+    error_type: str | None = None
+    may_still_be_running: bool = False
+
+
 class TurnResult(StrictModel):
     status: Literal["completed", "failed", "interrupted"]
     final_text: str | None = None
@@ -142,4 +170,8 @@ class TurnResult(StrictModel):
     warnings: list[str] = Field(default_factory=list)
     error: TurnError | None = None
     context_version: int
+    completion_reason: str = "unknown"
+    tool_outcomes: list[ToolOutcome] = Field(default_factory=list)
+    provider_attempts: int = 0
+    route_attempts: dict[str, int] = Field(default_factory=dict)
 

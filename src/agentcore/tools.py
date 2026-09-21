@@ -4,7 +4,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
@@ -12,7 +12,7 @@ from .interfaces import ToolContext
 
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
-ToolHandler = Callable[[ArgsT, ToolContext], Any | Awaitable[Any]]
+ToolHandler = Callable[[ArgsT, ToolContext], Any]
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -23,6 +23,8 @@ class ToolSpec(Generic[ArgsT]):
     args_model: type[ArgsT]
     handler: ToolHandler[ArgsT]
     requires_approval: bool = False
+    side_effects: Literal["none", "possible"] = "possible"
+    timeout_seconds: float | None = None
 
     def definition(self) -> dict[str, Any]:
         return {
@@ -54,6 +56,12 @@ class ToolRegistry:
             raise ValueError("tool description must not be blank")
         if not issubclass(spec.args_model, BaseModel):
             raise TypeError("args_model must be a pydantic BaseModel subclass")
+        if inspect.iscoroutinefunction(spec.handler) or inspect.iscoroutinefunction(
+            getattr(spec.handler, "__call__", None)
+        ):
+            raise TypeError("async tool handlers are not supported; provide a synchronous adapter")
+        if spec.timeout_seconds is not None and spec.timeout_seconds <= 0:
+            raise ValueError("tool timeout_seconds must be greater than zero")
         if spec.name in self._tools:
             raise ValueError(f"tool already registered: {spec.name}")
         self._tools[spec.name] = spec
@@ -74,9 +82,14 @@ class ToolRegistry:
         # Return detached JSON-shaped values so callers cannot mutate the snapshot.
         return json.loads(json.dumps(self._definitions, ensure_ascii=False))
 
-    async def invoke(self, spec: ToolSpec[Any], args: BaseModel, context: ToolContext) -> Any:
+    def invoke(self, spec: ToolSpec[Any], args: BaseModel, context: ToolContext) -> Any:
         result = spec.handler(args, context)
-        return await result if inspect.isawaitable(result) else result
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if close is not None:
+                close()
+            raise TypeError("tool handler returned an awaitable; async handlers are not supported")
+        return result
 
 
 def _json_dumps(value: Any) -> str:

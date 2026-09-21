@@ -80,10 +80,10 @@ def test_cli_chat_with_fake_transport(tmp_path, monkeypatch, capsys):
         def __init__(self, route):
             self.route = route
 
-        async def complete(self, request):
+        def complete(self, request):
             return ModelResponse(content="CLI answer", finish_reason="stop")
 
-        async def aclose(self):
+        def close(self):
             return None
 
     monkeypatch.setattr("agentcore.core.OpenAIChatTransport", FakeOpenAITransport)

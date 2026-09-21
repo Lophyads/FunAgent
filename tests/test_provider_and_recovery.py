@@ -66,6 +66,8 @@ async def test_retry_then_fallback(config_factory):
     assert result.route_used == "fallback"
     assert len(primary.requests) == 2
     assert len(fallback.requests) == 1
+    assert result.provider_attempts == 3
+    assert result.route_attempts == {"primary": 2, "fallback": 1}
     assert any("fallback activated" in warning for warning in result.warnings)
 
 
@@ -177,8 +179,8 @@ async def test_context_change_is_versioned_without_rewriting_history(config_fact
         config_b, default_tool_registry(), transports={"primary": transport_b}
     ) as agent:
         second = await agent.run_turn("two", session_id=session_id)
-        contexts = await agent.store.get_contexts(session_id)
-        messages = await agent.store.load_messages(session_id)
+        contexts = agent.store.get_contexts(session_id)
+        messages = agent.store.load_messages(session_id)
 
     assert first.context_version == 1
     assert second.context_version == 2
@@ -193,17 +195,17 @@ async def test_dangling_tool_call_is_repaired_before_resume(config_factory):
     registry = default_tool_registry()
     registry.freeze()
     store = SQLiteStore(config.database_path)
-    await store.open()
-    state = await store.ensure_session_context(
+    store.open()
+    state = store.ensure_session_context(
         "recover", config.system_prompt, registry.definitions()
     )
-    await store.begin_turn(
+    store.begin_turn(
         turn_id="old-turn",
         session_id="recover",
         context_version=state.version,
         user_message=Message(role="user", content="old question"),
     )
-    await store.append_message(
+    store.append_message(
         "recover",
         "old-turn",
         Message(
@@ -212,13 +214,13 @@ async def test_dangling_tool_call_is_repaired_before_resume(config_factory):
             finish_reason="tool_calls",
         ),
     )
-    await store.close()
+    store.close()
 
     def inspect_repaired_history(request):
         roles = [message["role"] for message in request.messages]
         assert roles == ["system", "user", "assistant", "tool", "user"]
         repaired = json.loads(request.messages[3]["content"])
-        assert repaired["error"]["type"] == "interrupted"
+        assert repaired["error"]["type"] == "outcome_unknown"
         return ModelResponse(content="resumed", finish_reason="stop")
 
     transport = ScriptedTransport(inspect_repaired_history)
@@ -226,8 +228,32 @@ async def test_dangling_tool_call_is_repaired_before_resume(config_factory):
         config, registry, transports={"primary": transport}
     ) as agent:
         result = await agent.run_turn("new question", session_id="recover")
-        old_turn = await agent.store.get_turn("old-turn")
+        old_turn = agent.store.get_turn("old-turn")
 
     assert result.status == "completed"
     assert old_turn["status"] == "failed"
     assert any("recovered unfinished turn" in warning for warning in result.warnings)
+
+
+def test_openai_transport_disables_sdk_retries(monkeypatch):
+    import agentcore.provider as provider_module
+    from agentcore import OpenAIChatTransport
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("NO_RETRY_KEY", "secret")
+    monkeypatch.setattr(provider_module, "OpenAI", FakeClient)
+    transport = OpenAIChatTransport(ModelRoute(
+        name="no-sdk-retry", provider="openai", model="model",
+        api_key_env="NO_RETRY_KEY",
+    ))
+    transport.close()
+
+    assert captured["max_retries"] == 0

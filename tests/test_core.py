@@ -36,9 +36,9 @@ async def test_final_text_persists_user_before_provider(config_factory, final_re
     transport = ScriptedTransport(assert_user_is_durable)
     async with AgentCore(config, default_tool_registry(), transports={"primary": transport}) as agent:
         result = await agent.run_turn("hello", session_id="s1")
-        stored = await agent.store.load_messages("s1")
-        turn = await agent.store.get_turn(result.turn_id)
-        finalized_again = await agent.store.finish_turn(
+        stored = agent.store.load_messages("s1")
+        turn = agent.store.get_turn(result.turn_id)
+        finalized_again = agent.store.finish_turn(
             session_id="s1",
             turn_id=result.turn_id,
             status="completed",
@@ -67,7 +67,7 @@ async def test_tool_call_is_persisted_before_handler_and_replayed(config_factory
     registry = ToolRegistry()
     handler_observations = []
 
-    async def echo(args: EchoArgs, context: ToolContext):
+    def echo(args: EchoArgs, context: ToolContext):
         with sqlite3.connect(config.database_path) as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE turn_id = ? AND role = 'assistant' "
@@ -159,7 +159,7 @@ class ApprovalArgs(BaseModel):
 async def test_approval_required_defaults_to_deny(config_factory):
     called = False
 
-    async def sensitive(args: ApprovalArgs, context: ToolContext):
+    def sensitive(args: ApprovalArgs, context: ToolContext):
         nonlocal called
         called = True
         return args.value
@@ -185,6 +185,9 @@ async def test_approval_required_defaults_to_deny(config_factory):
         result = await agent.run_turn("sensitive", session_id="approval")
 
     assert result.status == "completed"
+    assert result.completion_reason == "model_stop"
+    assert result.tool_outcomes[0].state == "denied"
+    assert result.tool_outcomes[0].effect_disposition == "not_applied"
     assert called is False
     payload = json.loads(transport.requests[1].messages[-1]["content"])
     assert payload["error"]["type"] == "approval_required"
@@ -193,7 +196,7 @@ async def test_approval_required_defaults_to_deny(config_factory):
 @pytest.mark.asyncio
 async def test_approved_tool_executes(config_factory):
     class Approver:
-        async def approve(self, invocation):
+        def approve(self, invocation):
             return ApprovalDecision(approved=True)
 
     registry = ToolRegistry()
@@ -257,25 +260,25 @@ async def test_memory_middleware_and_review_order(config_factory, final_response
     events = []
 
     class Memory:
-        async def recall(self, user_input, session_id):
+        def recall(self, user_input, session_id):
             events.append("memory")
             return [MemoryItem(id="m1", content="remember this")]
 
     class Middleware:
-        async def on_turn_start(self, event):
+        def on_turn_start(self, event):
             events.append("start")
 
-        async def before_model(self, event):
+        def before_model(self, event):
             events.append("before_model")
 
-        async def after_model(self, event):
+        def after_model(self, event):
             events.append("after_model")
 
-        async def on_turn_end(self, event):
+        def on_turn_end(self, event):
             events.append("end")
 
     class Review:
-        async def schedule(self, snapshot):
+        def schedule(self, snapshot):
             events.append("review")
 
     transport = ScriptedTransport(final_response)
@@ -288,7 +291,7 @@ async def test_memory_middleware_and_review_order(config_factory, final_response
         transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("raw text", session_id="hooks")
-        stored = await agent.store.load_messages("hooks")
+        stored = agent.store.load_messages("hooks")
 
     assert result.status == "completed"
     assert events == ["memory", "start", "before_model", "after_model", "end", "review"]
@@ -301,15 +304,15 @@ async def test_memory_middleware_and_review_order(config_factory, final_response
 async def test_multiple_tools_execute_sequentially_with_middleware(config_factory):
     execution_order = []
 
-    async def echo(args: EchoArgs, context: ToolContext):
+    def echo(args: EchoArgs, context: ToolContext):
         execution_order.append(f"run:{args.text}")
         return args.text
 
     class Middleware:
-        async def before_tool(self, invocation):
+        def before_tool(self, invocation):
             execution_order.append(f"before:{invocation.arguments['text']}")
 
-        async def after_tool(self, event):
+        def after_tool(self, event):
             execution_order.append(f"after:{event.invocation.arguments['text']}")
 
     registry = ToolRegistry()
@@ -354,13 +357,13 @@ async def test_multiple_tools_execute_sequentially_with_middleware(config_factor
 async def test_guard_failure_is_fail_closed(config_factory):
     called = False
 
-    async def echo(args: EchoArgs, context: ToolContext):
+    def echo(args: EchoArgs, context: ToolContext):
         nonlocal called
         called = True
         return args.text
 
     class BrokenGuard:
-        async def check(self, invocation):
+        def check(self, invocation):
             raise RuntimeError("guard unavailable")
 
     registry = ToolRegistry()
@@ -380,6 +383,9 @@ async def test_guard_failure_is_fail_closed(config_factory):
         result = await agent.run_turn("guard", session_id="guard")
 
     assert result.status == "completed"
+    assert result.completion_reason == "model_stop"
+    assert result.tool_outcomes[0].state == "denied"
+    assert result.tool_outcomes[0].effect_disposition == "not_applied"
     assert called is False
     payload = json.loads(transport.requests[1].messages[-1]["content"])
     assert payload["error"]["type"] == "guard_error"
@@ -388,7 +394,7 @@ async def test_guard_failure_is_fail_closed(config_factory):
 @pytest.mark.asyncio
 async def test_review_failure_only_adds_warning(config_factory, final_response):
     class BrokenReview:
-        async def schedule(self, snapshot):
+        def schedule(self, snapshot):
             raise RuntimeError("queue down")
 
     async with AgentCore(

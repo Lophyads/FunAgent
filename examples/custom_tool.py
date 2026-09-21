@@ -12,7 +12,7 @@ class GreetArgs(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
 
-async def greet(args: GreetArgs, context: ToolContext) -> dict[str, str]:
+def greet(args: GreetArgs, context: ToolContext) -> dict[str, str]:
     return {"message": f"Hello, {args.name}!", "session_id": context.session_id}
 
 
@@ -24,6 +24,7 @@ def build_registry() -> ToolRegistry:
             description="Greet a person by name.",
             args_model=GreetArgs,
             handler=greet,
+            side_effects="none",
         )
     )
     return registry

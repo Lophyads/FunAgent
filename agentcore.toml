@@ -12,6 +12,20 @@ max_delay_seconds = 10.0
 jitter_ratio = 0.2
 max_retry_after_seconds = 10.0
 
+[workers]
+turn_workers = 4
+operation_workers = 8
+queue_capacity = 128
+
+[timeouts]
+run_budget_seconds = 300.0
+tool_seconds = 60.0
+memory_seconds = 5.0
+middleware_seconds = 2.0
+policy_seconds = 30.0
+review_schedule_seconds = 1.0
+finalize_seconds = 5.0
+
 [[routes]]
 name = "primary"
 provider = "openai"

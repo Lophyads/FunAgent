@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
 import uuid
 from pathlib import Path
@@ -23,20 +22,16 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _readline(prompt: str) -> str:
-    return await asyncio.to_thread(input, prompt)
-
-
-async def _chat(config_path: Path, requested_session: str | None) -> int:
+def _chat(config_path: Path, requested_session: str | None) -> int:
     config = load_config(config_path)
     session_id = requested_session or str(uuid.uuid4())
     print(f"session: {session_id}")
     print("commands: /new, /session, /exit")
 
-    async with AgentCore(config, default_tool_registry()) as agent:
+    with AgentCore(config, default_tool_registry()) as agent:
         while True:
             try:
-                line = await _readline("you> ")
+                line = input("you> ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -53,7 +48,7 @@ async def _chat(config_path: Path, requested_session: str | None) -> int:
             if not line.strip():
                 continue
 
-            result = await agent.run_turn(line, session_id=session_id)
+            result = agent.run_turn_blocking(line, session_id=session_id)
             for warning in result.warnings:
                 print(f"warning: {warning}", file=sys.stderr)
             if result.final_text:
@@ -67,7 +62,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "chat":
-            return asyncio.run(_chat(args.config, args.session))
+            return _chat(args.config, args.session)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -83,4 +78,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

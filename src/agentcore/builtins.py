@@ -78,6 +78,7 @@ def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
             description="Evaluate a bounded arithmetic expression using numbers and +, -, *, /, //, %, or **.",
             args_model=CalculatorArgs,
             handler=_calculator,
+            side_effects="none",
         )
     )
     registry.register(
@@ -86,6 +87,7 @@ def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
             description="Return the current time in an IANA timezone such as UTC or Asia/Shanghai.",
             args_model=CurrentTimeArgs,
             handler=_current_time,
+            side_effects="none",
         )
     )
     return registry
