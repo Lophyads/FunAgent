@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fun-agent-core"
+version = "0.1.0"
+description = "A small, durable agent loop inspired by Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "aiosqlite>=0.21,<1",
+  "openai>=2.0,<3",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+  "tzdata>=2025.3; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+]
+
+[project.scripts]
+agentcore = "agentcore.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentcore"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]

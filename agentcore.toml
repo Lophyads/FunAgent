@@ -1,0 +1,25 @@
+[agent]
+system_prompt = "You are a helpful AI assistant. Use tools when they are useful."
+database_path = "agentcore.db"
+max_iterations = 8
+tool_result_max_chars = 32768
+memory_max_chars = 4000
+
+[retry]
+max_attempts = 3
+base_delay_seconds = 0.5
+max_delay_seconds = 10.0
+jitter_ratio = 0.2
+max_retry_after_seconds = 10.0
+
+[[routes]]
+name = "primary"
+provider = "openai"
+model = "deepseek-flash"
+api_mode = "chat_completions"
+base_url = "https://api.deepseek.com"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 60.0
+
+# Add more [[routes]] blocks below the primary route to configure fallbacks.
+
