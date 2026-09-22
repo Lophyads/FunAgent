@@ -1,11 +1,11 @@
 """Minimal custom tool example.
 
-Register tools before constructing AgentCore; the registry freezes at construction.
+Register tools before constructing AgentCore; the catalog freezes at construction.
 """
 
 from pydantic import BaseModel, Field
 
-from agentcore import ToolContext, ToolRegistry, ToolSpec
+from agentcore import ToolCatalog, ToolContext, ToolSpec
 
 
 class GreetArgs(BaseModel):
@@ -16,10 +16,12 @@ def greet(args: GreetArgs, context: ToolContext) -> dict[str, str]:
     return {"message": f"Hello, {args.name}!", "session_id": context.session_id}
 
 
-def build_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(
+def build_catalog() -> ToolCatalog:
+    catalog = ToolCatalog()
+    catalog.register(
         ToolSpec(
+            tool_id="example.greet",
+            implementation_version="1",
             name="greet",
             description="Greet a person by name.",
             args_model=GreetArgs,
@@ -27,4 +29,4 @@ def build_registry() -> ToolRegistry:
             side_effects="none",
         )
     )
-    return registry
+    return catalog

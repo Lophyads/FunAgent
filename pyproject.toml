@@ -31,3 +31,6 @@ packages = ["src/agentcore"]
 addopts = "-q"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "multiprocess: Windows spawn-based persistence and lease tests",
+]

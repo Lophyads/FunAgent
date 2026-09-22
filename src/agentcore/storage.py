@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
-from .models import Message, ToolCall, ToolOutcome, TurnError
+from .models import LeaseFence, LeaseHandle, Message, ToolCall, ToolOutcome, TurnError
 from .tools import encode_tool_error
 
 
@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS session_contexts (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     version INTEGER NOT NULL, system_prompt TEXT NOT NULL, tools_json TEXT NOT NULL,
-    fingerprint TEXT NOT NULL, created_at REAL NOT NULL,
+    fingerprint TEXT NOT NULL, build_request_json TEXT NOT NULL DEFAULT '{}',
+    system_prompt_bytes BLOB, system_prompt_fingerprint TEXT,
+    tool_schema_bytes BLOB, toolset_fingerprint TEXT,
+    tool_bindings_json TEXT NOT NULL DEFAULT '[]',
+    source_versions_json TEXT NOT NULL DEFAULT '[]',
+    binding_state TEXT NOT NULL DEFAULT 'verified',
+    created_at REAL NOT NULL,
     PRIMARY KEY (session_id, version)
 );
 CREATE TABLE IF NOT EXISTS turns (
@@ -57,10 +63,36 @@ CREATE TABLE IF NOT EXISTS tool_executions (
         state IN ('pending', 'running', 'succeeded', 'failed', 'denied', 'not_executed', 'unknown')
     ),
     effect_disposition TEXT, error_type TEXT, started_at REAL, finished_at REAL,
+    may_still_be_running INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL, PRIMARY KEY (turn_id, tool_call_id)
 );
 CREATE INDEX IF NOT EXISTS tool_executions_session_idx
     ON tool_executions(session_id, turn_id);
+CREATE TABLE IF NOT EXISTS model_attempts (
+    id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    route_index INTEGER NOT NULL,
+    route_name TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('started', 'succeeded', 'failed', 'ambiguous')),
+    error_type TEXT,
+    status_code INTEGER,
+    started_at REAL NOT NULL,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS model_attempts_turn_idx
+    ON model_attempts(turn_id, iteration, route_index, attempt_number);
+CREATE TABLE IF NOT EXISTS session_leases (
+    session_id TEXT PRIMARY KEY,
+    owner_id TEXT,
+    turn_id TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    expires_at REAL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -68,10 +100,23 @@ class StorageError(RuntimeError):
     pass
 
 
+class LeaseLostError(StorageError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
-class SessionContextState:
+class PersistedSessionContext:
+    session_id: str
     version: int
-    changed: bool
+    build_request: dict[str, Any]
+    system_prompt_bytes: bytes
+    system_prompt_fingerprint: str
+    tool_schema_bytes: bytes
+    toolset_fingerprint: str
+    tool_bindings: tuple[dict[str, str], ...]
+    source_versions: tuple[tuple[str, str], ...]
+    binding_state: Literal["verified", "legacy_unverified"]
+    created_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,12 +162,36 @@ class SQLiteStore:
                 self._anchor = connection
             try:
                 connection.executescript(_SCHEMA)
-                self._migrate_v2(connection)
-                connection.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2') "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-                )
-                connection.commit()
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    version_row = connection.execute(
+                        "SELECT value FROM schema_meta "
+                        "WHERE key = 'schema_version'"
+                    ).fetchone()
+                    if version_row is not None:
+                        try:
+                            existing_version = int(version_row["value"])
+                        except (TypeError, ValueError) as exc:
+                            raise StorageError(
+                                "database schema version is invalid"
+                            ) from exc
+                        if existing_version > 5:
+                            raise StorageError(
+                                "database schema is newer than this AgentCore"
+                            )
+                    self._migrate_v2(connection)
+                    self._migrate_v3(connection)
+                    self._migrate_v4(connection)
+                    self._migrate_v5(connection)
+                    connection.execute(
+                        "INSERT INTO schema_meta(key, value) "
+                        "VALUES ('schema_version', '5') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
             finally:
                 if not self._uri:
                     connection.close()
@@ -148,6 +217,107 @@ class SQLiteStore:
         message_columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
         if "effect_disposition" not in message_columns:
             connection.execute("ALTER TABLE messages ADD COLUMN effect_disposition TEXT")
+        tool_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(tool_executions)")
+        }
+        if "may_still_be_running" not in tool_columns:
+            connection.execute(
+                "ALTER TABLE tool_executions ADD COLUMN "
+                "may_still_be_running INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _migrate_v3(self, connection: sqlite3.Connection) -> None:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(session_contexts)")}
+        additions = {
+            "build_request_json": "TEXT NOT NULL DEFAULT '{}'",
+            "system_prompt_bytes": "BLOB",
+            "system_prompt_fingerprint": "TEXT",
+            "tool_schema_bytes": "BLOB",
+            "toolset_fingerprint": "TEXT",
+            "tool_bindings_json": "TEXT NOT NULL DEFAULT '[]'",
+            "source_versions_json": "TEXT NOT NULL DEFAULT '[]'",
+            "binding_state": "TEXT NOT NULL DEFAULT 'verified'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE session_contexts ADD COLUMN {name} {definition}"
+                )
+        rows = connection.execute(
+            "SELECT session_id, version, system_prompt, tools_json, "
+            "system_prompt_bytes, system_prompt_fingerprint, "
+            "tool_schema_bytes, toolset_fingerprint FROM session_contexts"
+        ).fetchall()
+        for row in rows:
+            if all((
+                row["system_prompt_bytes"] is not None,
+                row["system_prompt_fingerprint"] is not None,
+                row["tool_schema_bytes"] is not None,
+                row["toolset_fingerprint"] is not None,
+            )):
+                continue
+            prompt_bytes = (
+                bytes(row["system_prompt_bytes"])
+                if row["system_prompt_bytes"] is not None
+                else str(row["system_prompt"]).encode("utf-8")
+            )
+            raw_tools = json.loads(row["tools_json"])
+            tool_bytes = (
+                bytes(row["tool_schema_bytes"])
+                if row["tool_schema_bytes"] is not None
+                else _canonical_json(raw_tools).encode("utf-8")
+            )
+            descriptors = []
+            for definition in raw_tools:
+                function = definition.get("function", {})
+                name = str(function.get("name", ""))
+                descriptors.append({
+                    "tool_id": name,
+                    "implementation_version": "legacy_unverified",
+                    "name": name,
+                    "schema_fingerprint": hashlib.sha256(
+                        _canonical_json(definition).encode("utf-8")
+                    ).hexdigest(),
+                })
+            connection.execute(
+                "UPDATE session_contexts SET system_prompt_bytes = ?, "
+                "system_prompt_fingerprint = ?, tool_schema_bytes = ?, "
+                "toolset_fingerprint = ?, tool_bindings_json = ?, "
+                "source_versions_json = '[]', binding_state = ? "
+                "WHERE session_id = ? AND version = ?",
+                (
+                    prompt_bytes,
+                    hashlib.sha256(prompt_bytes).hexdigest(),
+                    tool_bytes,
+                    hashlib.sha256(tool_bytes).hexdigest(),
+                    _canonical_json(descriptors),
+                    "verified" if not descriptors else "legacy_unverified",
+                    row["session_id"],
+                    row["version"],
+                ),
+            )
+
+    def _migrate_v4(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS model_attempts ("
+            "id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE, "
+            "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, "
+            "iteration INTEGER NOT NULL, route_index INTEGER NOT NULL, route_name TEXT NOT NULL, "
+            "attempt_number INTEGER NOT NULL, request_fingerprint TEXT NOT NULL, "
+            "state TEXT NOT NULL CHECK (state IN ('started','succeeded','failed','ambiguous')), "
+            "error_type TEXT, status_code INTEGER, started_at REAL NOT NULL, finished_at REAL)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS model_attempts_turn_idx "
+            "ON model_attempts(turn_id, iteration, route_index, attempt_number)"
+        )
+
+    def _migrate_v5(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS session_leases ("
+            "session_id TEXT PRIMARY KEY, owner_id TEXT, turn_id TEXT, "
+            "fencing_token INTEGER NOT NULL DEFAULT 0, expires_at REAL, updated_at REAL NOT NULL)"
+        )
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -179,59 +349,120 @@ class SQLiteStore:
         finally:
             connection.close()
 
-    def ensure_session_context(
-        self, session_id: str, system_prompt: str, tools: list[dict[str, Any]]
-    ) -> SessionContextState:
-        fingerprint, tools_json = _context_fingerprint(system_prompt, tools)
+    def create_session_context(
+        self, session_id: str, *, build_request: dict[str, Any],
+        system_prompt_bytes: bytes, system_prompt_fingerprint: str,
+        tool_schema_bytes: bytes, toolset_fingerprint: str,
+        tool_bindings: tuple[dict[str, str], ...],
+        source_versions: tuple[tuple[str, str], ...],
+        turn_id: str, user_message: Message, fence: LeaseFence,
+    ) -> PersistedSessionContext:
+        if user_message.role != "user":
+            raise StorageError("session admission requires a user message")
+        if (
+            hashlib.sha256(system_prompt_bytes).hexdigest()
+            != system_prompt_fingerprint
+        ):
+            raise StorageError("system prompt fingerprint does not match bytes")
+        if hashlib.sha256(tool_schema_bytes).hexdigest() != toolset_fingerprint:
+            raise StorageError("toolset fingerprint does not match schema bytes")
+        system_prompt = system_prompt_bytes.decode("utf-8")
+        tools = json.loads(tool_schema_bytes.decode("utf-8"))
+        if not isinstance(tools, list):
+            raise StorageError("tool schema snapshot must be a JSON list")
+        legacy_fingerprint, tools_json = _context_fingerprint(system_prompt, tools)
         now = time.time()
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
             row = connection.execute(
                 "SELECT current_context_version FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
-            if row is None:
-                version = 1
-                connection.execute(
-                    "INSERT INTO sessions(id, current_context_version, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?)", (session_id, version, now, now),
-                )
-                connection.execute(
-                    "INSERT INTO session_contexts(session_id, version, system_prompt, tools_json, "
-                    "fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (session_id, version, system_prompt, tools_json, fingerprint, now),
-                )
-                return SessionContextState(version, False)
-            current = int(row["current_context_version"])
-            context = connection.execute(
-                "SELECT fingerprint FROM session_contexts WHERE session_id = ? AND version = ?",
-                (session_id, current),
-            ).fetchone()
-            if context is not None and context["fingerprint"] == fingerprint:
-                connection.execute(
-                    "UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id)
-                )
-                return SessionContextState(current, False)
-            version = current + 1
+            if row is not None:
+                raise StorageError(f"session already exists: {session_id}")
+            version = 1
             connection.execute(
-                "INSERT INTO session_contexts(session_id, version, system_prompt, tools_json, "
-                "fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, version, system_prompt, tools_json, fingerprint, now),
+                "INSERT INTO sessions(id, current_context_version, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)", (session_id, version, now, now),
             )
             connection.execute(
-                "UPDATE sessions SET current_context_version = ?, updated_at = ? WHERE id = ?",
-                (version, now, session_id),
+                "INSERT INTO session_contexts("
+                "session_id, version, system_prompt, tools_json, fingerprint, "
+                "build_request_json, system_prompt_bytes, system_prompt_fingerprint, "
+                "tool_schema_bytes, toolset_fingerprint, tool_bindings_json, "
+                "source_versions_json, binding_state, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?)",
+                (
+                    session_id, version, system_prompt, tools_json, legacy_fingerprint,
+                    _canonical_json(build_request), system_prompt_bytes,
+                    system_prompt_fingerprint, tool_schema_bytes, toolset_fingerprint,
+                    _canonical_json(tool_bindings), _canonical_json(source_versions), now,
+                ),
             )
-            return SessionContextState(version, True)
+            connection.execute(
+                "INSERT INTO turns(id, session_id, context_version, status, started_at) "
+                "VALUES (?, ?, ?, 'running', ?)",
+                (turn_id, session_id, version, now),
+            )
+            self._insert_message(
+                connection, session_id, turn_id, user_message
+            )
+        return PersistedSessionContext(
+            session_id=session_id, version=version, build_request=build_request,
+            system_prompt_bytes=system_prompt_bytes,
+            system_prompt_fingerprint=system_prompt_fingerprint,
+            tool_schema_bytes=tool_schema_bytes, toolset_fingerprint=toolset_fingerprint,
+            tool_bindings=tool_bindings, source_versions=source_versions,
+            binding_state="verified", created_at=now,
+        )
 
-    def recover_incomplete_turns(self, session_id: str) -> RecoveryState:
+    def load_session_context(self, session_id: str) -> PersistedSessionContext | None:
+        connection = self._connection()
+        try:
+            row = connection.execute(
+                "SELECT c.* FROM session_contexts c JOIN sessions s "
+                "ON s.id = c.session_id AND s.current_context_version = c.version "
+                "WHERE c.session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return self._row_to_session_context(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def verify_legacy_session_context(
+        self, session_id: str, version: int,
+        tool_bindings: tuple[dict[str, str], ...],
+        *, fence: LeaseFence,
+    ) -> bool:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            cursor = connection.execute(
+                "UPDATE session_contexts SET tool_bindings_json = ?, "
+                "binding_state = 'verified' "
+                "WHERE session_id = ? AND version = ? "
+                "AND binding_state = 'legacy_unverified'",
+                (_canonical_json(tool_bindings), session_id, version),
+            )
+            return cursor.rowcount == 1
+
+    def recover_incomplete_turns(
+        self, session_id: str, *, fence: LeaseFence
+    ) -> RecoveryState:
         warnings: list[str] = []
         repaired: list[Message] = []
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
             turns = connection.execute(
                 "SELECT id, status FROM turns WHERE session_id = ? ORDER BY started_at",
                 (session_id,),
             ).fetchall()
             for turn_row in turns:
                 turn_id = str(turn_row["id"])
+                connection.execute(
+                    "UPDATE model_attempts SET state = 'ambiguous', "
+                    "error_type = 'process_interrupted', finished_at = ? "
+                    "WHERE turn_id = ? AND state = 'started'",
+                    (time.time(), turn_id),
+                )
                 messages = self._load_turn_messages(connection, turn_id)
                 added = self._repair_tool_pairs(connection, session_id, turn_id, messages)
                 repaired.extend(added)
@@ -251,16 +482,58 @@ class SQLiteStore:
                     "message": "Recovered an unfinished turn after process interruption.",
                     "retryable": True,
                 })
+                attempt_rows = connection.execute(
+                    "SELECT route_name, COUNT(*) AS attempt_count, "
+                    "MAX(iteration) AS max_iteration "
+                    "FROM model_attempts WHERE turn_id = ? GROUP BY route_name",
+                    (turn_id,),
+                ).fetchall()
+                route_attempts = {
+                    str(item["route_name"]): int(item["attempt_count"])
+                    for item in attempt_rows
+                }
+                provider_attempts = sum(route_attempts.values())
+                iterations = max(
+                    (int(item["max_iteration"]) for item in attempt_rows),
+                    default=0,
+                )
+                final_message_id = None
+                if completed:
+                    final_row = connection.execute(
+                        "SELECT id FROM messages WHERE turn_id = ? "
+                        "AND role = 'assistant' AND tool_calls_json IS NULL "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (turn_id,),
+                    ).fetchone()
+                    final_message_id = (
+                        int(final_row["id"]) if final_row is not None else None
+                    )
                 connection.execute(
                     "UPDATE turns SET status = ?, completed_at = ?, error_json = ?, "
-                    "completion_reason = ? WHERE id = ? AND status = 'running'",
-                    (status, time.time(), error, "recovered", turn_id),
+                    "completion_reason = ?, provider_attempts = ?, "
+                    "route_attempts_json = ?, iterations = ?, final_message_id = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (
+                        status, time.time(), error, "recovered",
+                        provider_attempts, _canonical_json(route_attempts),
+                        iterations, final_message_id, turn_id,
+                    ),
                 )
                 warnings.append(f"recovered unfinished turn {turn_id} as {status}")
         return RecoveryState(tuple(warnings), tuple(repaired))
 
-    def repair_turn_tool_calls(self, session_id: str, turn_id: str) -> RecoveryState:
+    def repair_turn_tool_calls(
+        self, session_id: str, turn_id: str, *, fence: LeaseFence
+    ) -> RecoveryState:
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            turn = connection.execute(
+                "SELECT session_id FROM turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if turn is None or turn["session_id"] != session_id:
+                raise StorageError(
+                    "repair target does not belong to the fenced session"
+                )
             messages = self._load_turn_messages(connection, turn_id)
             repaired = self._repair_tool_pairs(connection, session_id, turn_id, messages)
         warnings = (f"repaired {len(repaired)} incomplete tool call(s) in current turn",) if repaired else ()
@@ -297,8 +570,8 @@ class SQLiteStore:
                 execution_state=state,
                 effect_disposition=effect,
             )
-            message = Message(
-                role="tool", content=content, tool_call_id=call.id, tool_name=call.name,
+            message = Message.tool_result(
+                content, tool_call_id=call.id, tool_name=call.name,
                 effect_disposition=effect,
                 metadata={"execution_state": state, "recovered": True},
             )
@@ -329,9 +602,19 @@ class SQLiteStore:
 
     def begin_turn(
         self, *, turn_id: str, session_id: str,
-        context_version: int, user_message: Message
+        context_version: int, user_message: Message, fence: LeaseFence,
     ) -> int:
+        if user_message.role != "user":
+            raise StorageError("begin_turn requires a user message")
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            context = connection.execute(
+                "SELECT 1 FROM session_contexts "
+                "WHERE session_id = ? AND version = ?",
+                (session_id, context_version),
+            ).fetchone()
+            if context is None:
+                raise StorageError("turn references an unknown session context")
             connection.execute(
                 "INSERT INTO turns(id, session_id, context_version, status, started_at) "
                 "VALUES (?, ?, ?, 'running', ?)",
@@ -339,15 +622,30 @@ class SQLiteStore:
             )
             return self._insert_message(connection, session_id, turn_id, user_message)
 
-    def append_message(self, session_id: str, turn_id: str, message: Message) -> int:
+    def append_message(
+        self, session_id: str, turn_id: str, message: Message, *, fence: LeaseFence
+    ) -> int:
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
             return self._insert_message(connection, session_id, turn_id, message)
 
     def stage_tool_calls(
         self, session_id: str, turn_id: str, assistant_message: Message,
         calls: list[tuple[ToolCall, Literal["none", "possible"]]],
+        *, fence: LeaseFence,
     ) -> int:
+        message_calls = assistant_message.tool_calls or []
+        if assistant_message.role != "assistant" or not message_calls:
+            raise StorageError("stage_tool_calls requires an assistant tool message")
+        staged_calls = [call for call, _ in calls]
+        if [
+            (call.id, call.name, call.arguments) for call in message_calls
+        ] != [
+            (call.id, call.name, call.arguments) for call in staged_calls
+        ]:
+            raise StorageError("staged tool executions must match the assistant message")
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
             message_id = self._insert_message(connection, session_id, turn_id, assistant_message)
             now = time.time()
             for call, side_effects in calls:
@@ -358,13 +656,17 @@ class SQLiteStore:
                 )
             return message_id
 
-    def mark_tool_running(self, turn_id: str, tool_call_id: str) -> bool:
+    def mark_tool_running(
+        self, turn_id: str, tool_call_id: str, *, fence: LeaseFence
+    ) -> bool:
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=fence.session_id)
             now = time.time()
             cursor = connection.execute(
                 "UPDATE tool_executions SET state = 'running', started_at = ?, updated_at = ? "
-                "WHERE turn_id = ? AND tool_call_id = ? AND state = 'pending'",
-                (now, now, turn_id, tool_call_id),
+                "WHERE turn_id = ? AND tool_call_id = ? AND session_id = ? "
+                "AND state = 'pending'",
+                (now, now, turn_id, tool_call_id, fence.session_id),
             )
             return cursor.rowcount == 1
 
@@ -373,22 +675,37 @@ class SQLiteStore:
         state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"],
         effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"],
         error_type: str | None,
+        may_still_be_running: bool,
+        fence: LeaseFence,
     ) -> bool:
+        if message.role != "tool":
+            raise StorageError("complete_tool_call requires a tool result message")
         with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
             row = connection.execute(
-                "SELECT state FROM tool_executions WHERE turn_id = ? AND tool_call_id = ?",
+                "SELECT session_id, tool_name, state FROM tool_executions "
+                "WHERE turn_id = ? AND tool_call_id = ?",
                 (turn_id, message.tool_call_id),
             ).fetchone()
             if row is None:
                 raise StorageError(f"unknown tool execution: {message.tool_call_id}")
+            if row["session_id"] != session_id:
+                raise StorageError("tool execution belongs to another session")
+            if row["tool_name"] != message.tool_name:
+                raise StorageError("tool result name does not match the staged call")
             if row["state"] not in {"pending", "running"}:
                 return False
             self._insert_message(connection, session_id, turn_id, message)
             now = time.time()
             connection.execute(
                 "UPDATE tool_executions SET state = ?, effect_disposition = ?, error_type = ?, "
-                "finished_at = ?, updated_at = ? WHERE turn_id = ? AND tool_call_id = ?",
-                (state, effect_disposition, error_type, now, now, turn_id, message.tool_call_id),
+                "may_still_be_running = ?, finished_at = ?, updated_at = ? "
+                "WHERE turn_id = ? AND tool_call_id = ?",
+                (
+                    state, effect_disposition, error_type,
+                    int(may_still_be_running), now, now,
+                    turn_id, message.tool_call_id,
+                ),
             )
             return True
 
@@ -397,11 +714,19 @@ class SQLiteStore:
         status: str, error: TurnError | None, route_name: str | None,
         iterations: int, usage: dict[str, int], completion_reason: str = "unknown",
         provider_attempts: int = 0, route_attempts: dict[str, int] | None = None,
+        fence: LeaseFence,
     ) -> bool:
+        if message.role != "assistant" or message.tool_calls is not None:
+            raise StorageError("terminal turn message must be assistant text")
         with self._transaction() as connection:
-            row = connection.execute("SELECT status FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            self._assert_fence(connection, fence, session_id=session_id)
+            row = connection.execute(
+                "SELECT status, session_id FROM turns WHERE id = ?", (turn_id,)
+            ).fetchone()
             if row is None:
                 raise StorageError(f"unknown turn: {turn_id}")
+            if row["session_id"] != session_id:
+                raise StorageError("turn belongs to another session")
             if row["status"] != "running":
                 return False
             message_id = self._insert_message(connection, session_id, turn_id, message)
@@ -418,11 +743,17 @@ class SQLiteStore:
         error: TurnError | None, route_name: str | None, iterations: int,
         usage: dict[str, int], completion_reason: str = "unknown",
         provider_attempts: int = 0, route_attempts: dict[str, int] | None = None,
+        fence: LeaseFence,
     ) -> bool:
         with self._transaction() as connection:
-            row = connection.execute("SELECT status FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            self._assert_fence(connection, fence, session_id=session_id)
+            row = connection.execute(
+                "SELECT status, session_id FROM turns WHERE id = ?", (turn_id,)
+            ).fetchone()
             if row is None:
                 raise StorageError(f"unknown turn: {turn_id}")
+            if row["session_id"] != session_id:
+                raise StorageError("turn belongs to another session")
             if row["status"] != "running":
                 return False
             self._finish_turn(
@@ -455,6 +786,147 @@ class SQLiteStore:
             "UPDATE sessions SET updated_at = ? WHERE id = ?", (time.time(), session_id)
         )
 
+    def begin_model_attempt(
+        self, *, attempt_id: str, turn_id: str, session_id: str,
+        iteration: int, route_index: int, route_name: str,
+        attempt_number: int, request_fingerprint: str, fence: LeaseFence,
+    ) -> None:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            turn = connection.execute(
+                "SELECT session_id FROM turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if turn is None or turn["session_id"] != session_id:
+                raise StorageError(
+                    "model attempt turn belongs to another session"
+                )
+            connection.execute(
+                "INSERT INTO model_attempts("
+                "id, turn_id, session_id, iteration, route_index, route_name, "
+                "attempt_number, request_fingerprint, state, started_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)",
+                (
+                    attempt_id, turn_id, session_id, iteration, route_index,
+                    route_name, attempt_number, request_fingerprint, time.time(),
+                ),
+            )
+
+    def finish_model_attempt(
+        self, attempt_id: str, *, state: Literal["succeeded", "failed", "ambiguous"],
+        error_type: str | None, status_code: int | None, fence: LeaseFence,
+    ) -> None:
+        with self._transaction() as connection:
+            self._assert_fence(
+                connection, fence, session_id=fence.session_id
+            )
+            cursor = connection.execute(
+                "UPDATE model_attempts SET state = ?, error_type = ?, status_code = ?, "
+                "finished_at = ? WHERE id = ? AND session_id = ? "
+                "AND state = 'started'",
+                (
+                    state, error_type, status_code, time.time(),
+                    attempt_id, fence.session_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError(f"model attempt is not active: {attempt_id}")
+
+    def acquire_lease(
+        self, *, session_id: str, owner_id: str, turn_id: str,
+        ttl_seconds: float,
+    ) -> LeaseHandle | None:
+        now = time.time()
+        expires_at = now + ttl_seconds
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if (
+                row is not None
+                and row["owner_id"] is not None
+                and float(row["expires_at"] or 0) > now
+                and row["owner_id"] != owner_id
+            ):
+                return None
+            next_token = int(row["fencing_token"]) + 1 if row is not None else 1
+            connection.execute(
+                "INSERT INTO session_leases("
+                "session_id, owner_id, turn_id, fencing_token, expires_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET owner_id = excluded.owner_id, "
+                "turn_id = excluded.turn_id, fencing_token = excluded.fencing_token, "
+                "expires_at = excluded.expires_at, updated_at = excluded.updated_at",
+                (session_id, owner_id, turn_id, next_token, expires_at, now),
+            )
+        return LeaseHandle(
+            session_id=session_id, owner_id=owner_id, turn_id=turn_id,
+            fencing_token=next_token, expires_at=expires_at,
+        )
+
+    def renew_lease(self, lease: LeaseHandle, *, ttl_seconds: float) -> LeaseHandle:
+        now = time.time()
+        expires_at = now + ttl_seconds
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE session_leases SET expires_at = ?, updated_at = ? "
+                "WHERE session_id = ? AND owner_id = ? AND turn_id = ? "
+                "AND fencing_token = ? AND expires_at > ?",
+                (
+                    expires_at, now, lease.session_id, lease.owner_id,
+                    lease.turn_id, lease.fencing_token, now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(f"lease is no longer current: {lease.session_id}")
+        return lease.model_copy(update={"expires_at": expires_at})
+
+    def assert_lease(self, lease: LeaseHandle) -> None:
+        connection = self._connection()
+        try:
+            self._assert_fence(connection, lease.fence, turn_id=lease.turn_id)
+        finally:
+            connection.close()
+
+    def release_lease(self, lease: LeaseHandle) -> None:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE session_leases SET owner_id = NULL, turn_id = NULL, "
+                "expires_at = NULL, updated_at = ? "
+                "WHERE session_id = ? AND owner_id = ? AND turn_id = ? "
+                "AND fencing_token = ?",
+                (
+                    time.time(), lease.session_id, lease.owner_id,
+                    lease.turn_id, lease.fencing_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(f"stale lease cannot be released: {lease.session_id}")
+
+    @staticmethod
+    def _assert_fence(
+        connection: sqlite3.Connection, fence: LeaseFence, *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        if session_id is not None and session_id != fence.session_id:
+            raise LeaseLostError(
+                "fence session does not match the write target"
+            )
+        row = connection.execute(
+            "SELECT owner_id, turn_id, fencing_token, expires_at "
+            "FROM session_leases WHERE session_id = ?",
+            (fence.session_id,),
+        ).fetchone()
+        now = time.time()
+        if (
+            row is None
+            or row["owner_id"] != fence.owner_id
+            or int(row["fencing_token"]) != fence.fencing_token
+            or float(row["expires_at"] or 0) <= now
+            or (turn_id is not None and row["turn_id"] != turn_id)
+        ):
+            raise LeaseLostError(f"fenced write rejected for session {fence.session_id}")
+
     def get_turn(self, turn_id: str) -> dict[str, Any] | None:
         connection = self._connection()
         try:
@@ -484,14 +956,17 @@ class SQLiteStore:
         connection = self._connection()
         try:
             rows = connection.execute(
-                "SELECT tool_call_id, tool_name, state, effect_disposition, error_type "
+                "SELECT tool_call_id, tool_name, side_effects, state, "
+                "effect_disposition, error_type, may_still_be_running "
                 "FROM tool_executions WHERE turn_id = ? ORDER BY rowid", (turn_id,),
             ).fetchall()
             return [
                 ToolOutcome(
                     tool_call_id=row["tool_call_id"], tool_name=row["tool_name"],
-                    state=row["state"], effect_disposition=row["effect_disposition"] or "unknown",
-                    error_type=row["error_type"], may_still_be_running=row["state"] == "unknown",
+                    side_effects=row["side_effects"], state=row["state"],
+                    effect_disposition=row["effect_disposition"] or "unknown",
+                    error_type=row["error_type"],
+                    may_still_be_running=bool(row["may_still_be_running"]),
                 )
                 for row in rows if row["state"] not in {"pending", "running"}
             ]
@@ -510,6 +985,9 @@ class SQLiteStore:
         self, connection: sqlite3.Connection, session_id: str,
         turn_id: str, message: Message,
     ) -> int:
+        self._validate_message_relationships(
+            connection, session_id=session_id, turn_id=turn_id, message=message
+        )
         row = connection.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM messages WHERE session_id = ?",
             (session_id,),
@@ -528,6 +1006,97 @@ class SQLiteStore:
              _canonical_json(message.metadata), time.time()),
         )
         return int(cursor.lastrowid)
+
+    @staticmethod
+    def _validate_message_relationships(
+        connection: sqlite3.Connection, *, session_id: str,
+        turn_id: str, message: Message,
+    ) -> None:
+        turn = connection.execute(
+            "SELECT session_id FROM turns WHERE id = ?", (turn_id,)
+        ).fetchone()
+        if turn is None:
+            raise StorageError(f"unknown turn: {turn_id}")
+        if turn["session_id"] != session_id:
+            raise StorageError("turn belongs to another session")
+
+        assistant_rows = connection.execute(
+            "SELECT tool_calls_json FROM messages "
+            "WHERE turn_id = ? AND role = 'assistant' AND tool_calls_json IS NOT NULL "
+            "ORDER BY seq",
+            (turn_id,),
+        ).fetchall()
+        existing_calls: dict[str, str] = {}
+        for row in assistant_rows:
+            try:
+                raw_calls = json.loads(row["tool_calls_json"])
+                for raw_call in raw_calls:
+                    call_id = str(raw_call["id"])
+                    call_name = str(raw_call["name"])
+                    if call_id in existing_calls:
+                        raise StorageError(
+                            f"duplicate tool call id in turn history: {call_id}"
+                        )
+                    existing_calls[call_id] = call_name
+            except StorageError:
+                raise
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise StorageError("invalid assistant tool call history") from exc
+
+        if message.role == "assistant" and message.tool_calls:
+            duplicate = next(
+                (call.id for call in message.tool_calls if call.id in existing_calls),
+                None,
+            )
+            if duplicate is not None:
+                raise StorageError(f"tool call id already exists in turn: {duplicate}")
+            return
+
+        if message.role != "tool":
+            return
+        expected_name = existing_calls.get(message.tool_call_id or "")
+        if expected_name is None:
+            raise StorageError(
+                f"tool result references an unknown assistant call: {message.tool_call_id}"
+            )
+        if expected_name != message.tool_name:
+            raise StorageError("tool result name does not match the assistant call")
+        duplicate_result = connection.execute(
+            "SELECT 1 FROM messages "
+            "WHERE turn_id = ? AND role = 'tool' AND tool_call_id = ? LIMIT 1",
+            (turn_id, message.tool_call_id),
+        ).fetchone()
+        if duplicate_result is not None:
+            raise StorageError(f"tool call already has a result: {message.tool_call_id}")
+
+    @staticmethod
+    def _row_to_session_context(row: sqlite3.Row) -> PersistedSessionContext:
+        prompt_bytes = bytes(row["system_prompt_bytes"])
+        tool_bytes = bytes(row["tool_schema_bytes"])
+        prompt_fingerprint = str(row["system_prompt_fingerprint"])
+        toolset_fingerprint = str(row["toolset_fingerprint"])
+        if hashlib.sha256(prompt_bytes).hexdigest() != prompt_fingerprint:
+            raise StorageError("persisted system prompt fingerprint mismatch")
+        if hashlib.sha256(tool_bytes).hexdigest() != toolset_fingerprint:
+            raise StorageError("persisted toolset fingerprint mismatch")
+        binding_state = str(row["binding_state"])
+        if binding_state not in {"verified", "legacy_unverified"}:
+            raise StorageError(f"invalid session binding state: {binding_state}")
+        return PersistedSessionContext(
+            session_id=str(row["session_id"]),
+            version=int(row["version"]),
+            build_request=json.loads(row["build_request_json"] or "{}"),
+            system_prompt_bytes=prompt_bytes,
+            system_prompt_fingerprint=prompt_fingerprint,
+            tool_schema_bytes=tool_bytes,
+            toolset_fingerprint=toolset_fingerprint,
+            tool_bindings=tuple(json.loads(row["tool_bindings_json"] or "[]")),
+            source_versions=tuple(
+                tuple(item) for item in json.loads(row["source_versions_json"] or "[]")
+            ),
+            binding_state=binding_state,
+            created_at=float(row["created_at"]),
+        )
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:

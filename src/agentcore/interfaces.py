@@ -4,17 +4,15 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
-from .models import MemoryItem, ModelRequest, ModelResponse, TurnResult, UserInput
-
-
-class ProviderTransport(Protocol):
-    def complete(self, request: ModelRequest) -> ModelResponse: ...
-
-    def close(self) -> None: ...
+from .models import MemoryItem, TurnResult, UserInput
 
 
 class MemoryProvider(Protocol):
     def recall(self, user_input: UserInput, session_id: str) -> Sequence[MemoryItem]: ...
+
+
+class MemoryUpdater(Protocol):
+    def update(self, snapshot: "TurnSnapshot") -> None: ...
 
 
 class ReviewScheduler(Protocol):
@@ -77,50 +75,6 @@ class Approver(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class TurnStartEvent:
-    session_id: str
-    turn_id: str
-    context_version: int
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCallEvent:
-    session_id: str
-    turn_id: str
-    route_name: str
-    iteration: int
-    attempt: int
-
-
-@dataclass(frozen=True, slots=True)
-class ModelResponseEvent:
-    session_id: str
-    turn_id: str
-    route_name: str
-    iteration: int
-    finish_reason: str | None
-    tool_call_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class ToolResultEvent:
-    invocation: ToolInvocation
-    success: bool
-    result: str
-
-
-@dataclass(frozen=True, slots=True)
-class TurnEndEvent:
-    session_id: str
-    turn_id: str
-    status: str
-
-
-class LifecycleMiddleware(Protocol):
-    """Optional synchronous, read-only lifecycle observer."""
-
-
-@dataclass(frozen=True, slots=True)
 class TurnSnapshot:
     result: TurnResult
     messages: tuple[dict[str, Any], ...]
@@ -131,6 +85,11 @@ class NoopMemoryProvider:
         return ()
 
 
+class NoopMemoryUpdater:
+    def update(self, snapshot: TurnSnapshot) -> None:
+        return None
+
+
 class NoopReviewScheduler:
     def schedule(self, snapshot: TurnSnapshot) -> None:
         return None
@@ -139,3 +98,23 @@ class NoopReviewScheduler:
 class AllowAllGuard:
     def check(self, invocation: ToolInvocation) -> GuardDecision:
         return GuardDecision(allowed=True)
+
+
+__all__ = [
+    "AllowAllGuard",
+    "ApprovalDecision",
+    "Approver",
+    "CancellationToken",
+    "GuardDecision",
+    "MemoryProvider",
+    "MemoryUpdater",
+    "NoopMemoryProvider",
+    "NoopMemoryUpdater",
+    "NoopReviewScheduler",
+    "ReviewScheduler",
+    "ToolContext",
+    "ToolGuard",
+    "ToolInvocation",
+    "TurnCancelled",
+    "TurnSnapshot",
+]

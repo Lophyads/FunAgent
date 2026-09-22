@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-from .builtins import default_tool_registry
+from .builtins import default_tool_catalog
 from .config import load_config
 from .core import AgentCore
 
@@ -28,7 +28,7 @@ def _chat(config_path: Path, requested_session: str | None) -> int:
     print(f"session: {session_id}")
     print("commands: /new, /session, /exit")
 
-    with AgentCore(config, default_tool_registry()) as agent:
+    with AgentCore(config, default_tool_catalog()) as agent:
         while True:
             try:
                 line = input("you> ")

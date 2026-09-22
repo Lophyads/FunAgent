@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field
 
 from .interfaces import ToolContext
-from .tools import ToolRegistry, ToolSpec
+from .tools import ToolCatalog, ToolSpec
 
 
 class CalculatorArgs(BaseModel):
@@ -71,9 +71,11 @@ def _current_time(args: CurrentTimeArgs, context: ToolContext) -> dict[str, str]
     return {"timezone": args.timezone, "iso8601": now.isoformat()}
 
 
-def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
-    registry.register(
+def register_builtin_tools(catalog: ToolCatalog) -> ToolCatalog:
+    catalog.register(
         ToolSpec(
+            tool_id="builtin.calculator",
+            implementation_version="1",
             name="calculator",
             description="Evaluate a bounded arithmetic expression using numbers and +, -, *, /, //, %, or **.",
             args_model=CalculatorArgs,
@@ -81,8 +83,10 @@ def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
             side_effects="none",
         )
     )
-    registry.register(
+    catalog.register(
         ToolSpec(
+            tool_id="builtin.current_time",
+            implementation_version="1",
             name="current_time",
             description="Return the current time in an IANA timezone such as UTC or Asia/Shanghai.",
             args_model=CurrentTimeArgs,
@@ -90,9 +94,8 @@ def register_builtin_tools(registry: ToolRegistry) -> ToolRegistry:
             side_effects="none",
         )
     )
-    return registry
+    return catalog
 
 
-def default_tool_registry() -> ToolRegistry:
-    return register_builtin_tools(ToolRegistry())
-
+def default_tool_catalog() -> ToolCatalog:
+    return register_builtin_tools(ToolCatalog())

@@ -24,6 +24,8 @@ def load_config(path: str | Path) -> AgentConfig:
         "retry": raw.get("retry", {}),
         "workers": raw.get("workers", {}),
         "timeouts": raw.get("timeouts", {}),
+        "lease": raw.get("lease", {}),
+        "session_defaults": raw.get("session", {}),
         "routes": raw.get("routes", []),
     }
     config = AgentConfig.model_validate(payload)

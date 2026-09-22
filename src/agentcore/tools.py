@@ -18,6 +18,8 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec(Generic[ArgsT]):
+    tool_id: str
+    implementation_version: str
     name: str
     description: str
     args_model: type[ArgsT]
@@ -25,6 +27,8 @@ class ToolSpec(Generic[ArgsT]):
     requires_approval: bool = False
     side_effects: Literal["none", "possible"] = "possible"
     timeout_seconds: float | None = None
+    toolsets: frozenset[str] = frozenset({"default"})
+    required_permissions: frozenset[str] = frozenset()
 
     def definition(self) -> dict[str, Any]:
         return {
@@ -37,11 +41,12 @@ class ToolSpec(Generic[ArgsT]):
         }
 
 
-class ToolRegistry:
+class ToolCatalog:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec[Any]] = {}
+        self._versions: dict[tuple[str, str], ToolSpec[Any]] = {}
         self._frozen = False
-        self._definitions: tuple[dict[str, Any], ...] = ()
+        self._ordered: tuple[ToolSpec[Any], ...] = ()
 
     @property
     def frozen(self) -> bool:
@@ -49,7 +54,11 @@ class ToolRegistry:
 
     def register(self, spec: ToolSpec[Any]) -> None:
         if self._frozen:
-            raise RuntimeError("tool registry is frozen")
+            raise RuntimeError("tool catalog is frozen")
+        if not _TOOL_NAME_RE.fullmatch(spec.tool_id):
+            raise ValueError(f"invalid tool id: {spec.tool_id!r}")
+        if not spec.implementation_version.strip():
+            raise ValueError("implementation_version must not be blank")
         if not _TOOL_NAME_RE.fullmatch(spec.name):
             raise ValueError(f"invalid tool name: {spec.name!r}")
         if not spec.description.strip():
@@ -64,23 +73,35 @@ class ToolRegistry:
             raise ValueError("tool timeout_seconds must be greater than zero")
         if spec.name in self._tools:
             raise ValueError(f"tool already registered: {spec.name}")
+        identity = (spec.tool_id, spec.implementation_version)
+        if identity in self._versions:
+            raise ValueError(
+                "tool implementation already registered: "
+                f"{spec.tool_id}@{spec.implementation_version}"
+            )
         self._tools[spec.name] = spec
+        self._versions[identity] = spec
 
     def freeze(self) -> None:
         if self._frozen:
             return
-        ordered = [self._tools[name] for name in sorted(self._tools)]
-        self._definitions = tuple(spec.definition() for spec in ordered)
+        self._ordered = tuple(sorted(
+            self._tools.values(), key=lambda spec: (spec.tool_id, spec.name)
+        ))
         self._frozen = True
 
     def get(self, name: str) -> ToolSpec[Any] | None:
         return self._tools.get(name)
 
-    def definitions(self) -> list[dict[str, Any]]:
+    def get_versioned(
+        self, tool_id: str, implementation_version: str
+    ) -> ToolSpec[Any] | None:
+        return self._versions.get((tool_id, implementation_version))
+
+    def specs(self) -> tuple[ToolSpec[Any], ...]:
         if not self._frozen:
-            raise RuntimeError("freeze the tool registry before reading definitions")
-        # Return detached JSON-shaped values so callers cannot mutate the snapshot.
-        return json.loads(json.dumps(self._definitions, ensure_ascii=False))
+            raise RuntimeError("freeze the tool catalog before reading specs")
+        return self._ordered
 
     def invoke(self, spec: ToolSpec[Any], args: BaseModel, context: ToolContext) -> Any:
         result = spec.handler(args, context)
@@ -127,4 +148,3 @@ def _encode_bounded(payload: dict[str, Any], max_chars: int) -> str:
         bounded["preview"] = rendered[:preview_budget]
         encoded = _json_dumps(bounded)
     return encoded[:max_chars]
-
