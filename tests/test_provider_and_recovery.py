@@ -21,7 +21,7 @@ def _routes(primary_attempts: int = 1) -> list[ModelRoute]:
 
 
 @pytest.mark.asyncio
-async def test_retry_then_fallback_uses_one_ledger_entry_per_send(config_factory, agent_factory):
+async def test_retry_then_fallback_counts_each_send_without_persistent_attempts(config_factory, agent_factory):
     error = NormalizedProviderError("temporary", status_code=503, retryable=True, allow_fallback=True)
     primary = ScriptedTransport(error, error)
     fallback = ScriptedTransport(NormalizedModelResponse(content="fallback answer", finish_reason="stop"))
@@ -38,8 +38,10 @@ async def test_retry_then_fallback_uses_one_ledger_entry_per_send(config_factory
     assert result.route_attempts == {"primary": 2, "fallback": 1}
     assert len(primary.requests) == 2 and len(fallback.requests) == 1
     with sqlite3.connect(config.database_path) as connection:
-        states = [row[0] for row in connection.execute("SELECT state FROM model_attempts ORDER BY started_at")]
-    assert states == ["failed", "failed", "succeeded"]
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+    assert "model_attempts" not in tables
 
 
 @pytest.mark.asyncio

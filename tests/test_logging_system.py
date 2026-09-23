@@ -86,19 +86,19 @@ def test_debug_previews_and_redaction(
     assert "turn.phase_started" in raw
 
 
-def test_tool_message_validation_failure_logs_safe_details(
+def test_tool_message_with_text_is_valid_and_logs_safe_details(
     config_factory, agent_factory, tmp_path,
 ):
     config = config_factory()
     transport = ScriptedTransport(NormalizedModelResponse(
-        content="",
+        content="Checking the time now.",
         tool_calls=[ToolCall(
             id="invalid-content-1",
             name="current_time",
             arguments='{"timezone":"UTC","password":"private-tool-secret"}',
         )],
         finish_reason="tool_calls",
-    ))
+    ), NormalizedModelResponse(content="finished", finish_reason="stop"))
 
     with configure_logging(config) as handle:
         with agent_factory(
@@ -111,18 +111,14 @@ def test_tool_message_validation_failure_logs_safe_details(
 
     agent_log = _text(tmp_path / "logs" / "agent.log")
     error_log = _text(tmp_path / "logs" / "errors.log")
-    assert result.status == "failed"
-    assert result.completion_reason == "turn_failed"
+    assert result.status == "completed"
+    assert result.completion_reason == "model_final"
     assert "tool.round_preparing" in agent_log
     assert "'content_type': 'str'" in agent_log
-    assert "'content_length': 0" in agent_log
-    assert "'content_preview': ''" in agent_log
+    assert "'content_length': 22" in agent_log
     assert "response_content_present=True" in agent_log
-    assert "response_content_length=0" in agent_log
-    assert "tool.message_validation_failed" in error_log
-    assert "assistant tool message must not include text content" in error_log
-    assert "turn.unhandled_error" in error_log
-    assert "Traceback" in error_log
+    assert "response_content_length=22" in agent_log
+    assert "tool.message_validation_failed" not in error_log
     assert "private-tool-secret" not in agent_log + error_log
 
 

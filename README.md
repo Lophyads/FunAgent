@@ -6,10 +6,10 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 
 当前实现包括：
 
-- 不可变 Session Prompt/Toolset Snapshot，Memory recall 只在新 Session bootstrap 时执行。
+- Session 仅冻结 Prompt；工具定义在每个 Turn 开始时重新解析，Memory recall 只在新 Session bootstrap 时执行。
 - Provider Resolver、API Mode Adapter 与单次请求 Transport 三层解耦。
 - 显式 Phase orchestrator，Provider retry 不增加 Agent iteration。
-- SQLite schema v7：消息、工具执行、模型 attempt、Session Lease、生命周期和投递账本。
+- SQLite schema v8：Session、消息、Session Lease 和投递义务四张业务表。
 - 单调 fencing token、独立 heartbeat 线程和 stale-owner 写入拒绝。
 - 顺序工具执行、Pydantic 参数校验、guard、approval 与未知副作用恢复语义。
 - GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
@@ -89,8 +89,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-可通过 keyword-only `session_request` 显式创建 Session Snapshot。既有 Session 再传入
-不同 request 会 fail closed，不会因当前配置变化替换旧 Prompt 或 Toolset。
+可通过 keyword-only `session_request` 指定新 Session 的身份及当前工具权限。
+既有 Session 的 profile/surface/platform 不允许改变，Prompt 保持原样；当前配置和
+Catalog 的工具变更只影响后续 Turn。
 
 ## Gateway 与回复投递
 
@@ -124,7 +125,7 @@ delivery obligation。`GatewayRuntime.wait_for_recovery()` 可用作启动恢复
 
 ## 自定义工具
 
-进程级 `ToolCatalog` 描述已安装实现，`ToolsetResolver` 决定某个 Session 能看到哪些
+进程级 `ToolCatalog` 描述可用实现，`ToolsetResolver` 决定每个 Turn 能看到哪些
 工具。每个实现必须提供稳定的 `tool_id` 与 `implementation_version`：
 
 ```python
@@ -153,7 +154,9 @@ catalog.register(ToolSpec(
 ))
 ```
 
-`AgentCore` 构造后 Catalog 冻结。异步 handler 会被拒绝；异步服务需要由集成方提供显式
+`AgentCore` 构造时冻结初始 Catalog；调用 `agent.update_tools(specs)` 可原子发布新定义，
+仅影响后续 Turn，进行中的 Turn 继续使用已解析的工具快照。Session 只冻结 system prompt。
+异步 handler 会被拒绝；异步服务需要由集成方提供显式
 同步适配器。工具超时表示 Core 停止等待，不表示线程被强制终止。已进入只读 handler
 后结果为 `unknown/none`；已进入可能有副作用的 handler 后结果为
 `unknown/unknown`。未完成工具永不自动重放。
@@ -168,7 +171,11 @@ cooldown、fallback 和当前 Turn route 粘滞由 ConversationLoop 统一控制
 
 `TurnResult.status == "completed"` 仅表示模型正常结束本轮。业务工具是否成功需结合
 `completion_reason`、`tool_outcomes`、`provider_attempts` 和 `route_attempts` 判断。
-`context_version` 在 admission 前失败时为 `None`。
+
+SQLite v8 仅包含 `sessions`、`messages`、`session_leases` 和
+`delivery_obligations` 四张业务表。历史顺序由 `messages.id` 决定；崩溃恢复从
+Session 尾消息和过期 lease 判断。v8 不迁移旧库，升级前须停止旧进程并显式删除旧
+SQLite 文件及其 WAL/SHM sidecar；旧会话数据不可恢复。
 
 ## 配置
 

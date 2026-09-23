@@ -28,11 +28,12 @@ def test_message_named_constructors_round_trip():
     call = ToolCall(id="call-1", name="calculator", arguments='{"expression":"1+1"}')
     messages = [
         Message.user("question", api_content="question with context", metadata={"a": 1}),
-        Message.assistant_text("answer", finish_reason="stop"),
-        Message.assistant_tools([call], finish_reason="tool_calls"),
+        Message.assistant_text("answer"),
+        Message.assistant_tools([call], tool_call_effects={"call-1": "none"}),
         Message.tool_result(
             '{"ok":true}', tool_call_id="call-1", tool_name="calculator",
-            effect_disposition="none", metadata={"execution_state": "succeeded"},
+            effect_disposition="none", reply_to_message_id=3,
+            tool_outcome_state="succeeded",
         ),
     ]
 
@@ -49,10 +50,7 @@ def test_message_named_constructors_round_trip():
         {"role": "assistant"},
         {"role": "assistant", "content": "x", "api_content": "forbidden"},
         {"role": "assistant", "tool_calls": []},
-        {
-            "role": "assistant", "content": "x",
-            "tool_calls": [{"id": "c", "name": "calculator"}],
-        },
+        {"role": "assistant", "content": "x", "tool_call_effects": {"c": "none"}},
         {
             "role": "assistant", "tool_calls": [
                 {"id": "same", "name": "calculator"},
@@ -93,55 +91,52 @@ def test_normalized_response_requires_semantic_content_and_unique_tool_ids():
 
 
 @pytest.mark.parametrize(
-    ("side_effects", "state", "effect", "error_type", "may_run"),
+    ("side_effects", "state", "effect", "error_type"),
     [
-        ("none", "succeeded", "none", None, False),
-        ("possible", "succeeded", "confirmed", None, False),
-        ("none", "failed", "not_applied", "invalid_arguments", False),
-        ("possible", "denied", "not_applied", "policy_denied", False),
-        ("possible", "not_executed", "not_applied", "cancelled", False),
-        ("none", "unknown", "none", "timeout", True),
-        ("possible", "unknown", "unknown", "timeout", True),
+        ("none", "succeeded", "none", None),
+        ("possible", "succeeded", "confirmed", None),
+        ("none", "failed", "not_applied", "invalid_arguments"),
+        ("possible", "denied", "not_applied", "policy_denied"),
+        ("possible", "not_executed", "not_applied", "cancelled"),
+        ("none", "unknown", "none", "timeout"),
+        ("possible", "unknown", "unknown", "timeout"),
     ],
 )
 def test_tool_outcome_accepts_legal_state_matrix(
-    side_effects, state, effect, error_type, may_run,
+    side_effects, state, effect, error_type,
 ):
     outcome = ToolOutcome(
         tool_call_id="call", tool_name="tool", side_effects=side_effects,
         state=state, effect_disposition=effect, error_type=error_type,
-        may_still_be_running=may_run,
     )
     assert outcome.effect_disposition == effect
 
 
 @pytest.mark.parametrize(
-    ("side_effects", "state", "effect", "error_type", "may_run"),
+    ("side_effects", "state", "effect", "error_type"),
     [
-        ("possible", "succeeded", "unknown", None, False),
-        ("none", "succeeded", "none", "unexpected", False),
-        ("possible", "denied", "unknown", "denied", False),
-        ("possible", "not_executed", "unknown", "cancelled", False),
-        ("none", "unknown", "unknown", "timeout", True),
-        ("possible", "unknown", "none", "timeout", True),
-        ("possible", "failed", "confirmed", "error", False),
-        ("possible", "failed", "unknown", "error", True),
+        ("possible", "succeeded", "unknown", None),
+        ("none", "succeeded", "none", "unexpected"),
+        ("possible", "denied", "unknown", "denied"),
+        ("possible", "not_executed", "unknown", "cancelled"),
+        ("none", "unknown", "unknown", "timeout"),
+        ("possible", "unknown", "none", "timeout"),
+        ("possible", "failed", "confirmed", "error"),
     ],
 )
 def test_tool_outcome_rejects_illegal_state_matrix(
-    side_effects, state, effect, error_type, may_run,
+    side_effects, state, effect, error_type,
 ):
     with pytest.raises(ValidationError):
         ToolOutcome(
             tool_call_id="call", tool_name="tool", side_effects=side_effects,
             state=state, effect_disposition=effect, error_type=error_type,
-            may_still_be_running=may_run,
         )
 
 
 def test_turn_result_enforces_terminal_error_and_attempt_contracts():
     base = {
-        "session_id": "session", "turn_id": "turn", "context_version": 1,
+        "session_id": "session", "turn_id": "turn",
         "provider_attempts": 1, "route_attempts": {"primary": 1},
     }
     assert TurnResult(status="completed", **base).error is None

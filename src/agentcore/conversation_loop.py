@@ -29,7 +29,6 @@ from .provider_runtime import (
 )
 from .session_context import (
     SessionBuildRequest, SessionContextFactory, SessionSnapshotConflict,
-    ToolsetRebindError,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
 from tools.tools import encode_tool_error, encode_tool_success
@@ -123,6 +122,7 @@ class ConversationLoop:
         self.recovery = recovery
         self.delivery_destination = delivery_destination
         self.max_recovery_attempts = max_recovery_attempts
+        self._tool_parent_id: int | None = None
 
     def run(self) -> TurnResult:
         with log_context(self.config, self.session_id):
@@ -159,14 +159,6 @@ class ConversationLoop:
             self._run_iterations(runtime, state)
         except SessionSnapshotConflict as exc:
             self._set_error(state, "failed", "session_snapshot_conflict", exc, False)
-        except ToolsetRebindError as exc:
-            logger.warning('session.rebind_failed error_type=%s', type(exc).__name__)
-            state.warnings.extend(runtime.observability.publish(
-                "session.rebind_failed", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                payload={"error_type": type(exc).__name__},
-            ))
-            self._set_error(state, "failed", "toolset_rebind_failed", exc, False)
         except LeaseAcquireTimeout as exc:
             self._set_error(state, "failed", "lease_timeout", exc, True)
         except LeaseLostError as exc:
@@ -334,11 +326,12 @@ class ConversationLoop:
                     session_id=state.session_id, turn_id=state.turn_id,
                 ))
             else:
-                lifecycle = self.store.get_session_lifecycle(state.session_id)
+                lifecycle = self.store.get_session_recovery(state.session_id)
                 state.user_driven_recovery = bool(
                     lifecycle and lifecycle["resume_pending"]
                 )
-            repaired = self.store.recover_incomplete_turns(
+            # todo 完全可以在 _establish_turn_phase 拿到历史会话记录后再进行尾部判断，没必要再取一遍数据
+            repaired = self.store.repair_latest_tool_batch(
                 state.session_id, fence=lease.fence
             )
             state.warnings.extend(repaired.warnings)
@@ -393,22 +386,12 @@ class ConversationLoop:
             if resolution.created:
                 state.admitted = True
             state.warnings.extend(resolution.warnings)
-            if any("defaults differ" in item for item in resolution.warnings):
-                logger.warning('session.config_mismatch_deferred')
-                state.warnings.extend(runtime.observability.publish(
-                    "session.config_mismatch_deferred",
-                    trace_id=state.trace_id, session_id=state.session_id,
-                    turn_id=state.turn_id,
-                ))
             session_event = "session.created" if resolution.created else "session.loaded"
-            logger.info('%s context_version=%s', session_event, resolution.snapshot.context_version)
+            logger.info('%s', session_event)
             state.warnings.extend(runtime.observability.publish(
                 "session.created" if resolution.created else "session.loaded",
                 trace_id=state.trace_id, session_id=state.session_id,
                 turn_id=state.turn_id,
-                payload={
-                    "context_version": resolution.snapshot.context_version
-                },
             ))
             return PhaseResult()
 
@@ -424,31 +407,28 @@ class ConversationLoop:
     def _establish_turn_phase(self) -> FunctionPhase:
         def begin(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
             lease = state.require_lease('establish_turn')
-            context = state.require_context('establish_turn')
+            state.require_context('establish_turn')
             if self.recovery:
-                message = self.store.begin_recovery_turn(
-                    turn_id=state.turn_id, session_id=state.session_id,
-                    context_version=context.context_version,
-                    fence=lease.fence,
-                )
+                latest = self.store.latest_message(state.session_id)
+                if latest is None:
+                    raise StorageError("recovery session has no message tail")
+                message = latest[1]
             else:
                 message = Message.user(
                     self.user_input.text, metadata=self.user_input.metadata
                 )
                 if not state.session_created:
-                    self.store.begin_turn(
-                        turn_id=state.turn_id, session_id=state.session_id,
-                        context_version=context.context_version,
-                        user_message=message, fence=lease.fence,
+                    self.store.append_user_message(
+                        state.session_id, message, fence=lease.fence
                     )
             state.submitted_message = message
-            state.new_messages.append(message)
+            if not self.recovery:
+                state.new_messages.append(message)
             state.admitted = True
-            logger.info('turn.admitted context_version=%s', context.context_version)
+            logger.info('turn.admitted')
             state.warnings.extend(runtime.observability.publish(
                 "turn.admitted", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
-                payload={"context_version": context.context_version},
             ))
             return PhaseResult()
 
@@ -487,12 +467,11 @@ class ConversationLoop:
                 tool_schema_bytes=context.toolset.schema_bytes,
             )
             logger.debug(
-                'turn.request_assembled phase=%s iteration=%s message_count=%s tool_count=%s context_version=%s',
+                'turn.request_assembled phase=%s iteration=%s message_count=%s tool_count=%s',
                 'assemble_request',
                 state.iteration,
                 len(state.request.messages),
                 len(context.toolset.bindings),
-                context.context_version,
             )
             return PhaseResult()
 
@@ -546,9 +525,6 @@ class ConversationLoop:
             if response.tool_calls:
                 raise RuntimeError('finish_text requires a text response')
             text = response.content or ""
-            assistant = Message.assistant_text(
-                text, finish_reason=response.finish_reason
-            )
             if response.finish_reason in {"length", "content_filter"}:
                 state.status = "failed"
                 state.completion_reason = "incomplete_response"
@@ -557,22 +533,18 @@ class ConversationLoop:
                     message=f"model stopped with finish_reason={response.finish_reason}",
                     retryable=response.finish_reason == "length",
                 )
+                state.finalized = True
+                return PhaseResult(PhaseAction.BREAK)
             else:
                 state.status = "completed"
                 state.completion_reason = "model_final"
                 state.error = None
-            committed = self.store.finish_turn_with_message(
-                session_id=state.session_id, turn_id=state.turn_id,
-                message=assistant, status=state.status, error=state.error,
-                route_name=state.route_used, iterations=state.iteration,
-                usage=state.usage, completion_reason=state.completion_reason,
-                provider_attempts=state.provider_attempts,
-                route_attempts=state.route_attempts, fence=lease.fence,
+            assistant = Message.assistant_text(text)
+            self.store.append_final_assistant(
+                state.session_id, assistant, fence=lease.fence,
                 delivery_destination=self.delivery_destination,
                 recovery=self.recovery or state.user_driven_recovery,
             )
-            if not committed:
-                raise StorageError("terminal turn was already finalized")
             state.assistant_message = assistant
             state.final_text = text
             state.messages.append(assistant)
@@ -592,7 +564,7 @@ class ConversationLoop:
         self, runtime: TurnRuntime, state: LoopState,
     ) -> tuple[NormalizedModelResponse, int]:
         request = state.require_request('provider_attempts')
-        lease = state.require_lease('provider_attempts')
+        state.require_lease('provider_attempts')
         failures: list[dict[str, Any]] = []
         for route_index in range(state.active_route_index, len(self.config.routes)):
             route = self.config.routes[route_index]
@@ -623,14 +595,6 @@ class ConversationLoop:
                 state.provider_attempts += 1
                 state.route_attempts[route.name] = (
                     state.route_attempts.get(route.name, 0) + 1
-                )
-                self.store.begin_model_attempt(
-                    attempt_id=attempt_id, turn_id=state.turn_id,
-                    session_id=state.session_id, iteration=state.iteration,
-                    route_index=route_index, route_name=route.name,
-                    attempt_number=attempt_number,
-                    request_fingerprint=request.fingerprint,
-                    fence=lease.fence,
                 )
                 logger.debug(
                     'provider.attempt_started phase=%s route=%s iteration=%s attempt=%s',
@@ -701,22 +665,10 @@ class ConversationLoop:
                     )
                     normalized = adapter.decode(raw_response, binding)
                 except (TurnCancelled, RunBudgetExceeded, LeaseLostError):
-                    self.store.finish_model_attempt(
-                        attempt_id, state="ambiguous",
-                        error_type="interrupted", status_code=None,
-                        fence=lease.fence,
-                    )
                     raise
                 except BaseException as exc:
                     error = adapter.normalize_error(exc)
                     state.attempt.provider_error = error
-                    self.store.finish_model_attempt(
-                        attempt_id,
-                        state="ambiguous" if error.ambiguous else "failed",
-                        error_type=error.error_type,
-                        status_code=error.status_code,
-                        fence=lease.fence,
-                    )
                     failure_payload = {
                         "route": route.name, "attempt": attempt_number,
                         "error_type": error.error_type,
@@ -793,11 +745,6 @@ class ConversationLoop:
                         break
                     raise ProviderRequestAborted(route.name, error) from exc
                 else:
-                    self.store.finish_model_attempt(
-                        attempt_id, state="succeeded",
-                        error_type=None, status_code=None,
-                        fence=lease.fence,
-                    )
                     route_state.clear()
                     response_content = normalized.content
                     response_content_preview = (
@@ -900,9 +847,15 @@ class ConversationLoop:
             len(call_ids) - len(set(call_ids)),
         )
         try:
+            effects = {
+                call.id: (
+                    context.toolset.get(call.name).spec.side_effects
+                    if context.toolset.get(call.name) else "possible"
+                ) for call in response.tool_calls
+            }
             assistant = Message.assistant_tools(
                 response.tool_calls, content=response.content,
-                finish_reason=response.finish_reason,
+                tool_call_effects=effects,
             )
         except ValidationError as exc:
             logger.error(
@@ -917,16 +870,9 @@ class ConversationLoop:
                 self._validation_error_details(exc),
             )
             raise
-        staged = []
-        for call in response.tool_calls:
-            binding = context.toolset.get(call.name)
-            staged.append(
-                (call, binding.spec.side_effects if binding else "possible")
-            )
         try:
-            self.store.stage_tool_calls(
-                state.session_id, state.turn_id, assistant, staged,
-                fence=lease.fence,
+            self._tool_parent_id = self.store.append_tool_calls(
+                state.session_id, assistant, fence=lease.fence,
             )
         except BaseException as exc:
             logger.error(
@@ -954,6 +900,7 @@ class ConversationLoop:
             )
         state.messages.append(assistant)
         state.new_messages.append(assistant)
+        state.assistant_message = assistant
         for tool_call in response.tool_calls:
             runtime.check_active(state)
             logger.debug(
@@ -964,16 +911,9 @@ class ConversationLoop:
             tool_started = time.monotonic()
             executed = self._execute_tool(runtime, state, tool_call)
             tool_duration_ms = int((time.monotonic() - tool_started) * 1000)
-            persisted = self.store.complete_tool_call(
-                session_id=state.session_id, turn_id=state.turn_id,
-                message=executed.message, state=executed.outcome.state,
-                effect_disposition=executed.outcome.effect_disposition,
-                error_type=executed.outcome.error_type,
-                may_still_be_running=executed.outcome.may_still_be_running,
-                fence=lease.fence,
+            self.store.append_tool_result(
+                state.session_id, executed.message, fence=lease.fence,
             )
-            if not persisted:
-                raise StorageError(f"tool outcome already terminal: {tool_call.id}")
             state.messages.append(executed.message)
             state.new_messages.append(executed.message)
             state.tool_outcomes.append(executed.outcome)
@@ -1075,10 +1015,8 @@ class ConversationLoop:
 
         def invoke() -> Any:
             cancellation.raise_if_cancelled()
-            if not self.store.mark_tool_running(
-                state.turn_id, tool_call.id, fence=lease.fence
-            ):
-                raise StorageError("tool execution was no longer pending")
+            runtime.check_active(state)
+            self.store.assert_lease(lease)
             started.set()
             runtime.observability.publish(
                 "tool.running", trace_id=state.trace_id,
@@ -1201,9 +1139,6 @@ class ConversationLoop:
             ),
             FunctionPhase("finalize_turn", self._finalize, check_active=False),
             FunctionPhase(
-                "clear_active_turn", self._clear_active_turn, check_active=False
-            ),
-            FunctionPhase(
                 "record_recovery_failure", self._record_recovery_failure,
                 check_active=False,
             ),
@@ -1224,12 +1159,23 @@ class ConversationLoop:
     def _repair(self, runtime: TurnRuntime, state: LoopState) -> PhaseResult:
         if state.lease is None or not state.admitted:
             return PhaseResult()
-        recovery = self.store.repair_turn_tool_calls(
-            state.session_id, state.turn_id, fence=state.lease.fence
+        recovery = self.store.repair_latest_tool_batch(
+            state.session_id, fence=state.lease.fence
         )
         state.warnings.extend(recovery.warnings)
         state.messages.extend(recovery.messages)
         state.new_messages.extend(recovery.messages)
+        for message in recovery.messages:
+            side_effects = (
+                "none" if message.effect_disposition == "none" else "possible"
+            )
+            state.tool_outcomes.append(ToolOutcome(
+                tool_call_id=message.tool_call_id or "",
+                tool_name=message.tool_name or "",
+                side_effects=side_effects, state="unknown",
+                effect_disposition=message.effect_disposition or "unknown",
+                error_type=message.tool_error_type,
+            ))
         if recovery.messages:
             logger.info(
                 'recovery.tool_pair_repaired phase=%s repair_count=%s',
@@ -1253,31 +1199,7 @@ class ConversationLoop:
                 message=state.completion_reason.replace("_", " "),
                 retryable=False,
             )
-        committed = self.store.finish_turn(
-            session_id=state.session_id, turn_id=state.turn_id,
-            status=state.status, error=state.error,
-            route_name=state.route_used, iterations=state.iteration,
-            usage=state.usage, completion_reason=state.completion_reason,
-            provider_attempts=state.provider_attempts,
-            route_attempts=state.route_attempts,
-            fence=state.lease.fence,
-        )
-        persisted = self.store.get_turn(state.turn_id)
-        state.finalized = committed or bool(
-            persisted and persisted["status"] != "running"
-        )
-        return PhaseResult()
-
-    def _clear_active_turn(
-        self, runtime: TurnRuntime, state: LoopState
-    ) -> PhaseResult:
-        if (
-            not self.recovery and state.lease is not None
-            and state.admitted and state.finalized
-        ):
-            self.store.clear_active_turn(
-                state.session_id, state.turn_id, fence=state.lease.fence
-            )
+        state.finalized = True
         return PhaseResult()
 
     def _record_recovery_failure(
@@ -1387,22 +1309,14 @@ class ConversationLoop:
                 message=state.completion_reason.replace("_", " "),
                 retryable=False,
             )
-        outcomes = (
-            self.store.get_tool_outcomes(state.turn_id)
-            if state.admitted else state.tool_outcomes
-        )
         return TurnResult(
             status=state.status, final_text=state.final_text,
             session_id=state.session_id, turn_id=state.turn_id,
             new_messages=state.new_messages, iterations=state.iteration,
             route_used=state.route_used, usage=state.usage,
             warnings=state.warnings, error=state.error,
-            context_version=(
-                state.context.context_version
-                if state.admitted and state.context is not None else None
-            ),
             completion_reason=state.completion_reason,
-            tool_outcomes=outcomes,
+            tool_outcomes=state.tool_outcomes,
             provider_attempts=state.provider_attempts,
             route_attempts=state.route_attempts,
         )
@@ -1474,11 +1388,10 @@ class ConversationLoop:
                     "outcome_unknown",
                     "Tool execution stopped being observed; its outcome is unknown.",
                     self.config.tool_result_max_chars,
-                    may_still_be_running=True,
                 ),
                 side_effects=side_effects, state_name="unknown",
                 effect="none" if side_effects == "none" else "unknown",
-                error_type=reason, may_still_be_running=True,
+                error_type=reason,
                 interrupt_reason=(
                     reason if reason in {"cancelled", "run_budget"} else None
                 ),
@@ -1508,27 +1421,26 @@ class ConversationLoop:
             requires_approval=requires_approval,
         )
 
-    @staticmethod
     def _tool_result(
-        call: ToolCall, invocation: ToolInvocation, content: str, *,
+        self, call: ToolCall, invocation: ToolInvocation, content: str, *,
         side_effects: str, state_name: str, effect: str,
-        error_type: str | None, may_still_be_running: bool = False,
+        error_type: str | None,
         interrupt_reason: str | None = None,
     ) -> _ToolExecution:
+        if self._tool_parent_id is None:
+            raise StorageError("tool result has no persisted assistant parent")
         outcome = ToolOutcome(
             tool_call_id=call.id, tool_name=call.name,
             side_effects=side_effects, state=state_name,
             effect_disposition=effect, error_type=error_type,
-            may_still_be_running=may_still_be_running,
         )
         return _ToolExecution(
             message=Message.tool_result(
                 content, tool_call_id=call.id, tool_name=call.name,
                 effect_disposition=effect,
-                metadata={
-                    "execution_state": state_name,
-                    "may_still_be_running": may_still_be_running,
-                },
+                reply_to_message_id=self._tool_parent_id,
+                tool_outcome_state=state_name,
+                tool_error_type=error_type,
             ),
             outcome=outcome, invocation=invocation,
             interrupt_reason=interrupt_reason,

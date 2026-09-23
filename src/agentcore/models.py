@@ -148,7 +148,6 @@ class TurnTrigger:
     session_id: str
     user_input: UserInput | None = None
     recovery_reason: str | None = None
-    source_turn_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"user", "internal_recovery"}:
@@ -158,7 +157,7 @@ class TurnTrigger:
         if self.kind == "user":
             if not isinstance(self.user_input, UserInput):
                 raise ValueError("user trigger requires a UserInput")
-            if self.recovery_reason is not None or self.source_turn_id is not None:
+            if self.recovery_reason is not None:
                 raise ValueError("user trigger cannot carry recovery metadata")
         elif self.user_input is not None:
             raise ValueError("internal recovery must not repeat user_input")
@@ -215,12 +214,16 @@ class ToolCall(StrictModel):
 
 class Message(StrictModel):
     role: Literal["user", "assistant", "tool"]
+    kind: Literal["normal", "internal_recovery"] = "normal"
     content: str | None = None
     api_content: str | None = None
     tool_calls: list[ToolCall] | None = None
+    tool_call_effects: dict[str, Literal["none", "possible"]] | None = None
+    reply_to_message_id: int | None = Field(default=None, ge=1)
     tool_call_id: str | None = None
     tool_name: str | None = None
-    finish_reason: str | None = None
+    tool_outcome_state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"] | None = None
+    tool_error_type: str | None = None
     effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -233,7 +236,10 @@ class Message(StrictModel):
                 self.tool_calls is not None,
                 self.tool_call_id is not None,
                 self.tool_name is not None,
-                self.finish_reason is not None,
+                self.tool_call_effects is not None,
+                self.reply_to_message_id is not None,
+                self.tool_outcome_state is not None,
+                self.tool_error_type is not None,
                 self.effect_disposition is not None,
             )):
                 raise ValueError("user message contains fields reserved for assistant or tool")
@@ -244,6 +250,9 @@ class Message(StrictModel):
                 self.api_content is not None,
                 self.tool_call_id is not None,
                 self.tool_name is not None,
+                self.reply_to_message_id is not None,
+                self.tool_outcome_state is not None,
+                self.tool_error_type is not None,
                 self.effect_disposition is not None,
             )):
                 raise ValueError("assistant message contains fields reserved for user or tool")
@@ -255,8 +264,12 @@ class Message(StrictModel):
                 ids = [call.id for call in self.tool_calls]
                 if len(ids) != len(set(ids)):
                     raise ValueError("assistant tool call ids must be unique")
+                if self.tool_call_effects is not None and set(self.tool_call_effects) != set(ids):
+                    raise ValueError("tool_call_effects must cover exactly the tool call ids")
             elif self.content is None or not self.content.strip():
                 raise ValueError("assistant text message requires non-blank content")
+            elif self.tool_call_effects is not None:
+                raise ValueError("assistant text message cannot include tool_call_effects")
             return self
 
         if any((
@@ -264,6 +277,8 @@ class Message(StrictModel):
             self.tool_call_id is None,
             self.tool_name is None,
             self.effect_disposition is None,
+            self.tool_outcome_state is None,
+            self.reply_to_message_id is None,
         )):
             raise ValueError(
                 "tool result requires content, tool_call_id, tool_name, and effect_disposition"
@@ -271,7 +286,7 @@ class Message(StrictModel):
         if any((
             self.api_content is not None,
             self.tool_calls is not None,
-            self.finish_reason is not None,
+            self.tool_call_effects is not None,
         )):
             raise ValueError("tool result contains fields reserved for user or assistant")
         return self
@@ -288,34 +303,40 @@ class Message(StrictModel):
 
     @classmethod
     def assistant_text(
-        cls, content: str, *, finish_reason: str | None = None,
+        cls, content: str, *,
         metadata: dict[str, Any] | None = None,
     ) -> "Message":
         return cls(
-            role="assistant", content=content, finish_reason=finish_reason,
+            role="assistant", content=content,
             metadata=metadata or {},
         )
 
     @classmethod
     def assistant_tools(
         cls, tool_calls: list[ToolCall], *, content: str | None = None,
-        finish_reason: str | None = None,
+        tool_call_effects: dict[str, Literal["none", "possible"]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "Message":
         return cls(
             role="assistant", content=content, tool_calls=tool_calls,
-            finish_reason=finish_reason, metadata=metadata or {},
+            tool_call_effects=tool_call_effects, metadata=metadata or {},
         )
 
     @classmethod
     def tool_result(
         cls, content: str, *, tool_call_id: str, tool_name: str,
         effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"],
+        reply_to_message_id: int,
+        tool_outcome_state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"],
+        tool_error_type: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "Message":
         return cls(
             role="tool", content=content, tool_call_id=tool_call_id,
             tool_name=tool_name, effect_disposition=effect_disposition,
+            reply_to_message_id=reply_to_message_id,
+            tool_outcome_state=tool_outcome_state,
+            tool_error_type=tool_error_type,
             metadata=metadata or {},
         )
 
@@ -398,12 +419,9 @@ class ToolOutcome(StrictModel):
     state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"]
     effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"]
     error_type: str | None = None
-    may_still_be_running: bool = False
 
     @model_validator(mode="after")
     def _valid_execution_semantics(self) -> "ToolOutcome":
-        if self.may_still_be_running and self.state != "unknown":
-            raise ValueError("may_still_be_running is only valid for unknown outcomes")
         if self.state in {"denied", "not_executed"}:
             if self.effect_disposition != "not_applied":
                 raise ValueError(f"{self.state} outcome must be not_applied")
@@ -446,7 +464,6 @@ class TurnResult(StrictModel):
     usage: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     error: TurnError | None = None
-    context_version: int | None = Field(default=None, ge=1)
     completion_reason: str = "unknown"
     tool_outcomes: list[ToolOutcome] = Field(default_factory=list)
     provider_attempts: int = Field(default=0, ge=0)

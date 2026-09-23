@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import time
+import sqlite3
 
 from agentcore import (
     GatewayRuntime, LeasePolicy, Message, NormalizedModelResponse,
@@ -35,6 +36,14 @@ def _gateway(config, adapter, transport, **options):
         config, adapter, provider_resolver=resolver, api_modes=api_modes,
         **options,
     )
+
+
+def _expire_lease(database_path, session_id):
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE session_leases SET expires_at=? WHERE session_id=?",
+            (time.time() - 1, session_id),
+        )
 
 
 def test_failed_delivery_replays_without_calling_model(
@@ -77,12 +86,9 @@ def test_startup_converts_crashed_turn_to_internal_recovery(
         turn_id="crashed-turn", ttl_seconds=30,
     )
     assert lease is not None
-    store.begin_turn(
-        turn_id="crashed-turn", session_id="recover", context_version=1,
-        user_message=Message.user("second"), fence=lease.fence,
-    )
-    store.release_lease(lease)
+    store.append_user_message("recover", Message.user("second"), fence=lease.fence)
     store.close()
+    _expire_lease(config.database_path, "recover")
 
     adapter = RecordingAdapter(True)
     transport = ScriptedTransport(
@@ -91,22 +97,16 @@ def test_startup_converts_crashed_turn_to_internal_recovery(
     with _gateway(config, adapter, transport) as gateway:
         recovered = gateway.wait_for_recovery()
         gateway.delivery.drain()
-        lifecycle = gateway.agent._store.get_session_lifecycle("recover")
+        lifecycle = gateway.agent._store.get_session_recovery("recover")
         messages = gateway.agent._store.load_messages("recover")
-        crashed = gateway.agent._store.get_turn("crashed-turn")
 
     assert len(recovered) == 1
     assert recovered[0].status == "completed"
     assert recovered[0].completion_reason == "model_final"
     assert len(transport.requests) == 1
-    assert crashed["status"] == "failed"
     assert lifecycle["resume_pending"] == 0
-    assert lifecycle["active_turn_id"] is None
     assert sum(message.content == "second" for message in messages) == 1
-    assert sum(
-        message.metadata.get("message_kind") == "recovery"
-        for message in messages
-    ) == 1
+    assert sum(message.kind == "internal_recovery" for message in messages) == 0
     assert any(text == "continued" for _, text in adapter.sent)
 
 
@@ -128,33 +128,29 @@ def test_startup_repair_marks_running_tool_unknown_without_replay(
         turn_id="tool-crash", ttl_seconds=30,
     )
     assert lease is not None
-    store.begin_turn(
-        turn_id="tool-crash", session_id="tool-recover", context_version=1,
-        user_message=Message.user("run a tool"), fence=lease.fence,
+    store.append_user_message(
+        "tool-recover", Message.user("run a tool"), fence=lease.fence,
     )
     call = ToolCall(id="uncertain", name="current_time", arguments="{}")
-    store.stage_tool_calls(
-        "tool-recover", "tool-crash",
-        Message.assistant_tools([call], finish_reason="tool_calls"),
-        [(call, "possible")], fence=lease.fence,
+    store.append_tool_calls(
+        "tool-recover",
+        Message.assistant_tools([call], tool_call_effects={"uncertain": "possible"}),
+        fence=lease.fence,
     )
-    assert store.mark_tool_running(
-        "tool-crash", "uncertain", fence=lease.fence
-    )
-    store.release_lease(lease)
     store.close()
+    _expire_lease(config.database_path, "tool-recover")
 
     transport = ScriptedTransport(
         NormalizedModelResponse(content="continued", finish_reason="stop")
     )
     with _gateway(config, RecordingAdapter(True), transport) as gateway:
         assert gateway.wait_for_recovery()[0].status == "completed"
-        outcomes = gateway.agent._store.get_tool_outcomes("tool-crash")
         messages = gateway.agent._store.load_messages("tool-recover")
 
     assert len(transport.requests) == 1
+    outcomes = [message for message in messages if message.role == "tool"]
     assert len(outcomes) == 1
-    assert outcomes[0].state == "unknown"
+    assert outcomes[0].tool_outcome_state == "unknown"
     assert outcomes[0].effect_disposition == "unknown"
     assert sum(
         message.role == "tool" and message.tool_call_id == "uncertain"
@@ -179,13 +175,9 @@ def test_failed_recovery_suspends_after_attempt_limit(
         turn_id="suspended-crash", ttl_seconds=30,
     )
     assert lease is not None
-    store.begin_turn(
-        turn_id="suspended-crash", session_id="suspend",
-        context_version=1, user_message=Message.user("continue"),
-        fence=lease.fence,
-    )
-    store.release_lease(lease)
+    store.append_user_message("suspend", Message.user("continue"), fence=lease.fence)
     store.close()
+    _expire_lease(config.database_path, "suspend")
 
     with _gateway(
         config, RecordingAdapter(), ScriptedTransport(
@@ -193,7 +185,7 @@ def test_failed_recovery_suspends_after_attempt_limit(
         ), max_recovery_attempts=1,
     ) as gateway:
         result = gateway.wait_for_recovery()[0]
-        lifecycle = gateway.agent._store.get_session_lifecycle("suspend")
+        lifecycle = gateway.agent._store.get_session_recovery("suspend")
 
     assert result.status == "failed"
     assert lifecycle["resume_pending"] == 1
@@ -212,7 +204,7 @@ def test_failed_recovery_suspends_after_attempt_limit(
         user_result = gateway.run_turn_blocking(
             "please continue", session_id="suspend"
         )
-        lifecycle = gateway.agent._store.get_session_lifecycle("suspend")
+        lifecycle = gateway.agent._store.get_session_recovery("suspend")
     assert user_result.status == "completed"
     assert lifecycle["resume_pending"] == 0
     assert lifecycle["resume_suspended"] == 0
@@ -290,10 +282,8 @@ def test_quick_restart_recovers_after_stale_lease_expires(
         turn_id="quick-crash", ttl_seconds=0.25,
     )
     assert lease is not None
-    store.begin_turn(
-        turn_id="quick-crash", session_id="quick-restart",
-        context_version=1, user_message=Message.user("second"),
-        fence=lease.fence,
+    store.append_user_message(
+        "quick-restart", Message.user("second"), fence=lease.fence,
     )
     store.close()
 
@@ -306,7 +296,7 @@ def test_quick_restart_recovers_after_stale_lease_expires(
         while not gateway._recovery_submissions and time.monotonic() < deadline:
             time.sleep(0.05)
         results = gateway.wait_for_recovery()
-        lifecycle = gateway.agent._store.get_session_lifecycle(
+        lifecycle = gateway.agent._store.get_session_recovery(
             "quick-restart"
         )
 
@@ -317,19 +307,15 @@ def test_quick_restart_recovers_after_stale_lease_expires(
 
 
 
-def test_gateway_reports_prior_clean_shutdown(config_factory):
+def test_normal_shutdown_leaves_no_pending_recovery(config_factory, final_response):
     config = config_factory()
     with _gateway(
-        config, RecordingAdapter(), ScriptedTransport()
+        config, RecordingAdapter(), ScriptedTransport(final_response)
     ) as gateway:
-        assert gateway.last_shutdown_clean is True
+        assert gateway.run_turn_blocking("hello", session_id="clean").status == "completed"
 
     store = SQLiteStore(config.database_path)
     store.open()
-    assert store.record_runtime_start("simulated-dead-runtime") is True
+    assert store.mark_stale_leases() == []
+    assert store.list_pending_recoveries(3) == []
     store.close()
-
-    with _gateway(
-        config, RecordingAdapter(), ScriptedTransport()
-    ) as gateway:
-        assert gateway.last_shutdown_clean is False

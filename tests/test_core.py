@@ -64,16 +64,12 @@ async def test_final_text_persists_user_before_provider(
 
     with sqlite3.connect(config.database_path) as connection:
         roles = [row[0] for row in connection.execute(
-            "SELECT role FROM messages WHERE session_id = 's1' ORDER BY seq"
+            "SELECT role FROM messages WHERE session_id = 's1' ORDER BY id"
         )]
-        turn_status = connection.execute(
-            "SELECT status FROM turns WHERE id = ?", (result.turn_id,)
-        ).fetchone()[0]
     assert result.status == "completed"
     assert result.final_text == "done"
     assert result.usage["total_tokens"] == 5
     assert roles == ["user", "assistant"]
-    assert turn_status == "completed"
     assert transport.requests[0].body["messages"][0] == {
         "role": "system", "content": "test system",
     }
@@ -89,8 +85,8 @@ async def test_tool_call_is_persisted_before_handler_and_replayed(
     def echo(args: EchoArgs, context: ToolContext):
         with sqlite3.connect(config.database_path) as connection:
             count = connection.execute(
-                "SELECT COUNT(*) FROM messages WHERE turn_id = ? AND role = 'assistant' "
-                "AND tool_calls_json IS NOT NULL", (context.turn_id,)
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'assistant' "
+                "AND tool_calls_json IS NOT NULL", (context.session_id,)
             ).fetchone()[0]
         handler_observations.append(count)
         return {"echo": args.text}
@@ -343,14 +339,13 @@ async def test_max_iterations_returns_failed_result(config_factory, agent_factor
         config, transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("loop", session_id="limit")
-        persisted = agent._store.get_turn(result.turn_id)
     with sqlite3.connect(config.database_path) as connection:
         lease = connection.execute(
-            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            "SELECT owner_id FROM session_leases WHERE session_id = ?",
             ("limit",),
         ).fetchone()
 
-    assert result.status == persisted["status"] == "failed"
+    assert result.status == "failed"
     assert result.error.code == "max_iterations"
     assert result.iterations == 2
-    assert lease == (None, None)
+    assert lease == (None,)

@@ -52,12 +52,10 @@ def test_message_load_failure_still_finalizes_persisted_turn(
         config, transports={"primary": transport}, store=store,
     ) as agent:
         result = agent.run_turn_blocking("hello", session_id="load-fails")
-        persisted = store.get_turn(result.turn_id)
-        lifecycle = store.get_session_lifecycle("load-fails")
+        tail = store.latest_message("load-fails")
 
     assert result.status == "failed"
-    assert persisted["status"] == "failed"
-    assert lifecycle["active_turn_id"] is None
+    assert tail is not None and tail[1].role == "user"
     assert not transport.requests
 
 
@@ -136,18 +134,19 @@ def test_tool_continue_and_text_break_persist_and_release(
         observers=[PhaseObserver()],
     ) as agent:
         result = agent.run_turn_blocking("calculate", session_id="phase-actions")
-        persisted = agent._store.get_turn(result.turn_id)
+        tail = agent._store.latest_message("phase-actions")
     with sqlite3.connect(config.database_path) as connection:
         lease = connection.execute(
-            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            "SELECT owner_id FROM session_leases WHERE session_id = ?",
             ("phase-actions",),
         ).fetchone()
 
-    assert result.status == persisted["status"] == "completed"
+    assert result.status == "completed"
+    assert tail is not None and tail[1].role == "assistant"
     assert result.iterations == 2
     assert actions["tool_round"] == "continue"
     assert actions["finish_text"] == "break"
-    assert lease == (None, None)
+    assert lease == (None,)
 
 
 def test_return_verdict_still_runs_cleanup(
@@ -172,15 +171,16 @@ def test_return_verdict_still_runs_cleanup(
         config, transports={"primary": ScriptedTransport(final_response)},
     ) as agent:
         result = agent.run_turn_blocking("hello", session_id="return-verdict")
-        persisted = agent._store.get_turn(result.turn_id)
+        tail = agent._store.latest_message("return-verdict")
     with sqlite3.connect(config.database_path) as connection:
         lease = connection.execute(
-            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            "SELECT owner_id FROM session_leases WHERE session_id = ?",
             ("return-verdict",),
         ).fetchone()
 
-    assert result.status == persisted["status"] == "completed"
-    assert lease == (None, None)
+    assert result.status == "completed"
+    assert tail is not None and tail[1].role == "assistant"
+    assert lease == (None,)
 
 
 def test_terminal_fallthrough_fails_and_cleanup_finalizes(
@@ -197,17 +197,18 @@ def test_terminal_fallthrough_fails_and_cleanup_finalizes(
         config, transports={"primary": ScriptedTransport(final_response)},
     ) as agent:
         result = agent.run_turn_blocking("hello", session_id="bad-verdict")
-        persisted = agent._store.get_turn(result.turn_id)
+        tail = agent._store.latest_message("bad-verdict")
     with sqlite3.connect(config.database_path) as connection:
         lease = connection.execute(
-            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            "SELECT owner_id FROM session_leases WHERE session_id = ?",
             ("bad-verdict",),
         ).fetchone()
 
-    assert result.status == persisted["status"] == "failed"
+    assert result.status == "failed"
+    assert tail is not None and tail[1].role == "user"
     assert result.error.code == "turn_failed"
     assert "unexpected action fallthrough" in result.error.message
-    assert lease == (None, None)
+    assert lease == (None,)
 
 
 def test_admission_requires_fallthrough(
@@ -247,7 +248,7 @@ def test_cleanup_rejects_non_fallthrough_and_keeps_releasing_lease(
         result = agent.run_turn_blocking("hello", session_id="bad-cleanup")
     with sqlite3.connect(config.database_path) as connection:
         lease = connection.execute(
-            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            "SELECT owner_id FROM session_leases WHERE session_id = ?",
             ("bad-cleanup",),
         ).fetchone()
 
@@ -256,4 +257,4 @@ def test_cleanup_rejects_non_fallthrough_and_keeps_releasing_lease(
         "repair_unresolved_tools returned unexpected action break" in warning
         for warning in result.warnings
     )
-    assert lease == (None, None)
+    assert lease == (None,)

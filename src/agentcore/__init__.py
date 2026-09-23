@@ -88,7 +88,6 @@ from .session_context import (
     SessionContextResolution,
     SessionRuntimeSnapshot,
     SessionSnapshotConflict,
-    ToolsetRebindError,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
 from tools.tools import ToolCatalog, ToolSpec
@@ -134,7 +133,7 @@ __all__ = [
     "StaticSystemPromptBuilder", "StorageError", "SystemPromptBuilder",
     "SystemPromptSnapshot", "TimeoutPolicy", "ToolBinding", "ToolCall",
     "ToolCatalog", "ToolContext", "ToolGuard", "ToolInvocation", "ToolOutcome",
-    "ToolSpec", "ToolsetRebindError", "ToolsetRequest", "ToolsetResolver",
+    "ToolSpec", "ToolsetRequest", "ToolsetResolver",
     "ToolsetSnapshot", "Transport", "TurnCancelled", "TurnError", "TurnLeaseStore",
     "TurnPhase", "TurnQueueFullError", "TurnResult", "TurnRuntime",
     "TurnSnapshot", "TurnTrigger", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",

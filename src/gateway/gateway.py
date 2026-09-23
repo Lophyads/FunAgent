@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import logging
 import threading
-import uuid
 from typing import Any
 
 from agentcore.core import AgentCore
@@ -45,8 +44,6 @@ class GatewayRuntime:
             log_config=config,
         )
         self._max_recovery_attempts = max_recovery_attempts
-        self._runtime_id = str(uuid.uuid4())
-        self.last_shutdown_clean: bool | None = None
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
@@ -110,9 +107,6 @@ class GatewayRuntime:
             if self._started:
                 return
             self.agent.start_blocking()
-            self.last_shutdown_clean = (
-                self.agent._store.record_runtime_start(self._runtime_id)
-            )
             logger.info('runtime.startup_started')
             self.agent._observability.publish(
                 "runtime.startup_started", trace_id="runtime"
@@ -127,7 +121,7 @@ class GatewayRuntime:
                     raise TypeError("delivery adapter start must be synchronous")
                 if readiness is False:
                     raise RuntimeError("delivery adapter is not ready")
-            converted = self.agent._store.convert_stale_active_turns()
+            converted = self.agent._store.mark_stale_leases()
             if converted:
                 logger.warning('recovery.interrupted_turns_converted session_count=%s', len(converted))
             self.agent._observability.publish(
@@ -186,25 +180,22 @@ class GatewayRuntime:
                 return False
             committed = False
             try:
-                lifecycle = self.agent._store.get_session_lifecycle(session_id)
+                lifecycle = self.agent._store.get_session_recovery(session_id)
                 trigger = TurnTrigger(
                     kind="internal_recovery", session_id=session_id,
                     recovery_reason=(
                         lifecycle["resume_reason"] if lifecycle else None
-                    ),
-                    source_turn_id=(
-                        lifecycle["resume_source_turn_id"] if lifecycle else None
                     ),
                 )
                 submission = self.agent.submit_recovery(
                     trigger, reservation=reservation
                 )
                 committed = True
-                submission.future.add_done_callback(
-                    lambda _future, sid=session_id: self._queue_delivery(sid)
-                )
                 self._recovery_submissions.append(submission)
                 self._scheduled_sessions.add(session_id)
+                submission.future.add_done_callback(
+                    lambda _future, sid=session_id: self._recovery_done(sid)
+                )
                 logger.info('recovery.scheduled')
                 self.agent._observability.publish(
                     "recovery.scheduled", trace_id="runtime",
@@ -223,7 +214,7 @@ class GatewayRuntime:
     def _monitor_recovery_bound(self) -> None:
         while not self._monitor_stop.wait(self._monitor_interval):
             try:
-                converted = self.agent._store.convert_stale_active_turns()
+                converted = self.agent._store.mark_stale_leases()
                 if converted:
                     logger.warning('recovery.interrupted_turns_converted session_count=%s', len(converted))
                     self.agent._observability.publish(
@@ -249,6 +240,11 @@ class GatewayRuntime:
         except RuntimeError:
             # The obligation stays in SQLite for the next startup.
             pass
+
+    def _recovery_done(self, session_id: str) -> None:
+        with self._lock:
+            self._scheduled_sessions.discard(session_id)
+        self._queue_delivery(session_id)
 
     def _check_inbound(self) -> None:
         with self._lock:
@@ -315,19 +311,9 @@ class GatewayRuntime:
         timeout = self.agent._config.timeouts.finalize_seconds
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout)
-        turns_drained = self.agent._dispatcher.close(timeout=timeout)
-        delivery_drained = self.delivery.close(timeout)
-        try:
-            if self._started and turns_drained and delivery_drained:
-                self.agent._store.mark_runtime_clean(self._runtime_id)
-        except Exception as exc:
-            logger.warning('runtime.shutdown_incomplete error_type=%s', type(exc).__name__)
-            self.agent._observability.publish(
-                "runtime.shutdown_incomplete", trace_id="runtime",
-                payload={"error_type": type(exc).__name__},
-            )
-        finally:
-            self.agent.close_blocking()
+        self.agent._dispatcher.close(timeout=timeout)
+        self.delivery.close(timeout)
+        self.agent.close_blocking()
         adapter_close = getattr(self.adapter, "close", None)
         if adapter_close is not None:
             try:

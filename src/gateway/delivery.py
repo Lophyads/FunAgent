@@ -90,7 +90,7 @@ class DeliveryRuntime:
 
     def _deliver_one_bound(self, obligation: dict[str, object]) -> bool:
         session_id = str(obligation["session_id"])
-        turn_id = str(obligation["turn_id"])
+        turn_id = f"delivery:{obligation['message_id']}"
         obligation_id = str(obligation["id"])
         try:
             lease = self._leases.acquire(

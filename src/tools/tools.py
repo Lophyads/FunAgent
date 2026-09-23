@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, Literal, TypeVar
 
@@ -43,6 +44,7 @@ class ToolSpec(Generic[ArgsT]):
 
 class ToolCatalog:
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._tools: dict[str, ToolSpec[Any]] = {}
         self._versions: dict[tuple[str, str], ToolSpec[Any]] = {}
         self._frozen = False
@@ -53,8 +55,23 @@ class ToolCatalog:
         return self._frozen
 
     def register(self, spec: ToolSpec[Any]) -> None:
-        if self._frozen:
-            raise RuntimeError("tool catalog is frozen")
+        with self._lock:
+            if self._frozen:
+                raise RuntimeError("tool catalog is frozen; use replace_all() between turns")
+            self._validate_spec(spec)
+            if spec.name in self._tools:
+                raise ValueError(f"tool already registered: {spec.name}")
+            identity = (spec.tool_id, spec.implementation_version)
+            if identity in self._versions:
+                raise ValueError(
+                    "tool implementation already registered: "
+                    f"{spec.tool_id}@{spec.implementation_version}"
+                )
+            self._tools[spec.name] = spec
+            self._versions[identity] = spec
+
+    @staticmethod
+    def _validate_spec(spec: ToolSpec[Any]) -> None:
         if not _TOOL_NAME_RE.fullmatch(spec.tool_id):
             raise ValueError(f"invalid tool id: {spec.tool_id!r}")
         if not spec.implementation_version.strip():
@@ -71,37 +88,49 @@ class ToolCatalog:
             raise TypeError("async tool handlers are not supported; provide a synchronous adapter")
         if spec.timeout_seconds is not None and spec.timeout_seconds <= 0:
             raise ValueError("tool timeout_seconds must be greater than zero")
-        if spec.name in self._tools:
-            raise ValueError(f"tool already registered: {spec.name}")
-        identity = (spec.tool_id, spec.implementation_version)
-        if identity in self._versions:
-            raise ValueError(
-                "tool implementation already registered: "
-                f"{spec.tool_id}@{spec.implementation_version}"
-            )
-        self._tools[spec.name] = spec
-        self._versions[identity] = spec
+
+    def replace_all(self, specs: tuple[ToolSpec[Any], ...]) -> None:
+        """Atomically publish tools for future turns; running snapshots remain intact."""
+        names: dict[str, ToolSpec[Any]] = {}
+        versions: dict[tuple[str, str], ToolSpec[Any]] = {}
+        for spec in specs:
+            self._validate_spec(spec)
+            identity = (spec.tool_id, spec.implementation_version)
+            if spec.name in names or identity in versions:
+                raise ValueError("duplicate tool name or implementation identity")
+            names[spec.name] = spec
+            versions[identity] = spec
+        ordered = tuple(sorted(specs, key=lambda item: (item.tool_id, item.name)))
+        with self._lock:
+            self._tools = names
+            self._versions = versions
+            self._ordered = ordered
+            self._frozen = True
 
     def freeze(self) -> None:
-        if self._frozen:
-            return
-        self._ordered = tuple(sorted(
-            self._tools.values(), key=lambda spec: (spec.tool_id, spec.name)
-        ))
-        self._frozen = True
+        with self._lock:
+            if self._frozen:
+                return
+            self._ordered = tuple(sorted(
+                self._tools.values(), key=lambda spec: (spec.tool_id, spec.name)
+            ))
+            self._frozen = True
 
     def get(self, name: str) -> ToolSpec[Any] | None:
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
 
     def get_versioned(
         self, tool_id: str, implementation_version: str
     ) -> ToolSpec[Any] | None:
-        return self._versions.get((tool_id, implementation_version))
+        with self._lock:
+            return self._versions.get((tool_id, implementation_version))
 
     def specs(self) -> tuple[ToolSpec[Any], ...]:
-        if not self._frozen:
-            raise RuntimeError("freeze the tool catalog before reading specs")
-        return self._ordered
+        with self._lock:
+            if not self._frozen:
+                raise RuntimeError("freeze the tool catalog before reading specs")
+            return self._ordered
 
     def invoke(self, spec: ToolSpec[Any], args: BaseModel, context: ToolContext) -> Any:
         result = spec.handler(args, context)

@@ -8,7 +8,7 @@ import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextvars import copy_context
-from typing import Any, Callable, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from .builtins import default_tool_catalog
 from .conversation_loop import ConversationLoop, RouteState
@@ -28,7 +28,7 @@ from .provider_runtime import (
 )
 from .session_context import SessionBuildRequest, SessionContextFactory
 from .storage import SQLiteStore
-from tools.tools import ToolCatalog
+from tools.tools import ToolCatalog, ToolSpec
 from tools.toolsets import DefaultToolsetResolver, ToolsetResolver
 from .turn_state import OperationTimeoutError, RunBudgetExceeded
 from .workers import (
@@ -81,7 +81,6 @@ class AgentCore:
         review_scheduler: ReviewScheduler | None = None,
         store: SQLiteStore | None = None,
         lease_store: TurnLeaseStore | None = None,
-        legacy_tool_bindings: Mapping[str, tuple[str, str]] | None = None,
         delivery_destination: str | None = None,
         max_recovery_attempts: int = 3,
     ) -> None:
@@ -130,7 +129,6 @@ class AgentCore:
             memory=self._bounded_memory,
             defaults=SessionBuildRequest.from_defaults(config.session_defaults),
             memory_max_chars=config.memory_max_chars,
-            legacy_bindings=legacy_tool_bindings,
         )
         self._owner_id = str(uuid.uuid4())
 
@@ -164,6 +162,13 @@ class AgentCore:
         self._lifecycle_lock = threading.RLock()
         self._started = False
         self._closed = False
+
+    def update_tools(self, specs: Sequence[ToolSpec[Any]]) -> None:
+        """Publish a new catalog for future turns without mutating active snapshots."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("AgentCore is closed")
+            self._catalog.replace_all(tuple(specs))
 
     def _validate_sync_extensions(self) -> None:
         targets: list[tuple[Any, str, str]] = [

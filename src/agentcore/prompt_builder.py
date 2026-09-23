@@ -20,7 +20,6 @@ class SystemPromptSnapshot:
     text: str
     content_bytes: bytes
     fingerprint: str
-    source_versions: tuple[tuple[str, str], ...]
 
 
 class SystemPromptBuilder(Protocol):
@@ -30,13 +29,10 @@ class SystemPromptBuilder(Protocol):
 class StaticSystemPromptBuilder:
     """Deterministic builder for the configured base prompt and bootstrap memory."""
 
-    def __init__(self, base_prompt: str, *, builder_version: str = "1") -> None:
+    def __init__(self, base_prompt: str) -> None:
         if not base_prompt.strip():
             raise ValueError("base system prompt must not be blank")
-        if not builder_version.strip():
-            raise ValueError("builder_version must not be blank")
         self._base_prompt = base_prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip()
-        self._builder_version = builder_version
 
     def build(self, request: PromptBuildRequest) -> SystemPromptSnapshot:
         sections = [self._base_prompt]
@@ -54,19 +50,10 @@ class StaticSystemPromptBuilder:
                 )
         text = "\n\n".join(sections)
         content_bytes = text.encode("utf-8")
-        source_versions = (
-            ("builder", self._builder_version),
-            ("config", request.config_version),
-            ("profile", request.profile),
-            ("surface", request.surface),
-            ("platform", request.platform),
-            ("skills", ",".join(request.enabled_skills)),
-        )
         return SystemPromptSnapshot(
             text=text,
             content_bytes=content_bytes,
             fingerprint=hashlib.sha256(content_bytes).hexdigest(),
-            source_versions=source_versions,
         )
 
 

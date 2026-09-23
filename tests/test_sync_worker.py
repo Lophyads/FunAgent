@@ -177,7 +177,7 @@ async def test_tool_timeout_is_unknown_and_does_not_block_event_loop(config_fact
     assert handler_started.is_set()
     assert result.tool_outcomes[0].state == "unknown"
     assert result.tool_outcomes[0].effect_disposition == "unknown"
-    assert result.tool_outcomes[0].may_still_be_running is True
+    assert result.tool_outcomes[0].error_type == "tool_timeout"
     payload = json.loads(transport.requests[1].body["messages"][-1]["content"])
     assert payload["error"]["type"] == "outcome_unknown"
 

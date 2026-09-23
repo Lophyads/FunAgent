@@ -33,15 +33,6 @@ class ToolBinding:
     handler: ToolHandler[Any]
     spec: ToolSpec[Any]
 
-    def descriptor(self) -> Mapping[str, str]:
-        return MappingProxyType({
-            "tool_id": self.tool_id,
-            "implementation_version": self.implementation_version,
-            "name": self.name,
-            "schema_fingerprint": hashlib.sha256(self.schema_bytes).hexdigest(),
-        })
-
-
 @dataclass(frozen=True, slots=True)
 class ToolsetSnapshot:
     bindings: tuple[ToolBinding, ...]
@@ -54,10 +45,6 @@ class ToolsetSnapshot:
     def definitions(self) -> tuple[Mapping[str, Any], ...]:
         decoded = json.loads(self.schema_bytes.decode("utf-8"))
         return tuple(MappingProxyType(item) for item in decoded)
-
-    def descriptors(self) -> tuple[Mapping[str, str], ...]:
-        return tuple(binding.descriptor() for binding in self.bindings)
-
 
 class ToolsetResolver(Protocol):
     def resolve(
@@ -76,34 +63,6 @@ class DefaultToolsetResolver:
             and spec.required_permissions.issubset(request.permissions)
         ]
         return _snapshot_from_specs(specs)
-
-
-def rebind_toolset(
-    *,
-    schema_bytes: bytes,
-    fingerprint: str,
-    descriptors: tuple[Mapping[str, str], ...],
-    catalog: ToolCatalog,
-) -> ToolsetSnapshot:
-    if hashlib.sha256(schema_bytes).hexdigest() != fingerprint:
-        raise ValueError("persisted toolset fingerprint does not match schema bytes")
-    specs: list[ToolSpec[Any]] = []
-    for descriptor in descriptors:
-        tool_id = descriptor["tool_id"]
-        version = descriptor["implementation_version"]
-        spec = catalog.get_versioned(tool_id, version)
-        if spec is None:
-            raise LookupError(f"missing tool implementation: {tool_id}@{version}")
-        if spec.name != descriptor["name"]:
-            raise ValueError(f"tool name mismatch for {tool_id}@{version}")
-        spec_schema = canonical_json_bytes(spec.definition())
-        if hashlib.sha256(spec_schema).hexdigest() != descriptor["schema_fingerprint"]:
-            raise ValueError(f"tool schema mismatch for {tool_id}@{version}")
-        specs.append(spec)
-    rebound = _snapshot_from_specs(specs)
-    if rebound.schema_bytes != schema_bytes or rebound.fingerprint != fingerprint:
-        raise ValueError("rebound toolset does not match the persisted snapshot")
-    return rebound
 
 
 def _snapshot_from_specs(specs: list[ToolSpec[Any]]) -> ToolsetSnapshot:
@@ -134,5 +93,4 @@ __all__ = [
     "ToolsetResolver",
     "ToolsetSnapshot",
     "canonical_json_bytes",
-    "rebind_toolset",
 ]
