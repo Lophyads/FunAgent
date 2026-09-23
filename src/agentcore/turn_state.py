@@ -32,14 +32,15 @@ class RunBudgetExceeded(TimeoutError):
 
 
 class PhaseAction(str, Enum):
-    PROCEED = "proceed"
-    NEXT_ITERATION = "next_iteration"
-    STOP_TURN = "stop_turn"
+    FALLTHROUGH = "fallthrough"
+    BREAK = "break"
+    RETURN = "return"
+    CONTINUE = "continue"
 
 
 @dataclass(frozen=True, slots=True)
 class PhaseResult:
-    action: PhaseAction = PhaseAction.PROCEED
+    action: PhaseAction = PhaseAction.FALLTHROUGH
 
 
 @dataclass(slots=True)
@@ -88,6 +89,30 @@ class LoopState:
     finalized: bool = False
     released: bool = False
     business_error: BaseException | None = None
+
+    def require_lease(self, phase: str) -> LeaseHandle:
+        lease = self.lease
+        if lease is None:
+            raise RuntimeError(f"{phase} requires lease")
+        return lease
+
+    def require_context(self, phase: str) -> SessionRuntimeSnapshot:
+        context = self.context
+        if context is None:
+            raise RuntimeError(f"{phase} requires context")
+        return context
+
+    def require_request(self, phase: str) -> CanonicalModelRequest:
+        request = self.request
+        if request is None:
+            raise RuntimeError(f"{phase} requires request")
+        return request
+
+    def require_response(self, phase: str) -> NormalizedModelResponse:
+        response = self.response
+        if response is None:
+            raise RuntimeError(f"{phase} requires response")
+        return response
 
 
 @dataclass(frozen=True, slots=True)

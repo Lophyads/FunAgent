@@ -338,11 +338,19 @@ async def test_max_iterations_returns_failed_result(config_factory, agent_factor
             ToolCall(id="c2", name="calculator", arguments='{"expression":"2+2"}')
         ], finish_reason="tool_calls"),
     )
+    config = config_factory(max_iterations=2)
     async with agent_factory(
-        config_factory(max_iterations=2), transports={"primary": transport},
+        config, transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("loop", session_id="limit")
+        persisted = agent._store.get_turn(result.turn_id)
+    with sqlite3.connect(config.database_path) as connection:
+        lease = connection.execute(
+            "SELECT owner_id, turn_id FROM session_leases WHERE session_id = ?",
+            ("limit",),
+        ).fetchone()
 
-    assert result.status == "failed"
+    assert result.status == persisted["status"] == "failed"
     assert result.error.code == "max_iterations"
     assert result.iterations == 2
+    assert lease == (None, None)

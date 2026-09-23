@@ -49,3 +49,7 @@ config_version = "1"
 enabled_skills = []
 enabled_toolsets = ["default"]
 permissions = []
+
+
+[logging]
+level = "DEBUG"

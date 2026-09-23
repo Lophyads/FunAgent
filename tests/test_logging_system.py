@@ -39,6 +39,7 @@ def test_turn_logs_raw_session_and_milestones(
     raw = _text(tmp_path / "logs" / "agent.log")
     assert "[caller-chosen-session] agentcore.conversation_loop: turn.started" in raw
     assert "turn.admitted" in raw
+    assert "provider.request" in raw
     assert "provider.response" in raw
     assert "turn.finalized" in raw
     assert "turn.ended" in raw
@@ -78,9 +79,51 @@ def test_debug_previews_and_redaction(
     assert "turn.user_preview" in raw
     assert "tool.arguments_preview" in raw
     assert "turn.request_assembled" in raw
+    assert "provider.request_messages" in raw
+    assert "content_preview" in raw
     assert "private-user-secret" not in raw
     assert "private-tool-secret" not in raw
     assert "turn.phase_started" in raw
+
+
+def test_tool_message_validation_failure_logs_safe_details(
+    config_factory, agent_factory, tmp_path,
+):
+    config = config_factory()
+    transport = ScriptedTransport(NormalizedModelResponse(
+        content="",
+        tool_calls=[ToolCall(
+            id="invalid-content-1",
+            name="current_time",
+            arguments='{"timezone":"UTC","password":"private-tool-secret"}',
+        )],
+        finish_reason="tool_calls",
+    ))
+
+    with configure_logging(config) as handle:
+        with agent_factory(
+            config, transports={"primary": transport},
+        ) as agent:
+            result = agent.run_turn_blocking(
+                "trigger invalid tool response", session_id="tool-validation"
+            )
+        assert handle.runtime is not None and handle.runtime.flush(2)
+
+    agent_log = _text(tmp_path / "logs" / "agent.log")
+    error_log = _text(tmp_path / "logs" / "errors.log")
+    assert result.status == "failed"
+    assert result.completion_reason == "turn_failed"
+    assert "tool.round_preparing" in agent_log
+    assert "'content_type': 'str'" in agent_log
+    assert "'content_length': 0" in agent_log
+    assert "'content_preview': ''" in agent_log
+    assert "response_content_present=True" in agent_log
+    assert "response_content_length=0" in agent_log
+    assert "tool.message_validation_failed" in error_log
+    assert "assistant tool message must not include text content" in error_log
+    assert "turn.unhandled_error" in error_log
+    assert "Traceback" in error_log
+    assert "private-tool-secret" not in agent_log + error_log
 
 
 def test_root_logger_routes_and_restores(config_factory, tmp_path):

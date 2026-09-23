@@ -7,6 +7,7 @@ import random
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -154,30 +155,8 @@ class ConversationLoop:
                 self._establish_turn_phase(),
                 self._load_messages_phase(),
             ):
-                run_phase(phase, runtime, state)
-            for iteration in range(1, self.config.max_iterations + 1):
-                state.iteration = iteration
-                state.response = None
-                state.assistant_message = None
-                run_phase(self._assemble_phase(), runtime, state)
-                run_phase(self._provider_phase(), runtime, state)
-                assert state.response is not None
-                phase = (
-                    self._tool_round_phase()
-                    if state.response.tool_calls else self._finish_text_phase()
-                )
-                result = run_phase(phase, runtime, state)
-                if result.action is PhaseAction.NEXT_ITERATION:
-                    continue
-                break
-            else:
-                state.status = "failed"
-                state.completion_reason = "max_iterations"
-                state.error = TurnError(
-                    code="max_iterations",
-                    message=f"agent exceeded {self.config.max_iterations} model iterations",
-                    retryable=False,
-                )
+                self._run_fallthrough_phase(phase, runtime, state)
+            self._run_iterations(runtime, state)
         except SessionSnapshotConflict as exc:
             self._set_error(state, "failed", "session_snapshot_conflict", exc, False)
         except ToolsetRebindError as exc:
@@ -220,7 +199,12 @@ class ConversationLoop:
                 details={"status_code": exc.error.status_code},
             )
         except BaseException as exc:
-            logger.error('turn.unhandled_error error_type=%s', type(exc).__name__)
+            logger.error(
+                'turn.unhandled_error error_type=%s validation_errors=%s',
+                type(exc).__name__,
+                self._validation_error_details(exc),
+                exc_info=True,
+            )
             state.warnings.extend(runtime.observability.publish(
                 "turn.unhandled_error", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -230,7 +214,9 @@ class ConversationLoop:
         finally:
             if state.error is not None and not state.finalized:
                 try:
-                    run_phase(self._handle_error_phase(), runtime, state)
+                    self._run_fallthrough_phase(
+                        self._handle_error_phase(), runtime, state
+                    )
                 except BaseException as exc:
                     state.warnings.append(
                         "handle_turn_error phase failed: "
@@ -248,6 +234,49 @@ class ConversationLoop:
                 len(state.tool_outcomes),
             )
         return self._result(state)
+
+    @staticmethod
+    def _run_fallthrough_phase(
+        phase: FunctionPhase, runtime: TurnRuntime, state: LoopState,
+    ) -> None:
+        action = run_phase(phase, runtime, state).action
+        if action is not PhaseAction.FALLTHROUGH:
+            raise RuntimeError(
+                f"{phase.name} returned unexpected action {action.value}; "
+                "expected fallthrough"
+            )
+
+    def _run_iterations(self, runtime: TurnRuntime, state: LoopState) -> None:
+        for iteration in range(1, self.config.max_iterations + 1):
+            state.iteration = iteration
+            state.response = None
+            state.assistant_message = None
+            self._run_fallthrough_phase(self._assemble_phase(), runtime, state)
+            self._run_fallthrough_phase(self._provider_phase(), runtime, state)
+            response = state.require_response("response_dispatch")
+            phase = (
+                self._tool_round_phase()
+                if response.tool_calls else self._finish_text_phase()
+            )
+            action = run_phase(phase, runtime, state).action
+            if action is PhaseAction.CONTINUE:
+                continue
+            if action is PhaseAction.BREAK:
+                break
+            if action is PhaseAction.RETURN:
+                return
+            raise RuntimeError(
+                f"{phase.name} returned unexpected action {action.value}; "
+                "expected break, return, or continue"
+            )
+        else:
+            state.status = "failed"
+            state.completion_reason = "max_iterations"
+            state.error = TurnError(
+                code="max_iterations",
+                message=f"agent exceeded {self.config.max_iterations} model iterations",
+                retryable=False,
+            )
 
     def _handle_error_phase(self) -> FunctionPhase:
         def handle(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
@@ -289,10 +318,10 @@ class ConversationLoop:
 
     def _recover_history_phase(self) -> FunctionPhase:
         def recover(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.lease is not None
+            lease = state.require_lease('recover_history')
             if self.recovery:
                 state.recovery_claimed = self.store.claim_recovery(
-                    state.session_id, fence=state.lease.fence,
+                    state.session_id, fence=lease.fence,
                     max_attempts=self.max_recovery_attempts,
                 )
                 if not state.recovery_claimed:
@@ -310,7 +339,7 @@ class ConversationLoop:
                     lifecycle and lifecycle["resume_pending"]
                 )
             repaired = self.store.recover_incomplete_turns(
-                state.session_id, fence=state.lease.fence
+                state.session_id, fence=lease.fence
             )
             state.warnings.extend(repaired.warnings)
             if repaired.warnings:
@@ -346,15 +375,15 @@ class ConversationLoop:
 
     def _resolve_context_phase(self) -> FunctionPhase:
         def resolve(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.lease is not None
+            lease = state.require_lease('resolve_session_context')
             resolution = (
                 self.session_contexts.load_existing(
-                    state.session_id, state.lease
+                    state.session_id, lease
                 )
                 if self.recovery else
                 self.session_contexts.create_or_load(
                     state.session_id, self.user_input, self.session_request,
-                    state.lease,
+                    lease,
                 )
             )
             state.context = resolution.snapshot
@@ -394,12 +423,13 @@ class ConversationLoop:
 
     def _establish_turn_phase(self) -> FunctionPhase:
         def begin(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.lease is not None and state.context is not None
+            lease = state.require_lease('establish_turn')
+            context = state.require_context('establish_turn')
             if self.recovery:
                 message = self.store.begin_recovery_turn(
                     turn_id=state.turn_id, session_id=state.session_id,
-                    context_version=state.context.context_version,
-                    fence=state.lease.fence,
+                    context_version=context.context_version,
+                    fence=lease.fence,
                 )
             else:
                 message = Message.user(
@@ -408,17 +438,17 @@ class ConversationLoop:
                 if not state.session_created:
                     self.store.begin_turn(
                         turn_id=state.turn_id, session_id=state.session_id,
-                        context_version=state.context.context_version,
-                        user_message=message, fence=state.lease.fence,
+                        context_version=context.context_version,
+                        user_message=message, fence=lease.fence,
                     )
             state.submitted_message = message
             state.new_messages.append(message)
             state.admitted = True
-            logger.info('turn.admitted context_version=%s', state.context.context_version)
+            logger.info('turn.admitted context_version=%s', context.context_version)
             state.warnings.extend(runtime.observability.publish(
                 "turn.admitted", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
-                payload={"context_version": state.context.context_version},
+                payload={"context_version": context.context_version},
             ))
             return PhaseResult()
 
@@ -450,19 +480,19 @@ class ConversationLoop:
 
     def _assemble_phase(self) -> FunctionPhase:
         def assemble(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.context is not None
+            context = state.require_context('assemble_request')
             state.request = CanonicalModelRequest.build(
-                system_prompt=state.context.prompt.text,
+                system_prompt=context.prompt.text,
                 messages=tuple(state.messages),
-                tool_schema_bytes=state.context.toolset.schema_bytes,
+                tool_schema_bytes=context.toolset.schema_bytes,
             )
             logger.debug(
                 'turn.request_assembled phase=%s iteration=%s message_count=%s tool_count=%s context_version=%s',
                 'assemble_request',
                 state.iteration,
                 len(state.request.messages),
-                len(state.context.toolset.bindings),
-                state.context.context_version,
+                len(context.toolset.bindings),
+                context.context_version,
             )
             return PhaseResult()
 
@@ -491,13 +521,15 @@ class ConversationLoop:
 
     def _tool_round_phase(self) -> FunctionPhase:
         def execute(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.response is not None and state.response.tool_calls
-            self._run_tool_round(runtime, state, state.response)
-            return PhaseResult(PhaseAction.NEXT_ITERATION)
+            response = state.require_response('tool_round')
+            if not response.tool_calls:
+                raise RuntimeError('tool_round requires response with tool_calls')
+            self._run_tool_round(runtime, state, response)
+            return PhaseResult(PhaseAction.CONTINUE)
 
         def validate(state: LoopState) -> None:
-            assert state.response is not None
-            wanted = {call.id for call in state.response.tool_calls}
+            response = state.require_response('tool_round')
+            wanted = {call.id for call in response.tool_calls}
             actual = {
                 message.tool_call_id for message in state.new_messages
                 if message.role == "tool"
@@ -509,31 +541,33 @@ class ConversationLoop:
 
     def _finish_text_phase(self) -> FunctionPhase:
         def finish(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            assert state.response is not None and not state.response.tool_calls
-            text = state.response.content or ""
+            response = state.require_response('finish_text')
+            lease = state.require_lease('finish_text')
+            if response.tool_calls:
+                raise RuntimeError('finish_text requires a text response')
+            text = response.content or ""
             assistant = Message.assistant_text(
-                text, finish_reason=state.response.finish_reason
+                text, finish_reason=response.finish_reason
             )
-            if state.response.finish_reason in {"length", "content_filter"}:
+            if response.finish_reason in {"length", "content_filter"}:
                 state.status = "failed"
                 state.completion_reason = "incomplete_response"
                 state.error = TurnError(
                     code="incomplete_response",
-                    message=f"model stopped with finish_reason={state.response.finish_reason}",
-                    retryable=state.response.finish_reason == "length",
+                    message=f"model stopped with finish_reason={response.finish_reason}",
+                    retryable=response.finish_reason == "length",
                 )
             else:
                 state.status = "completed"
                 state.completion_reason = "model_final"
                 state.error = None
-            assert state.lease is not None
             committed = self.store.finish_turn_with_message(
                 session_id=state.session_id, turn_id=state.turn_id,
                 message=assistant, status=state.status, error=state.error,
                 route_name=state.route_used, iterations=state.iteration,
                 usage=state.usage, completion_reason=state.completion_reason,
                 provider_attempts=state.provider_attempts,
-                route_attempts=state.route_attempts, fence=state.lease.fence,
+                route_attempts=state.route_attempts, fence=lease.fence,
                 delivery_destination=self.delivery_destination,
                 recovery=self.recovery or state.user_driven_recovery,
             )
@@ -544,7 +578,7 @@ class ConversationLoop:
             state.messages.append(assistant)
             state.new_messages.append(assistant)
             state.finalized = True
-            return PhaseResult(PhaseAction.STOP_TURN)
+            return PhaseResult(PhaseAction.BREAK)
 
         def validate(state: LoopState) -> None:
             if state.response is None or state.response.tool_calls:
@@ -557,7 +591,8 @@ class ConversationLoop:
     def _run_provider_attempts(
         self, runtime: TurnRuntime, state: LoopState,
     ) -> tuple[NormalizedModelResponse, int]:
-        assert state.request is not None
+        request = state.require_request('provider_attempts')
+        lease = state.require_lease('provider_attempts')
         failures: list[dict[str, Any]] = []
         for route_index in range(state.active_route_index, len(self.config.routes)):
             route = self.config.routes[route_index]
@@ -582,21 +617,20 @@ class ConversationLoop:
                 state.attempt = AttemptState(
                     attempt_id=attempt_id, route_index=route_index,
                     route_name=route.name, attempt_number=attempt_number,
-                    request_fingerprint=state.request.fingerprint,
+                    request_fingerprint=request.fingerprint,
                     started_at=time.time(),
                 )
                 state.provider_attempts += 1
                 state.route_attempts[route.name] = (
                     state.route_attempts.get(route.name, 0) + 1
                 )
-                assert state.lease is not None
                 self.store.begin_model_attempt(
                     attempt_id=attempt_id, turn_id=state.turn_id,
                     session_id=state.session_id, iteration=state.iteration,
                     route_index=route_index, route_name=route.name,
                     attempt_number=attempt_number,
-                    request_fingerprint=state.request.fingerprint,
-                    fence=state.lease.fence,
+                    request_fingerprint=request.fingerprint,
+                    fence=lease.fence,
                 )
                 logger.debug(
                     'provider.attempt_started phase=%s route=%s iteration=%s attempt=%s',
@@ -616,7 +650,39 @@ class ConversationLoop:
                 ))
                 attempt_started = time.monotonic()
                 try:
-                    wire = adapter.encode(state.request, binding)
+                    wire = adapter.encode(request, binding)
+                    request_messages = self._provider_request_message_details(
+                        wire.body
+                    )
+                    request_payload = {
+                        "route": route.name,
+                        "provider": binding.provider,
+                        "model": binding.model,
+                        "api_mode": binding.api_mode,
+                        "iteration": state.iteration,
+                        "attempt": attempt_number,
+                        "request_fingerprint": request.fingerprint,
+                        "timeout_seconds": wire.timeout_seconds,
+                        "message_count": len(request_messages),
+                        "messages": [
+                            {
+                                key: value for key, value in item.items()
+                                if key != "content_preview"
+                            }
+                            for item in request_messages
+                        ],
+                        "tool_count": len(wire.body.get("tools") or []),
+                    }
+                    logger.info(
+                        'provider.request phase=%s payload=%s',
+                        'provider_attempts',
+                        request_payload,
+                    )
+                    logger.debug(
+                        'provider.request_messages phase=%s payload=%s',
+                        'provider_attempts',
+                        request_messages,
+                    )
                     raw_response = binding.transport.send(
                         wire,
                         AttemptContext(
@@ -629,12 +695,16 @@ class ConversationLoop:
                         ),
                     )
                     runtime.check_active(state)
+                    logger.debug(
+                        'provider.response raw_response=%s',
+                        raw_response.raw,
+                    )
                     normalized = adapter.decode(raw_response, binding)
                 except (TurnCancelled, RunBudgetExceeded, LeaseLostError):
                     self.store.finish_model_attempt(
                         attempt_id, state="ambiguous",
                         error_type="interrupted", status_code=None,
-                        fence=state.lease.fence,
+                        fence=lease.fence,
                     )
                     raise
                 except BaseException as exc:
@@ -645,7 +715,7 @@ class ConversationLoop:
                         state="ambiguous" if error.ambiguous else "failed",
                         error_type=error.error_type,
                         status_code=error.status_code,
-                        fence=state.lease.fence,
+                        fence=lease.fence,
                     )
                     failure_payload = {
                         "route": route.name, "attempt": attempt_number,
@@ -726,12 +796,37 @@ class ConversationLoop:
                     self.store.finish_model_attempt(
                         attempt_id, state="succeeded",
                         error_type=None, status_code=None,
-                        fence=state.lease.fence,
+                        fence=lease.fence,
                     )
                     route_state.clear()
+                    response_content = normalized.content
+                    response_content_preview = (
+                        None if response_content is None else
+                        response_content[:1000]
+                        .replace('\r', '\\r')
+                        .replace('\n', '\\n')
+                    )
                     response_payload = {
                         "route": route.name,
                         "tool_call_count": len(normalized.tool_calls),
+                        "tool_calls": [
+                            {
+                                "id": call.id,
+                                "name": call.name,
+                                "arguments_length": len(call.arguments),
+                            }
+                            for call in normalized.tool_calls
+                        ],
+                        "content_type": type(response_content).__name__,
+                        "content_length": (
+                            len(response_content)
+                            if response_content is not None else 0
+                        ),
+                        "content_truncated": bool(
+                            response_content is not None
+                            and len(response_content) > 1000
+                        ),
+                        "content_preview": response_content_preview,
                         "finish_reason": (
                             normalized.finish_reason
                             if normalized.finish_reason in {
@@ -788,21 +883,61 @@ class ConversationLoop:
         self, runtime: TurnRuntime, state: LoopState,
         response: NormalizedModelResponse,
     ) -> None:
-        assert state.context is not None and state.lease is not None
-        assistant = Message.assistant_tools(
-            response.tool_calls, content=response.content,
-            finish_reason=response.finish_reason,
+        context = state.require_context('tool_round')
+        lease = state.require_lease('tool_round')
+        call_ids = [call.id for call in response.tool_calls]
+        logger.info(
+            'tool.round_preparing phase=%s iteration=%s tool_call_count=%s '
+            'tool_names=%s finish_reason=%s response_content_present=%s '
+            'response_content_length=%s duplicate_call_id_count=%s',
+            'tool_round',
+            state.iteration,
+            len(response.tool_calls),
+            [call.name for call in response.tool_calls],
+            response.finish_reason,
+            response.content is not None,
+            len(response.content) if response.content is not None else 0,
+            len(call_ids) - len(set(call_ids)),
         )
+        try:
+            assistant = Message.assistant_tools(
+                response.tool_calls, content=response.content,
+                finish_reason=response.finish_reason,
+            )
+        except ValidationError as exc:
+            logger.error(
+                'tool.message_validation_failed phase=%s iteration=%s '
+                'tool_call_count=%s response_content_present=%s '
+                'response_content_length=%s validation_errors=%s',
+                'tool_round',
+                state.iteration,
+                len(response.tool_calls),
+                response.content is not None,
+                len(response.content) if response.content is not None else 0,
+                self._validation_error_details(exc),
+            )
+            raise
         staged = []
         for call in response.tool_calls:
-            binding = state.context.toolset.get(call.name)
+            binding = context.toolset.get(call.name)
             staged.append(
                 (call, binding.spec.side_effects if binding else "possible")
             )
-        self.store.stage_tool_calls(
-            state.session_id, state.turn_id, assistant, staged,
-            fence=state.lease.fence,
-        )
+        try:
+            self.store.stage_tool_calls(
+                state.session_id, state.turn_id, assistant, staged,
+                fence=lease.fence,
+            )
+        except BaseException as exc:
+            logger.error(
+                'tool.stage_failed phase=%s iteration=%s tool_call_count=%s '
+                'error_type=%s',
+                'tool_round',
+                state.iteration,
+                len(response.tool_calls),
+                type(exc).__name__,
+            )
+            raise
         round_started = time.monotonic()
         outcome_start = len(state.tool_outcomes)
         logger.info(
@@ -835,7 +970,7 @@ class ConversationLoop:
                 effect_disposition=executed.outcome.effect_disposition,
                 error_type=executed.outcome.error_type,
                 may_still_be_running=executed.outcome.may_still_be_running,
-                fence=state.lease.fence,
+                fence=lease.fence,
             )
             if not persisted:
                 raise StorageError(f"tool outcome already terminal: {tool_call.id}")
@@ -888,8 +1023,9 @@ class ConversationLoop:
     def _execute_tool(
         self, runtime: TurnRuntime, state: LoopState, tool_call: ToolCall,
     ) -> _ToolExecution:
-        assert state.context is not None
-        binding = state.context.toolset.get(tool_call.name)
+        context = state.require_context('execute_tool')
+        lease = state.require_lease('execute_tool')
+        binding = context.toolset.get(tool_call.name)
         if binding is None:
             invocation = self._invocation(state, tool_call, {}, False)
             return self._tool_result(
@@ -939,9 +1075,8 @@ class ConversationLoop:
 
         def invoke() -> Any:
             cancellation.raise_if_cancelled()
-            assert state.lease is not None
             if not self.store.mark_tool_running(
-                state.turn_id, tool_call.id, fence=state.lease.fence
+                state.turn_id, tool_call.id, fence=lease.fence
             ):
                 raise StorageError("tool execution was no longer pending")
             started.set()
@@ -1080,7 +1215,7 @@ class ConversationLoop:
         )
         for phase in phases:
             try:
-                run_phase(phase, runtime, state)
+                self._run_fallthrough_phase(phase, runtime, state)
             except BaseException as exc:
                 state.warnings.append(
                     f"cleanup phase {phase.name} failed: {type(exc).__name__}: {exc}"
@@ -1398,6 +1533,83 @@ class ConversationLoop:
             outcome=outcome, invocation=invocation,
             interrupt_reason=interrupt_reason,
         )
+
+    @staticmethod
+    def _provider_request_message_details(
+        body: Mapping[str, Any], *, preview_chars: int = 500,
+    ) -> list[dict[str, Any]]:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return []
+        details: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            if not isinstance(message, Mapping):
+                details.append({
+                    "index": index,
+                    "role": "unknown",
+                    "content_type": type(message).__name__,
+                    "content_length": None,
+                    "content_preview": None,
+                    "tool_call_count": 0,
+                    "tool_names": [],
+                })
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                content_length: int | None = len(content)
+                content_preview: str | None = (
+                    content[:preview_chars]
+                    .replace('\r', '\\r')
+                    .replace('\n', '\\n')
+                )
+            elif content is None:
+                content_length = 0
+                content_preview = None
+            else:
+                rendered = repr(content)
+                content_length = len(rendered)
+                content_preview = (
+                    rendered[:preview_chars]
+                    .replace('\r', '\\r')
+                    .replace('\n', '\\n')
+                )
+            raw_tool_calls = message.get("tool_calls")
+            tool_calls = (
+                raw_tool_calls if isinstance(raw_tool_calls, list) else []
+            )
+            tool_names = []
+            for call in tool_calls:
+                if not isinstance(call, Mapping):
+                    continue
+                function = call.get("function")
+                if isinstance(function, Mapping):
+                    tool_names.append(function.get("name"))
+            details.append({
+                "index": index,
+                "role": message.get("role"),
+                "content_type": type(content).__name__,
+                "content_length": content_length,
+                "content_preview": content_preview,
+                "tool_call_count": len(tool_calls),
+                "tool_names": tool_names,
+                "tool_call_id": message.get("tool_call_id"),
+            })
+        return details
+
+    @staticmethod
+    def _validation_error_details(
+        exc: BaseException,
+    ) -> list[dict[str, Any]] | None:
+        if not isinstance(exc, ValidationError):
+            return None
+        return [
+            {
+                "type": error.get("type"),
+                "loc": list(error.get("loc", ())),
+                "msg": error.get("msg"),
+            }
+            for error in exc.errors(include_url=False, include_input=False)
+        ]
 
     @staticmethod
     def _set_error(

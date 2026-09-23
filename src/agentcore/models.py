@@ -250,8 +250,8 @@ class Message(StrictModel):
             if self.tool_calls is not None:
                 if not self.tool_calls:
                     raise ValueError("assistant tool message requires non-empty tool_calls")
-                if self.content is not None:
-                    raise ValueError("assistant tool message must not include text content")
+                # if self.content is not None:
+                #     raise ValueError("assistant tool message must not include text content")
                 ids = [call.id for call in self.tool_calls]
                 if len(ids) != len(set(ids)):
                     raise ValueError("assistant tool call ids must be unique")
