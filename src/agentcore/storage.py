@@ -175,7 +175,7 @@ class SQLiteStore:
                             raise StorageError(
                                 "database schema version is invalid"
                             ) from exc
-                        if existing_version > 5:
+                        if existing_version > 7:
                             raise StorageError(
                                 "database schema is newer than this AgentCore"
                             )
@@ -183,9 +183,11 @@ class SQLiteStore:
                     self._migrate_v3(connection)
                     self._migrate_v4(connection)
                     self._migrate_v5(connection)
+                    self._migrate_v6(connection)
+                    self._migrate_v7(connection)
                     connection.execute(
                         "INSERT INTO schema_meta(key, value) "
-                        "VALUES ('schema_version', '5') "
+                        "VALUES ('schema_version', '7') "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
                     )
                     connection.commit()
@@ -319,6 +321,55 @@ class SQLiteStore:
             "fencing_token INTEGER NOT NULL DEFAULT 0, expires_at REAL, updated_at REAL NOT NULL)"
         )
 
+    def _migrate_v6(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS session_lifecycle ("
+            "session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE, "
+            "active_turn_id TEXT, active_turn_token TEXT, active_turn_started_at REAL, "
+            "resume_pending INTEGER NOT NULL DEFAULT 0, resume_reason TEXT, "
+            "resume_source_turn_id TEXT, resume_attempts INTEGER NOT NULL DEFAULT 0, "
+            "resume_not_before REAL, resume_suspended INTEGER NOT NULL DEFAULT 0, "
+            "updated_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS runtime_instances ("
+            "id TEXT PRIMARY KEY, started_at REAL NOT NULL, "
+            "closed_at REAL, clean_shutdown INTEGER NOT NULL DEFAULT 0)"
+        )
+        # v5 had no active markers. Preserve its unfinished turns as pending
+        # recovery without modifying historical messages.
+        connection.execute(
+            "INSERT OR IGNORE INTO session_lifecycle("
+            "session_id, resume_pending, resume_reason, "
+            "resume_source_turn_id, updated_at) "
+            "SELECT t.session_id, 1, 'legacy_interrupted', t.id, ? "
+            "FROM turns t WHERE t.status = 'running' "
+            "AND t.final_message_id IS NULL "
+            "AND t.id = (SELECT t2.id FROM turns t2 "
+            "WHERE t2.session_id = t.session_id AND t2.status = 'running' "
+            "ORDER BY t2.started_at DESC LIMIT 1)",
+            (time.time(),),
+        )
+
+    def _migrate_v7(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS delivery_obligations ("
+            "id TEXT PRIMARY KEY, "
+            "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, "
+            "turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE, "
+            "message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+            "destination TEXT NOT NULL, "
+            "state TEXT NOT NULL CHECK (state IN "
+            "('pending','attempting','delivered','failed','abandoned')), "
+            "attempts INTEGER NOT NULL DEFAULT 0, owner_id TEXT, "
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+            "delivered_at REAL, last_error TEXT)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS delivery_obligations_state_idx "
+            "ON delivery_obligations(state, updated_at)"
+        )
+
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._database, timeout=5.0, isolation_level=None, uri=self._uri
@@ -406,6 +457,7 @@ class SQLiteStore:
             self._insert_message(
                 connection, session_id, turn_id, user_message
             )
+            self._set_active_turn(connection, session_id, turn_id, now)
         return PersistedSessionContext(
             session_id=session_id, version=version, build_request=build_request,
             system_prompt_bytes=system_prompt_bytes,
@@ -620,7 +672,196 @@ class SQLiteStore:
                 "VALUES (?, ?, ?, 'running', ?)",
                 (turn_id, session_id, context_version, time.time()),
             )
-            return self._insert_message(connection, session_id, turn_id, user_message)
+            message_id = self._insert_message(
+                connection, session_id, turn_id, user_message
+            )
+            self._set_active_turn(connection, session_id, turn_id, time.time())
+            return message_id
+
+    @staticmethod
+    def _set_active_turn(
+        connection: sqlite3.Connection, session_id: str, turn_id: str, now: float
+    ) -> None:
+        connection.execute(
+            "INSERT INTO session_lifecycle("
+            "session_id, active_turn_id, active_turn_token, "
+            "active_turn_started_at, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "active_turn_id = excluded.active_turn_id, "
+            "active_turn_token = excluded.active_turn_token, "
+            "active_turn_started_at = excluded.active_turn_started_at, "
+            "updated_at = excluded.updated_at "
+            "WHERE session_lifecycle.resume_pending = 0",
+            (session_id, turn_id, turn_id, now, now),
+        )
+
+    def record_runtime_start(self, instance_id: str) -> bool:
+        with self._transaction() as connection:
+            previous = connection.execute(
+                "SELECT clean_shutdown FROM runtime_instances "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO runtime_instances(id, started_at) VALUES (?, ?)",
+                (instance_id, time.time()),
+            )
+            return previous is None or bool(previous["clean_shutdown"])
+
+    def mark_runtime_clean(self, instance_id: str) -> None:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE runtime_instances SET clean_shutdown = 1, "
+                "closed_at = ? WHERE id = ? AND clean_shutdown = 0",
+                (time.time(), instance_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("runtime instance is not open")
+
+    def clear_active_turn(
+        self, session_id: str, turn_id: str, *, fence: LeaseFence
+    ) -> bool:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            cursor = connection.execute(
+                "UPDATE session_lifecycle SET active_turn_id = NULL, "
+                "active_turn_token = NULL, active_turn_started_at = NULL, "
+                "updated_at = ? WHERE session_id = ? AND active_turn_token = ?",
+                (time.time(), session_id, turn_id),
+            )
+            return cursor.rowcount == 1
+
+    def convert_stale_active_turns(self) -> list[str]:
+        """Convert only markers whose session lease is no longer live."""
+        converted: list[str] = []
+        with self._transaction() as connection:
+            now = time.time()
+            rows = connection.execute(
+                "SELECT l.session_id, l.active_turn_id, t.final_message_id, t.status "
+                "FROM session_lifecycle l "
+                "LEFT JOIN session_leases sl ON sl.session_id = l.session_id "
+                "LEFT JOIN turns t ON t.id = l.active_turn_id "
+                "WHERE l.active_turn_id IS NOT NULL "
+                "AND (sl.owner_id IS NULL OR sl.expires_at <= ?)",
+                (now,),
+            ).fetchall()
+            for row in rows:
+                session_id = str(row["session_id"])
+                source_turn_id = str(row["active_turn_id"])
+                has_final = (
+                    row["final_message_id"] is not None
+                    and row["status"] == "completed"
+                )
+                cursor = connection.execute(
+                    "UPDATE session_lifecycle SET active_turn_id = NULL, "
+                    "active_turn_token = NULL, active_turn_started_at = NULL, "
+                    "resume_pending = CASE WHEN ? THEN resume_pending ELSE 1 END, "
+                    "resume_reason = CASE WHEN ? THEN resume_reason "
+                    "ELSE 'restart_interrupted' END, "
+                    "resume_source_turn_id = CASE WHEN ? THEN resume_source_turn_id "
+                    "ELSE ? END, updated_at = ? "
+                    "WHERE session_id = ? AND active_turn_id = ?",
+                    (has_final, has_final, has_final, source_turn_id,
+                     now, session_id, source_turn_id),
+                )
+                if cursor.rowcount and not has_final:
+                    converted.append(session_id)
+        return converted
+
+    def list_pending_recoveries(self, max_attempts: int) -> list[str]:
+        connection = self._connection()
+        try:
+            rows = connection.execute(
+                "SELECT l.session_id FROM session_lifecycle l "
+                "WHERE l.resume_pending = 1 AND l.resume_suspended = 0 "
+                "AND l.resume_attempts < ? "
+                "AND (l.resume_not_before IS NULL OR l.resume_not_before <= ?) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_obligations d "
+                "WHERE d.session_id = l.session_id AND d.state NOT IN "
+                "('delivered','abandoned')) ORDER BY l.updated_at",
+                (max_attempts, time.time()),
+            ).fetchall()
+            return [str(row["session_id"]) for row in rows]
+        finally:
+            connection.close()
+
+    def claim_recovery(
+        self, session_id: str, *, fence: LeaseFence, max_attempts: int
+    ) -> bool:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            cursor = connection.execute(
+                "UPDATE session_lifecycle SET resume_attempts = resume_attempts + 1, "
+                "updated_at = ? WHERE session_id = ? AND resume_pending = 1 "
+                "AND resume_suspended = 0 AND resume_attempts < ? "
+                "AND (resume_not_before IS NULL OR resume_not_before <= ?) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_obligations d "
+                "WHERE d.session_id = ? AND d.state NOT IN "
+                "('delivered','abandoned'))",
+                (time.time(), session_id, max_attempts, time.time(), session_id),
+            )
+            return cursor.rowcount == 1
+
+    def finish_recovery(
+        self, session_id: str, *, completed: bool,
+        max_attempts: int, fence: LeaseFence
+    ) -> None:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            if completed:
+                connection.execute(
+                    "UPDATE session_lifecycle SET resume_pending = 0, "
+                    "resume_reason = NULL, resume_source_turn_id = NULL, "
+                    "resume_suspended = 0, resume_attempts = 0, "
+                    "resume_not_before = NULL, updated_at = ? WHERE session_id = ?",
+                    (time.time(), session_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE session_lifecycle SET resume_suspended = "
+                    "CASE WHEN resume_attempts >= ? THEN 1 ELSE resume_suspended END, "
+                    "updated_at = ? WHERE session_id = ?",
+                    (max_attempts, time.time(), session_id),
+                )
+
+    def get_session_lifecycle(self, session_id: str) -> dict[str, Any] | None:
+        connection = self._connection()
+        try:
+            row = connection.execute(
+                "SELECT * FROM session_lifecycle WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def begin_recovery_turn(
+        self, *, turn_id: str, session_id: str, context_version: int,
+        fence: LeaseFence,
+    ) -> Message:
+        message = Message.user(
+            "Continue the interrupted task using the recorded conversation. "
+            "Do not repeat any tool call whose outcome is already recorded or unknown.",
+            metadata={"message_kind": "recovery", "visibility": "internal"},
+        )
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            row = connection.execute(
+                "SELECT 1 FROM session_contexts "
+                "WHERE session_id = ? AND version = ?",
+                (session_id, context_version),
+            ).fetchone()
+            if row is None:
+                raise StorageError("recovery references an unknown session context")
+            now = time.time()
+            connection.execute(
+                "INSERT INTO turns(id, session_id, context_version, status, started_at) "
+                "VALUES (?, ?, ?, 'running', ?)",
+                (turn_id, session_id, context_version, now),
+            )
+            self._insert_message(connection, session_id, turn_id, message)
+            # resume_pending already records interrupted recovery work. Keeping
+            # an active marker as well would create competing recovery signals.
+        return message
 
     def append_message(
         self, session_id: str, turn_id: str, message: Message, *, fence: LeaseFence
@@ -714,7 +955,8 @@ class SQLiteStore:
         status: str, error: TurnError | None, route_name: str | None,
         iterations: int, usage: dict[str, int], completion_reason: str = "unknown",
         provider_attempts: int = 0, route_attempts: dict[str, int] | None = None,
-        fence: LeaseFence,
+        fence: LeaseFence, delivery_destination: str | None = None,
+        recovery: bool = False,
     ) -> bool:
         if message.role != "assistant" or message.tool_calls is not None:
             raise StorageError("terminal turn message must be assistant text")
@@ -736,6 +978,21 @@ class SQLiteStore:
                 final_message_id=message_id, completion_reason=completion_reason,
                 provider_attempts=provider_attempts, route_attempts=route_attempts or {},
             )
+            if status == "completed" and error is None:
+                if delivery_destination is not None:
+                    self._create_delivery_obligation(
+                        connection, session_id, turn_id, message_id,
+                        delivery_destination,
+                    )
+                if recovery and completion_reason == "model_final":
+                    connection.execute(
+                        "UPDATE session_lifecycle SET resume_pending = 0, "
+                        "resume_reason = NULL, resume_source_turn_id = NULL, "
+                        "resume_suspended = 0, resume_attempts = 0, "
+                        "resume_not_before = NULL, updated_at = ? "
+                        "WHERE session_id = ? AND resume_pending = 1",
+                        (time.time(), session_id),
+                    )
             return True
 
     def finish_turn(
@@ -785,6 +1042,82 @@ class SQLiteStore:
         connection.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?", (time.time(), session_id)
         )
+
+    @staticmethod
+    def _create_delivery_obligation(
+        connection: sqlite3.Connection, session_id: str, turn_id: str,
+        message_id: int, destination: str,
+    ) -> str:
+        if not destination.strip():
+            raise StorageError("delivery destination must not be blank")
+        payload = _canonical_json(
+            [session_id, turn_id, message_id, destination]
+        ).encode("utf-8")
+        obligation_id = hashlib.sha256(payload).hexdigest()
+        now = time.time()
+        connection.execute(
+            "INSERT OR IGNORE INTO delivery_obligations("
+            "id, session_id, turn_id, message_id, destination, state, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (obligation_id, session_id, turn_id, message_id,
+             destination, now, now),
+        )
+        return obligation_id
+
+    def list_pending_deliveries(self) -> list[dict[str, Any]]:
+        connection = self._connection()
+        try:
+            rows = connection.execute(
+                "SELECT d.*, m.content FROM delivery_obligations d "
+                "JOIN messages m ON m.id = d.message_id "
+                "WHERE d.state IN ('pending','attempting','failed') "
+                "ORDER BY d.created_at, d.id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def claim_delivery(
+        self, obligation_id: str, *, fence: LeaseFence
+    ) -> dict[str, Any] | None:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=fence.session_id)
+            row = connection.execute(
+                "SELECT d.*, m.content FROM delivery_obligations d "
+                "JOIN messages m ON m.id = d.message_id WHERE d.id = ?",
+                (obligation_id,),
+            ).fetchone()
+            if row is None or row["session_id"] != fence.session_id:
+                return None
+            if row["state"] not in {"pending", "attempting", "failed"}:
+                return None
+            cursor = connection.execute(
+                "UPDATE delivery_obligations SET state = 'attempting', "
+                "attempts = attempts + 1, owner_id = ?, updated_at = ? "
+                "WHERE id = ? AND state IN ('pending','attempting','failed')",
+                (fence.owner_id, time.time(), obligation_id),
+            )
+            return dict(row) if cursor.rowcount else None
+
+    def finish_delivery(
+        self, obligation_id: str, *, delivered: bool,
+        error_type: str | None, fence: LeaseFence,
+    ) -> bool:
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=fence.session_id)
+            now = time.time()
+            cursor = connection.execute(
+                "UPDATE delivery_obligations SET state = ?, updated_at = ?, "
+                "delivered_at = ?, last_error = ?, owner_id = NULL "
+                "WHERE id = ? AND session_id = ? AND state = 'attempting' "
+                "AND owner_id = ?",
+                (
+                    "delivered" if delivered else "failed", now,
+                    now if delivered else None, error_type,
+                    obligation_id, fence.session_id, fence.owner_id,
+                ),
+            )
+            return cursor.rowcount == 1
 
     def begin_model_attempt(
         self, *, attempt_id: str, turn_id: str, session_id: str,

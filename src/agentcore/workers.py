@@ -122,7 +122,24 @@ class _TurnJob(Generic[T]):
     session_id: str
     future: Future[T]
     cancel_event: threading.Event
-    function: Callable[[threading.Event], T]
+    function: Callable[[threading.Event], T] | None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnReservation(Generic[T]):
+    """A queued session position that does not occupy a worker."""
+
+    session_id: str
+    _dispatcher: "TurnDispatcher"
+    _job: _TurnJob[T]
+
+    def commit(
+        self, function: Callable[[threading.Event], T]
+    ) -> TurnSubmission[T]:
+        return self._dispatcher._commit_reserved(self._job, function)
+
+    def cancel(self) -> None:
+        self._dispatcher._cancel_reserved(self._job)
 
 
 class TurnDispatcher:
@@ -135,6 +152,7 @@ class TurnDispatcher:
         self._closed = False
         self._total = 0
         self._active_sessions: set[str] = set()
+        self._blocked_sessions: set[str] = set()
         self._waiting: dict[str, deque[_TurnJob[Any]]] = {}
         self._jobs: dict[int, _TurnJob[Any]] = {}
 
@@ -161,6 +179,76 @@ class TurnDispatcher:
         if dispatch:
             self._dispatch(job)
         return TurnSubmission(future=future, cancel_event=job.cancel_event)
+
+    def reserve(self, session_id: str) -> TurnReservation[T]:
+        """Synchronously hold FIFO position before building a recovery job."""
+        job: _TurnJob[T] = _TurnJob(
+            session_id, Future(), threading.Event(), None
+        )
+        with self._lock:
+            if self._closed:
+                raise WorkerPoolClosedError("turn dispatcher is closed")
+            if self._total >= self._capacity:
+                raise TurnQueueFullError("turn queue is full")
+            self._total += 1
+            self._jobs[id(job)] = job
+            self._waiting.setdefault(session_id, deque()).append(job)
+            if session_id not in self._active_sessions:
+                self._active_sessions.add(session_id)
+                self._blocked_sessions.add(session_id)
+        return TurnReservation(session_id, self, job)
+
+    def _commit_reserved(
+        self, job: _TurnJob[T],
+        function: Callable[[threading.Event], T],
+    ) -> TurnSubmission[T]:
+        dispatch = False
+        with self._lock:
+            if self._closed or id(job) not in self._jobs:
+                raise WorkerPoolClosedError("turn reservation is no longer active")
+            if job.function is not None:
+                raise RuntimeError("turn reservation was already committed")
+            job.function = function
+            lane = self._waiting.get(job.session_id)
+            if (
+                job.session_id in self._blocked_sessions
+                and lane and lane[0] is job
+            ):
+                lane.popleft()
+                if not lane:
+                    self._waiting.pop(job.session_id, None)
+                self._blocked_sessions.discard(job.session_id)
+                dispatch = True
+        if dispatch:
+            self._dispatch(job)
+        return TurnSubmission(job.future, job.cancel_event)
+
+    def _cancel_reserved(self, job: _TurnJob[Any]) -> None:
+        next_job: _TurnJob[Any] | None = None
+        with self._lock:
+            if job.function is not None:
+                raise RuntimeError("committed reservation cannot be cancelled")
+            if self._jobs.pop(id(job), None) is None:
+                return
+            self._total -= 1
+            job.future.cancel()
+            lane = self._waiting.get(job.session_id)
+            if lane:
+                lane.remove(job)
+                if not lane:
+                    self._waiting.pop(job.session_id, None)
+            if job.session_id in self._blocked_sessions:
+                lane = self._waiting.get(job.session_id)
+                if not lane:
+                    self._blocked_sessions.discard(job.session_id)
+                    self._active_sessions.discard(job.session_id)
+                elif lane[0].function is not None:
+                    next_job = lane.popleft()
+                    if not lane:
+                        self._waiting.pop(job.session_id, None)
+                    self._blocked_sessions.discard(job.session_id)
+        if next_job is not None:
+            self._dispatch(next_job)
 
     def close(self, *, timeout: float) -> bool:
         with self._lock:
@@ -191,6 +279,7 @@ class TurnDispatcher:
             self._complete(job)
             return
         try:
+            assert job.function is not None
             job.future.set_result(job.function(job.cancel_event))
         except BaseException as exc:
             job.future.set_exception(exc)
@@ -204,11 +293,15 @@ class TurnDispatcher:
                 self._total -= 1
             lane = self._waiting.get(job.session_id)
             if lane and not self._closed:
-                next_job = lane.popleft()
-                if not lane:
-                    self._waiting.pop(job.session_id, None)
+                if lane[0].function is None:
+                    self._blocked_sessions.add(job.session_id)
+                else:
+                    next_job = lane.popleft()
+                    if not lane:
+                        self._waiting.pop(job.session_id, None)
             else:
                 self._active_sessions.discard(job.session_id)
+                self._blocked_sessions.discard(job.session_id)
         if next_job is not None:
             self._dispatch(next_job)
 

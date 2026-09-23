@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, TypeAlias
 
-from .workers import DaemonWorkerPool, WorkerQueueFullError
+from .workers import DaemonWorkerPool, WorkerQueueFullError, submit_daemon_call
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -42,17 +42,17 @@ class EventEnvelope:
 
 
 class LifecycleObserver(Protocol):
-    def on_event(self, event: AgentEvent) -> None: ...
+    def observe(self, event: AgentEvent) -> None: ...
 
 
 class EventSink(Protocol):
-    def publish(self, event: EventEnvelope) -> None: ...
+    def emit(self, event: EventEnvelope) -> None: ...
 
     def close(self) -> None: ...
 
 
 class NullEventSink:
-    def publish(self, event: EventEnvelope) -> None:
+    def emit(self, event: EventEnvelope) -> None:
         return None
 
     def close(self) -> None:
@@ -71,7 +71,8 @@ class ObservabilityHub:
     _SENSITIVE_KEYS = {
         "api_key", "authorization", "credential", "credential_ref",
         "prompt", "system_prompt", "user_input", "message", "arguments",
-        "result", "content", "tool_result",
+        "result", "content", "tool_result", "input", "output",
+        "text", "body", "headers", "user_message",
     }
 
     def __init__(
@@ -80,13 +81,13 @@ class ObservabilityHub:
         observer_timeout: float = 2.0,
     ) -> None:
         for index, observer in enumerate(observers):
-            callback = getattr(observer, "on_event", None)
+            callback = getattr(observer, "observe", None)
             if callback is None or _is_async(callback):
-                raise TypeError(f"observer {index}.on_event must be synchronous")
+                raise TypeError(f"observer {index}.observe must be synchronous")
         for index, sink in enumerate(sinks):
-            publish = getattr(sink, "publish", None)
+            emit = getattr(sink, "emit", None)
             close = getattr(sink, "close", None)
-            if publish is None or close is None or _is_async(publish) or _is_async(close):
+            if emit is None or close is None or _is_async(emit) or _is_async(close):
                 raise TypeError(f"event sink {index} must be synchronous")
         self._observers = observers
         self._sinks = sinks
@@ -113,7 +114,7 @@ class ObservabilityHub:
         if self._closed.is_set():
             return ("observability hub is closed",)
         occurred_at = time.time()
-        safe_payload = MappingProxyType(self._sanitize(payload or {}))
+        safe_payload = self._freeze(self._sanitize(payload or {}))
         safe_session = self._digest(session_id) if session_id else None
         safe_turn = self._digest(turn_id) if turn_id else None
         event = AgentEvent(
@@ -125,7 +126,7 @@ class ObservabilityHub:
         for index, observer in enumerate(self._observers):
             try:
                 future = self._observer_pool.submit(
-                    lambda observer=observer: observer.on_event(event)
+                    lambda observer=observer: observer.observe(event)
                 )
                 future.result(timeout=self._timeout)
             except FutureTimeoutError:
@@ -158,7 +159,12 @@ class ObservabilityHub:
             warnings.append("event sink queue did not drain before timeout")
         for index, sink in enumerate(self._sinks):
             try:
-                sink.close()
+                future = submit_daemon_call(
+                    sink.close, name=f"agentcore-sink-close-{index}"
+                )
+                future.result(timeout=max(0.0, timeout))
+            except FutureTimeoutError:
+                warnings.append(f"event sink {index}.close timed out")
             except BaseException as exc:
                 warnings.append(
                     f"event sink {index}.close failed: {type(exc).__name__}: {exc}"
@@ -168,16 +174,27 @@ class ObservabilityHub:
     def _publish_sinks(self, event: EventEnvelope) -> None:
         for sink in self._sinks:
             try:
-                sink.publish(event)
+                sink.emit(event)
             except BaseException:
                 pass
+
+    @staticmethod
+    def _freeze(value: Any) -> Any:
+        if isinstance(value, dict):
+            return MappingProxyType({
+                key: ObservabilityHub._freeze(item)
+                for key, item in value.items()
+            })
+        if isinstance(value, list):
+            return tuple(ObservabilityHub._freeze(item) for item in value)
+        return value
 
     def _digest(self, value: str) -> str:
         return hashlib.sha256(self._salt + value.encode("utf-8")).hexdigest()[:24]
 
     def _sanitize(self, value: Mapping[str, Any]) -> dict[str, JsonValue]:
         safe: dict[str, JsonValue] = {}
-        for key, item in value.items():
+        for key, item in list(value.items())[:64]:
             normalized = key.lower()
             if normalized in self._SENSITIVE_KEYS or any(
                 marker in normalized
@@ -194,10 +211,9 @@ class ObservabilityHub:
         if isinstance(value, str):
             return value[:512]
         if isinstance(value, Mapping):
-            return {
-                str(key): self._json_value(item)
-                for key, item in list(value.items())[:64]
-            }
+            return self._sanitize({
+                str(key): item for key, item in list(value.items())[:64]
+            })
         if isinstance(value, (list, tuple)):
             return [self._json_value(item) for item in value[:64]]
         return type(value).__name__

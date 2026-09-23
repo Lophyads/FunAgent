@@ -74,6 +74,11 @@ class LoopState:
     provider_attempts: int = 0
     route_attempts: dict[str, int] = field(default_factory=dict)
     admitted: bool = False
+    session_created: bool = False
+    history_recovered: bool = False
+    submitted_message: Message | None = None
+    recovery_claimed: bool = False
+    user_driven_recovery: bool = False
     finalized: bool = False
     released: bool = False
     business_error: BaseException | None = None

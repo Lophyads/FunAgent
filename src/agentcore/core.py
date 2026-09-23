@@ -17,7 +17,7 @@ from .interfaces import (
     ReviewScheduler, ToolGuard, TurnCancelled,
 )
 from .lease import LeaseHeartbeatService, SQLiteTurnLeaseStore, TurnLeaseStore
-from .models import AgentConfig, MemoryItem, TurnResult, UserInput
+from .models import AgentConfig, MemoryItem, TurnResult, TurnTrigger, UserInput
 from .observability import EventSink, LifecycleObserver, ObservabilityHub
 from .prompt_builder import StaticSystemPromptBuilder, SystemPromptBuilder
 from .provider_runtime import (
@@ -30,7 +30,7 @@ from .tools import ToolCatalog
 from .toolsets import DefaultToolsetResolver, ToolsetResolver
 from .turn_state import OperationTimeoutError, RunBudgetExceeded
 from .workers import (
-    DaemonWorkerPool, TurnDispatcher, TurnQueueFullError,
+    DaemonWorkerPool, TurnDispatcher, TurnQueueFullError, TurnReservation,
     WorkerQueueFullError, submit_daemon_call,
 )
 
@@ -79,7 +79,13 @@ class AgentCore:
         store: SQLiteStore | None = None,
         lease_store: TurnLeaseStore | None = None,
         legacy_tool_bindings: Mapping[str, tuple[str, str]] | None = None,
+        delivery_destination: str | None = None,
+        max_recovery_attempts: int = 3,
     ) -> None:
+        if max_recovery_attempts < 1:
+            raise ValueError("max_recovery_attempts must be positive")
+        self._delivery_destination = delivery_destination
+        self._max_recovery_attempts = max_recovery_attempts
         self._config = config
         self._catalog = tool_catalog or default_tool_catalog()
         self._catalog.freeze()
@@ -306,10 +312,38 @@ class AgentCore:
             )
             raise
 
+    def reserve_recovery(self, session_id: str) -> TurnReservation[TurnResult]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("AgentCore is closed")
+        return self._dispatcher.reserve(session_id)
+
+    def submit_recovery(
+        self, trigger: TurnTrigger,
+        reservation: TurnReservation[TurnResult] | None = None,
+    ):
+        """Submit an internal recovery turn to the same per-session FIFO lane."""
+        if trigger.kind != "internal_recovery":
+            raise ValueError("submit_recovery requires an internal recovery trigger")
+        session_id = trigger.session_id
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("AgentCore is closed")
+        turn_id = str(uuid.uuid4())
+        function = lambda cancel_event: self._run_submitted_turn(
+            UserInput(text="Internal recovery"), session_id, turn_id,
+            None, cancel_event, recovery=True,
+        )
+        if reservation is not None:
+            if reservation.session_id != session_id:
+                raise ValueError("recovery reservation belongs to another session")
+            return reservation.commit(function)
+        return self._dispatcher.submit(session_id, function)
+
     def _run_submitted_turn(
         self, user_input: UserInput, session_id: str, turn_id: str,
         session_request: SessionBuildRequest | None,
-        cancel_event: threading.Event,
+        cancel_event: threading.Event, recovery: bool = False,
     ) -> TurnResult:
         self.start_blocking()
         return ConversationLoop(
@@ -326,6 +360,9 @@ class AgentCore:
             review_scheduler=self._review_scheduler,
             observability=self._observability,
             call_operation=self.call_operation,
+            recovery=recovery,
+            delivery_destination=self._delivery_destination,
+            max_recovery_attempts=self._max_recovery_attempts,
         ).run()
 
     def call_operation(

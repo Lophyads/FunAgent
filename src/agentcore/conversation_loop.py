@@ -94,6 +94,8 @@ class ConversationLoop:
         guard: ToolGuard, approver: Approver | None,
         memory_updater: MemoryUpdater, review_scheduler: ReviewScheduler,
         observability: Any, call_operation: Any,
+        recovery: bool = False, delivery_destination: str | None = None,
+        max_recovery_attempts: int = 3,
     ) -> None:
         self.config = config
         self.user_input = user_input
@@ -115,6 +117,9 @@ class ConversationLoop:
         self.review_scheduler = review_scheduler
         self.observability = observability
         self.call_operation = call_operation
+        self.recovery = recovery
+        self.delivery_destination = delivery_destination
+        self.max_recovery_attempts = max_recovery_attempts
 
     def run(self) -> TurnResult:
         budget = self.config.timeouts.run_budget_seconds
@@ -130,7 +135,14 @@ class ConversationLoop:
             call_operation=self.call_operation,
         )
         try:
-            run_phase(self._admission_phase(), runtime, state)
+            for phase in (
+                self._acquire_lease_phase(),
+                self._recover_history_phase(),
+                self._resolve_context_phase(),
+                self._establish_turn_phase(),
+                self._load_messages_phase(),
+            ):
+                run_phase(phase, runtime, state)
             for iteration in range(1, self.config.max_iterations + 1):
                 state.iteration = iteration
                 state.response = None
@@ -220,12 +232,12 @@ class ConversationLoop:
             "handle_turn_error", handle, validate, check_active=False
         )
 
-    def _admission_phase(self) -> FunctionPhase:
-        def admission(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            runtime.observability.publish(
+    def _acquire_lease_phase(self) -> FunctionPhase:
+        def acquire(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            state.warnings.extend(runtime.observability.publish(
                 "lease.wait_started", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
-            )
+            ))
             lease = self._acquire_lease(runtime, state)
             state.lease = lease
             self.heartbeat.register(lease, runtime.lease_lost_event)
@@ -234,67 +246,168 @@ class ConversationLoop:
                 session_id=state.session_id, turn_id=state.turn_id,
                 payload={"fencing_token": lease.fencing_token},
             ))
-            recovery = self.store.recover_incomplete_turns(
-                state.session_id, fence=lease.fence
+            return PhaseResult()
+
+        def validate(state: LoopState) -> None:
+            if state.lease is None:
+                raise RuntimeError("lease phase did not acquire a session lease")
+
+        return FunctionPhase(
+            "acquire_lease", acquire, validate, check_active=False
+        )
+
+    def _recover_history_phase(self) -> FunctionPhase:
+        def recover(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            assert state.lease is not None
+            if self.recovery:
+                state.recovery_claimed = self.store.claim_recovery(
+                    state.session_id, fence=state.lease.fence,
+                    max_attempts=self.max_recovery_attempts,
+                )
+                if not state.recovery_claimed:
+                    raise StorageError(
+                        "session is not eligible for internal recovery"
+                    )
+                state.warnings.extend(runtime.observability.publish(
+                    "recovery.started", trace_id=state.trace_id,
+                    session_id=state.session_id, turn_id=state.turn_id,
+                ))
+            else:
+                lifecycle = self.store.get_session_lifecycle(state.session_id)
+                state.user_driven_recovery = bool(
+                    lifecycle and lifecycle["resume_pending"]
+                )
+            repaired = self.store.recover_incomplete_turns(
+                state.session_id, fence=state.lease.fence
             )
-            state.warnings.extend(recovery.warnings)
-            if recovery.warnings:
-                runtime.observability.publish(
+            state.warnings.extend(repaired.warnings)
+            if repaired.warnings:
+                state.warnings.extend(runtime.observability.publish(
                     "recovery.incomplete_turn_found", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
-                    payload={"warning_count": len(recovery.warnings)},
-                )
-            if recovery.messages:
-                runtime.observability.publish(
+                    payload={"warning_count": len(repaired.warnings)},
+                ))
+            if repaired.messages:
+                state.warnings.extend(runtime.observability.publish(
                     "recovery.tool_pair_repaired", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
-                    payload={"repair_count": len(recovery.messages)},
-                )
-            if recovery.warnings or recovery.messages:
-                runtime.observability.publish(
-                    "recovery.recovery_completed", trace_id=state.trace_id,
+                    payload={"repair_count": len(repaired.messages)},
+                ))
+            if repaired.warnings or repaired.messages:
+                state.warnings.extend(runtime.observability.publish(
+                    "recovery.history_repaired", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
+                ))
+            state.history_recovered = True
+            return PhaseResult()
+
+        def validate(state: LoopState) -> None:
+            if not state.history_recovered:
+                raise RuntimeError("prior turn history was not repaired")
+
+        return FunctionPhase(
+            "recover_history", recover, validate, check_active=False
+        )
+
+    def _resolve_context_phase(self) -> FunctionPhase:
+        def resolve(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            assert state.lease is not None
+            resolution = (
+                self.session_contexts.load_existing(
+                    state.session_id, state.lease
                 )
-            resolution = self.session_contexts.create_or_load(
-                state.session_id, self.user_input, self.session_request, lease
+                if self.recovery else
+                self.session_contexts.create_or_load(
+                    state.session_id, self.user_input, self.session_request,
+                    state.lease,
+                )
             )
             state.context = resolution.snapshot
+            state.session_created = resolution.created
+            # A new Session's context, turn, and user message were committed
+            # together by SessionContextFactory.
+            if resolution.created:
+                state.admitted = True
             state.warnings.extend(resolution.warnings)
             if any("defaults differ" in item for item in resolution.warnings):
                 state.warnings.extend(runtime.observability.publish(
-                    "session.config_mismatch_deferred", trace_id=state.trace_id,
-                    session_id=state.session_id, turn_id=state.turn_id,
+                    "session.config_mismatch_deferred",
+                    trace_id=state.trace_id, session_id=state.session_id,
+                    turn_id=state.turn_id,
                 ))
-            user_message = Message.user(
-                self.user_input.text, metadata=self.user_input.metadata
-            )
-            if not resolution.created:
-                self.store.begin_turn(
-                    turn_id=state.turn_id, session_id=state.session_id,
-                    context_version=resolution.snapshot.context_version,
-                    user_message=user_message, fence=lease.fence,
-                )
-            state.messages = self.store.load_messages(state.session_id)
-            state.new_messages.append(user_message)
-            state.admitted = True
-            event = "session.created" if resolution.created else "session.loaded"
             state.warnings.extend(runtime.observability.publish(
-                event, trace_id=state.trace_id, session_id=state.session_id,
+                "session.created" if resolution.created else "session.loaded",
+                trace_id=state.trace_id, session_id=state.session_id,
                 turn_id=state.turn_id,
-                payload={"context_version": resolution.snapshot.context_version},
-            ))
-            state.warnings.extend(runtime.observability.publish(
-                "turn.admitted", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                payload={"context_version": resolution.snapshot.context_version},
+                payload={
+                    "context_version": resolution.snapshot.context_version
+                },
             ))
             return PhaseResult()
 
         def validate(state: LoopState) -> None:
-            if state.lease is None or state.context is None or not state.admitted:
-                raise RuntimeError("admission did not establish lease, context, and turn")
+            if state.context is None:
+                raise RuntimeError("session context was not resolved")
 
-        return FunctionPhase("admission", admission, validate, check_active=False)
+        return FunctionPhase(
+            "resolve_session_context", resolve, validate,
+            check_active=False,
+        )
+
+    def _establish_turn_phase(self) -> FunctionPhase:
+        def begin(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            assert state.lease is not None and state.context is not None
+            if self.recovery:
+                message = self.store.begin_recovery_turn(
+                    turn_id=state.turn_id, session_id=state.session_id,
+                    context_version=state.context.context_version,
+                    fence=state.lease.fence,
+                )
+            else:
+                message = Message.user(
+                    self.user_input.text, metadata=self.user_input.metadata
+                )
+                if not state.session_created:
+                    self.store.begin_turn(
+                        turn_id=state.turn_id, session_id=state.session_id,
+                        context_version=state.context.context_version,
+                        user_message=message, fence=state.lease.fence,
+                    )
+            state.submitted_message = message
+            state.new_messages.append(message)
+            state.admitted = True
+            state.warnings.extend(runtime.observability.publish(
+                "turn.admitted", trace_id=state.trace_id,
+                session_id=state.session_id, turn_id=state.turn_id,
+                payload={"context_version": state.context.context_version},
+            ))
+            return PhaseResult()
+
+        def validate(state: LoopState) -> None:
+            if not state.admitted or state.submitted_message is None:
+                raise RuntimeError("current turn was not admitted")
+
+        return FunctionPhase(
+            "establish_turn", begin, validate, check_active=False
+        )
+
+    def _load_messages_phase(self) -> FunctionPhase:
+        def load(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            state.messages = self.store.load_messages(state.session_id)
+            return PhaseResult()
+
+        def validate(state: LoopState) -> None:
+            if (
+                state.submitted_message is None or not state.messages
+                or state.messages[-1] != state.submitted_message
+            ):
+                raise RuntimeError(
+                    "loaded history does not end with the submitted message"
+                )
+
+        return FunctionPhase(
+            "load_messages", load, validate, check_active=False
+        )
 
     def _assemble_phase(self) -> FunctionPhase:
         def assemble(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
@@ -364,7 +477,7 @@ class ConversationLoop:
                 )
             else:
                 state.status = "completed"
-                state.completion_reason = "model_stop"
+                state.completion_reason = "model_final"
                 state.error = None
             assert state.lease is not None
             committed = self.store.finish_turn_with_message(
@@ -374,6 +487,8 @@ class ConversationLoop:
                 usage=state.usage, completion_reason=state.completion_reason,
                 provider_attempts=state.provider_attempts,
                 route_attempts=state.route_attempts, fence=state.lease.fence,
+                delivery_destination=self.delivery_destination,
+                recovery=self.recovery or state.user_driven_recovery,
             )
             if not committed:
                 raise StorageError("terminal turn was already finalized")
@@ -779,6 +894,13 @@ class ConversationLoop:
                 "repair_unresolved_tools", self._repair, check_active=False
             ),
             FunctionPhase("finalize_turn", self._finalize, check_active=False),
+            FunctionPhase(
+                "clear_active_turn", self._clear_active_turn, check_active=False
+            ),
+            FunctionPhase(
+                "record_recovery_failure", self._record_recovery_failure,
+                check_active=False,
+            ),
             FunctionPhase("end_turn", self._end_turn, check_active=False),
             FunctionPhase(
                 "release_lease", self._release,
@@ -835,6 +957,32 @@ class ConversationLoop:
         )
         return PhaseResult()
 
+    def _clear_active_turn(
+        self, runtime: TurnRuntime, state: LoopState
+    ) -> PhaseResult:
+        if (
+            not self.recovery and state.lease is not None
+            and state.admitted and state.finalized
+        ):
+            self.store.clear_active_turn(
+                state.session_id, state.turn_id, fence=state.lease.fence
+            )
+        return PhaseResult()
+
+    def _record_recovery_failure(
+        self, runtime: TurnRuntime, state: LoopState
+    ) -> PhaseResult:
+        if (
+            self.recovery and state.recovery_claimed
+            and state.status != "completed" and state.lease is not None
+        ):
+            self.store.finish_recovery(
+                state.session_id, completed=False,
+                max_attempts=self.max_recovery_attempts,
+                fence=state.lease.fence,
+            )
+        return PhaseResult()
+
     def _end_turn(self, runtime: TurnRuntime, state: LoopState) -> PhaseResult:
         if not state.finalized:
             return PhaseResult()
@@ -865,6 +1013,14 @@ class ConversationLoop:
                 state.warnings.append(
                     f"{label} failed: {type(exc).__name__}: {exc}"
                 )
+        if self.recovery:
+            state.warnings.extend(runtime.observability.publish(
+                "recovery.completed" if state.status == "completed"
+                else "recovery.failed",
+                trace_id=state.trace_id, session_id=state.session_id,
+                turn_id=state.turn_id,
+                payload={"status": state.status},
+            ))
         state.warnings.extend(runtime.observability.publish(
             "turn.finalized", trace_id=state.trace_id,
             session_id=state.session_id, turn_id=state.turn_id,

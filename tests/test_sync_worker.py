@@ -199,7 +199,7 @@ def test_async_extensions_are_rejected(config_factory, agent_factory, final_resp
         agent_factory(config_factory(), transports={"primary": AsyncTransport()})
 
     class AsyncObserver:
-        async def on_event(self, event):
+        async def observe(self, event):
             return None
 
     with pytest.raises(TypeError, match="observer"):

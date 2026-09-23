@@ -131,6 +131,16 @@ class SessionContextFactory:
             )
         return self._load(persisted, request, lease)
 
+    def load_existing(
+        self, session_id: str, lease: LeaseHandle
+    ) -> SessionContextResolution:
+        persisted = self._store.load_session_context(session_id)
+        if persisted is None:
+            raise SessionContextError(
+                "cannot recover a session without a persisted snapshot"
+            )
+        return self._load(persisted, None, lease)
+
     def _create(
         self, session_id: str, user_input: UserInput,
         request: SessionBuildRequest,

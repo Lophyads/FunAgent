@@ -1,4 +1,4 @@
-# FunAgent mini-Hermes
+# FunAgent
 
 FunAgent 是一个 Python 3.11+ 的同步 Agent 内核。完整 ConversationLoop 在 daemon turn
 worker 中运行；异步 API 只负责提交任务并等待 Future，不在业务 EventLoop 上执行
@@ -9,14 +9,11 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - 不可变 Session Prompt/Toolset Snapshot，Memory recall 只在新 Session bootstrap 时执行。
 - Provider Resolver、API Mode Adapter 与单次请求 Transport 三层解耦。
 - 显式 Phase orchestrator，Provider retry 不增加 Agent iteration。
-- SQLite schema v5：消息、工具执行、模型 attempt 与跨进程 Session Lease 账本。
+- SQLite schema v7：消息、工具执行、模型 attempt、Session Lease、生命周期和投递账本。
 - 单调 fencing token、独立 heartbeat 线程和 stale-owner 写入拒绝。
 - 顺序工具执行、Pydantic 参数校验、guard、approval 与未知副作用恢复语义。
+- GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
 - 隔离的 Observer/EventSink 可观测性路径及集中敏感信息脱敏。
-
-详细设计见
-[mini-hermes-development-design.md](docs/mini-hermes-development-design.md)，验收矩阵见
-[mini-hermes-test-acceptance-plan.md](docs/mini-hermes-test-acceptance-plan.md)。
 
 ## 快速开始
 
@@ -71,6 +68,36 @@ asyncio.run(main())
 
 可通过 keyword-only `session_request` 显式创建 Session Snapshot。既有 Session 再传入
 不同 request 会 fail closed，不会因当前配置变化替换旧 Prompt 或 Toolset。
+
+## Gateway 与回复投递
+
+有外部投递目标时使用 `GatewayRuntime`。Adapter 必须以确定性的
+`obligation_id` 作为幂等键；仅在目标确认成功后返回 `True`。未确认回复保留在
+SQLite 中，下一次启动先重试投递，再安排需要模型继续处理的 Session。
+
+```python
+from agentcore import GatewayRuntime, load_config
+
+
+class ChatAdapter:
+    destination = "chat:room"
+
+    def __init__(self, client):
+        self.client = client
+
+    def send(self, *, obligation_id: str, destination: str, text: str) -> bool:
+        response = self.client.send_text(
+            destination, text, idempotency_key=obligation_id
+        )
+        return response.acknowledged
+
+
+with GatewayRuntime(load_config("agentcore.toml"), ChatAdapter(client)) as gateway:
+    result = gateway.run_turn_blocking("Hello")
+```
+
+普通 `AgentCore` 仍返回 `TurnResult` 给调用方；它没有外部投递目标时不会创建
+delivery obligation。`GatewayRuntime.wait_for_recovery()` 可用作启动恢复的等待屏障。
 
 ## 自定义工具
 
@@ -128,7 +155,7 @@ cooldown、fallback 和当前 Turn route 粘滞由 ConversationLoop 统一控制
 - `[timeouts]`：总预算和工具、策略、memory、observer、review、finalize 上限。
 - `[[routes]]`：有序 primary/fallback 路由。
 
-MVP 不包含 Gateway、Cron、Subagent、MCP、Delivery Runtime、上下文压缩、多模态或
+当前版本不包含 HTTP Gateway 服务、Cron、Subagent、MCP、上下文压缩、多模态或
 exactly-once 工具保证。
 
 ## 验收

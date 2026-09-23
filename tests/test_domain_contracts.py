@@ -191,7 +191,7 @@ async def test_observer_failure_is_isolated_and_warned(
     config_factory, agent_factory, final_response,
 ):
     class BrokenObserver:
-        def on_event(self, event):
+        def observe(self, event):
             raise RuntimeError("observer unavailable")
 
     async with agent_factory(
@@ -211,7 +211,7 @@ def test_legacy_dynamic_lifecycle_hooks_are_rejected(
         def before_model(self, event):
             return None
 
-    with pytest.raises(TypeError, match="on_event"):
+    with pytest.raises(TypeError, match="observe"):
         agent_factory(
             config_factory(), transports={"primary": ScriptedTransport(final_response)},
             observers=[LegacyHooks()],

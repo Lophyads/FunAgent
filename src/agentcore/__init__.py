@@ -1,5 +1,7 @@
 from .builtins import default_tool_catalog, register_builtin_tools
 from .config import load_config
+from .delivery import DeliveryAdapter, DeliveryBatch, DeliveryRuntime
+from .gateway import GatewayRuntime
 from .core import AgentCore, TurnQueueFullError, WorkerQueueFullError
 from .interfaces import (
     AllowAllGuard,
@@ -42,6 +44,7 @@ from .models import (
     ToolOutcome,
     TurnError,
     TurnResult,
+    TurnTrigger,
     UserInput,
     WorkerPolicy,
 )
@@ -110,7 +113,8 @@ __all__ = [
     "ApiModeAdapter", "ApiModeRegistry", "ApprovalDecision", "Approver",
     "AttemptContext", "AttemptState", "CancellationToken",
     "CanonicalModelRequest", "ChatCompletionsAdapter",
-    "DefaultToolsetResolver", "EnvironmentCredentialResolver",
+    "DefaultToolsetResolver", "DeliveryAdapter", "DeliveryBatch",
+    "DeliveryRuntime", "EnvironmentCredentialResolver", "GatewayRuntime",
     "EventEnvelope", "EventSink", "GuardDecision", "LeaseAcquireTimeout",
     "LeaseFence", "LeaseHandle", "LeaseHeartbeatService", "LeaseLostError",
     "LeasePolicy", "LifecycleObserver", "LoopState", "MemoryItem",
@@ -131,7 +135,7 @@ __all__ = [
     "ToolSpec", "ToolsetRebindError", "ToolsetRequest", "ToolsetResolver",
     "ToolsetSnapshot", "Transport", "TurnCancelled", "TurnError", "TurnLeaseStore",
     "TurnPhase", "TurnQueueFullError", "TurnResult", "TurnRuntime",
-    "TurnSnapshot", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",
+    "TurnSnapshot", "TurnTrigger", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",
     "WorkerQueueFullError", "default_api_mode_registry",
     "default_tool_catalog", "load_config", "register_builtin_tools",
 ]

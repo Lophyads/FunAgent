@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -125,6 +126,28 @@ class UserInput(StrictModel):
     @classmethod
     def normalize(cls, value: "UserInput | str") -> "UserInput":
         return value if isinstance(value, cls) else cls(text=value)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnTrigger:
+    kind: Literal["user", "internal_recovery"]
+    session_id: str
+    user_input: UserInput | None = None
+    recovery_reason: str | None = None
+    source_turn_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"user", "internal_recovery"}:
+            raise ValueError("invalid turn trigger kind")
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("trigger session_id must not be blank")
+        if self.kind == "user":
+            if not isinstance(self.user_input, UserInput):
+                raise ValueError("user trigger requires a UserInput")
+            if self.recovery_reason is not None or self.source_turn_id is not None:
+                raise ValueError("user trigger cannot carry recovery metadata")
+        elif self.user_input is not None:
+            raise ValueError("internal recovery must not repeat user_input")
 
 
 class LeaseFence(FrozenStrictModel):
