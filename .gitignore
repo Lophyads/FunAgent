@@ -12,3 +12,6 @@ build/
 *.db-shm
 *.db-wal
 .env
+
+logs/
+.correlation-key

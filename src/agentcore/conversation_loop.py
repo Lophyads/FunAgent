@@ -18,6 +18,7 @@ from .interfaces import (
     ToolGuard, ToolInvocation, TurnCancelled, TurnSnapshot,
 )
 from .lease import LeaseAcquireTimeout, LeaseHeartbeatService, TurnLeaseStore
+from .logging_system import log_context
 from .models import (
     AgentConfig, CanonicalModelRequest, Message, NormalizedModelResponse,
     ToolCall, ToolOutcome, TurnError, TurnResult, UserInput,
@@ -36,6 +37,7 @@ from .turn_state import (
     PhaseResult, RunBudgetExceeded, TurnRuntime, run_phase,
 )
 from .workers import WorkerQueueFullError
+
 
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,10 @@ class ConversationLoop:
         self.max_recovery_attempts = max_recovery_attempts
 
     def run(self) -> TurnResult:
+        with log_context(self.config, self.session_id):
+            return self._run()
+
+    def _run(self) -> TurnResult:
         budget = self.config.timeouts.run_budget_seconds
         deadline = time.monotonic() + budget if budget is not None else None
         state = LoopState(
@@ -129,11 +135,17 @@ class ConversationLoop:
             trace_id=self.turn_id,
         )
         runtime = TurnRuntime(
-            store=self.store, lease_store=self.lease_store,
+            config=self.config, store=self.store, lease_store=self.lease_store,
             observability=self.observability, cancel_event=self.cancel_event,
             lease_lost_event=threading.Event(), deadline=deadline,
             call_operation=self.call_operation,
         )
+        logger.info('turn.started')
+        if not self.recovery:
+            logger.debug(
+                'turn.user_preview %s',
+                self.user_input.text[:80].replace('\r', ' ').replace('\n', ' '),
+            )
         try:
             for phase in (
                 self._acquire_lease_phase(),
@@ -169,6 +181,7 @@ class ConversationLoop:
         except SessionSnapshotConflict as exc:
             self._set_error(state, "failed", "session_snapshot_conflict", exc, False)
         except ToolsetRebindError as exc:
+            logger.warning('session.rebind_failed error_type=%s', type(exc).__name__)
             state.warnings.extend(runtime.observability.publish(
                 "session.rebind_failed", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -178,6 +191,7 @@ class ConversationLoop:
         except LeaseAcquireTimeout as exc:
             self._set_error(state, "failed", "lease_timeout", exc, True)
         except LeaseLostError as exc:
+            logger.error('lease.fenced_write_rejected error_type=%s', type(exc).__name__)
             state.warnings.extend(runtime.observability.publish(
                 "lease.fenced_write_rejected", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -206,7 +220,12 @@ class ConversationLoop:
                 details={"status_code": exc.error.status_code},
             )
         except BaseException as exc:
-            logger.exception("conversation loop failed")
+            logger.error('turn.unhandled_error error_type=%s', type(exc).__name__)
+            state.warnings.extend(runtime.observability.publish(
+                "turn.unhandled_error", trace_id=state.trace_id,
+                session_id=state.session_id, turn_id=state.turn_id,
+                payload={"error_type": type(exc).__name__},
+            ))
             self._set_error(state, "failed", "turn_failed", exc, False)
         finally:
             if state.error is not None and not state.finalized:
@@ -218,6 +237,16 @@ class ConversationLoop:
                         f"{type(exc).__name__}: {exc}"
                     )
             self._cleanup(runtime, state)
+            end_logger = logger.info if state.status == "completed" else logger.error
+            end_logger(
+                'turn.ended status=%s completion_reason=%s duration_ms=%s iteration=%s provider_attempts=%s tool_call_count=%s',
+                state.status,
+                state.completion_reason,
+                int((time.monotonic() - state.started_at_monotonic) * 1000),
+                state.iteration,
+                state.provider_attempts,
+                len(state.tool_outcomes),
+            )
         return self._result(state)
 
     def _handle_error_phase(self) -> FunctionPhase:
@@ -234,6 +263,7 @@ class ConversationLoop:
 
     def _acquire_lease_phase(self) -> FunctionPhase:
         def acquire(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            logger.debug('lease.wait_started')
             state.warnings.extend(runtime.observability.publish(
                 "lease.wait_started", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -241,6 +271,7 @@ class ConversationLoop:
             lease = self._acquire_lease(runtime, state)
             state.lease = lease
             self.heartbeat.register(lease, runtime.lease_lost_event)
+            logger.info('lease.acquired fencing_token=%s', lease.fencing_token)
             state.warnings.extend(runtime.observability.publish(
                 "lease.acquired", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -268,6 +299,7 @@ class ConversationLoop:
                     raise StorageError(
                         "session is not eligible for internal recovery"
                     )
+                logger.info('recovery.started')
                 state.warnings.extend(runtime.observability.publish(
                     "recovery.started", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
@@ -282,18 +314,21 @@ class ConversationLoop:
             )
             state.warnings.extend(repaired.warnings)
             if repaired.warnings:
+                logger.warning('recovery.incomplete_turn_found warning_count=%s', len(repaired.warnings))
                 state.warnings.extend(runtime.observability.publish(
                     "recovery.incomplete_turn_found", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
                     payload={"warning_count": len(repaired.warnings)},
                 ))
             if repaired.messages:
+                logger.info('recovery.tool_pair_repaired repair_count=%s', len(repaired.messages))
                 state.warnings.extend(runtime.observability.publish(
                     "recovery.tool_pair_repaired", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
                     payload={"repair_count": len(repaired.messages)},
                 ))
             if repaired.warnings or repaired.messages:
+                logger.info('recovery.history_repaired')
                 state.warnings.extend(runtime.observability.publish(
                     "recovery.history_repaired", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
@@ -330,11 +365,14 @@ class ConversationLoop:
                 state.admitted = True
             state.warnings.extend(resolution.warnings)
             if any("defaults differ" in item for item in resolution.warnings):
+                logger.warning('session.config_mismatch_deferred')
                 state.warnings.extend(runtime.observability.publish(
                     "session.config_mismatch_deferred",
                     trace_id=state.trace_id, session_id=state.session_id,
                     turn_id=state.turn_id,
                 ))
+            session_event = "session.created" if resolution.created else "session.loaded"
+            logger.info('%s context_version=%s', session_event, resolution.snapshot.context_version)
             state.warnings.extend(runtime.observability.publish(
                 "session.created" if resolution.created else "session.loaded",
                 trace_id=state.trace_id, session_id=state.session_id,
@@ -376,6 +414,7 @@ class ConversationLoop:
             state.submitted_message = message
             state.new_messages.append(message)
             state.admitted = True
+            logger.info('turn.admitted context_version=%s', state.context.context_version)
             state.warnings.extend(runtime.observability.publish(
                 "turn.admitted", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -416,6 +455,14 @@ class ConversationLoop:
                 system_prompt=state.context.prompt.text,
                 messages=tuple(state.messages),
                 tool_schema_bytes=state.context.toolset.schema_bytes,
+            )
+            logger.debug(
+                'turn.request_assembled phase=%s iteration=%s message_count=%s tool_count=%s context_version=%s',
+                'assemble_request',
+                state.iteration,
+                len(state.request.messages),
+                len(state.context.toolset.bindings),
+                state.context.context_version,
             )
             return PhaseResult()
 
@@ -551,6 +598,13 @@ class ConversationLoop:
                     request_fingerprint=state.request.fingerprint,
                     fence=state.lease.fence,
                 )
+                logger.debug(
+                    'provider.attempt_started phase=%s route=%s iteration=%s attempt=%s',
+                    'provider_attempts',
+                    route.name,
+                    state.iteration,
+                    attempt_number,
+                )
                 state.warnings.extend(runtime.observability.publish(
                     "provider.attempt_started", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
@@ -560,6 +614,7 @@ class ConversationLoop:
                         "attempt": attempt_number,
                     },
                 ))
+                attempt_started = time.monotonic()
                 try:
                     wire = adapter.encode(state.request, binding)
                     raw_response = binding.transport.send(
@@ -592,6 +647,32 @@ class ConversationLoop:
                         status_code=error.status_code,
                         fence=state.lease.fence,
                     )
+                    failure_payload = {
+                        "route": route.name, "attempt": attempt_number,
+                        "error_type": error.error_type,
+                        "status_code": error.status_code,
+                        "duration_ms": int(
+                            (time.monotonic() - attempt_started) * 1000
+                        ),
+                    }
+                    logger.warning(
+                        'provider.attempt_failed phase=%s payload=%s',
+                        'provider_attempts',
+                        failure_payload,
+                    )
+                    state.warnings.extend(runtime.observability.publish(
+                        "provider.attempt_failed", trace_id=state.trace_id,
+                        session_id=state.session_id, turn_id=state.turn_id,
+                        phase="provider_attempts",
+                        payload={
+                            "route": route.name, "attempt": attempt_number,
+                            "error_type": error.error_type,
+                            "status_code": error.status_code,
+                            "duration_ms": int(
+                                (time.monotonic() - attempt_started) * 1000
+                            ),
+                        },
+                    ))
                     failures.append({
                         "route": route.name,
                         "attempt": attempt_number,
@@ -599,6 +680,12 @@ class ConversationLoop:
                         "status_code": error.status_code,
                     })
                     if error.ambiguous:
+                        logger.warning(
+                            'provider.ambiguous_failure phase=%s route=%s error_type=%s',
+                            'provider_attempts',
+                            route.name,
+                            error.error_type,
+                        )
                         state.warnings.extend(runtime.observability.publish(
                             "provider.ambiguous_failure",
                             trace_id=state.trace_id,
@@ -617,11 +704,18 @@ class ConversationLoop:
                         ))
                     if error.retryable and attempt_number < max_attempts:
                         delay = self._retry_delay(error, attempt_number - 1)
+                        logger.warning(
+                            'provider.retry_scheduled phase=%s route=%s attempt=%s delay=%s',
+                            'provider_attempts',
+                            route.name,
+                            attempt_number,
+                            delay,
+                        )
                         state.warnings.extend(runtime.observability.publish(
                             "provider.retry_scheduled", trace_id=state.trace_id,
                             session_id=state.session_id, turn_id=state.turn_id,
                             phase="provider_attempts",
-                            payload={"route": route.name, "delay": delay},
+                            payload={"route": route.name, "attempt": attempt_number, "delay": delay},
                         ))
                         self._wait(runtime, state, delay)
                         continue
@@ -635,6 +729,24 @@ class ConversationLoop:
                         fence=state.lease.fence,
                     )
                     route_state.clear()
+                    response_payload = {
+                        "route": route.name,
+                        "tool_call_count": len(normalized.tool_calls),
+                        "finish_reason": (
+                            normalized.finish_reason
+                            if normalized.finish_reason in {
+                                "stop", "length", "tool_calls", "content_filter"
+                            } else "other"
+                        ),
+                        "duration_ms": int(
+                            (time.monotonic() - attempt_started) * 1000
+                        ),
+                    }
+                    logger.info(
+                        'provider.response phase=%s payload=%s',
+                        'provider_attempts',
+                        response_payload,
+                    )
                     state.warnings.extend(runtime.observability.publish(
                         "provider.response", trace_id=state.trace_id,
                         session_id=state.session_id, turn_id=state.turn_id,
@@ -642,10 +754,25 @@ class ConversationLoop:
                         payload={
                             "route": route.name,
                             "tool_call_count": len(normalized.tool_calls),
+                            "finish_reason": (
+                                normalized.finish_reason
+                                if normalized.finish_reason in {
+                                    "stop", "length", "tool_calls", "content_filter"
+                                } else "other"
+                            ),
+                            "duration_ms": int(
+                                (time.monotonic() - attempt_started) * 1000
+                            ),
                         },
                     ))
                     return normalized, route_index
             if route_index + 1 < len(self.config.routes):
+                logger.warning(
+                    'provider.fallback phase=%s from_route=%s to_route=%s',
+                    'provider_attempts',
+                    route.name,
+                    self.config.routes[route_index + 1].name,
+                )
                 state.warnings.extend(runtime.observability.publish(
                     "provider.fallback", trace_id=state.trace_id,
                     session_id=state.session_id, turn_id=state.turn_id,
@@ -676,6 +803,14 @@ class ConversationLoop:
             state.session_id, state.turn_id, assistant, staged,
             fence=state.lease.fence,
         )
+        round_started = time.monotonic()
+        outcome_start = len(state.tool_outcomes)
+        logger.info(
+            'tool.round_started phase=%s iteration=%s tool_call_count=%s',
+            'tool_round',
+            state.iteration,
+            len(response.tool_calls),
+        )
         for call in response.tool_calls:
             runtime.observability.publish(
                 "tool.pending", trace_id=state.trace_id,
@@ -686,7 +821,14 @@ class ConversationLoop:
         state.new_messages.append(assistant)
         for tool_call in response.tool_calls:
             runtime.check_active(state)
+            logger.debug(
+                'tool.arguments_preview tool_name=%s preview=%s',
+                tool_call.name,
+                tool_call.arguments[:200].replace('\r', ' ').replace('\n', ' '),
+            )
+            tool_started = time.monotonic()
             executed = self._execute_tool(runtime, state, tool_call)
+            tool_duration_ms = int((time.monotonic() - tool_started) * 1000)
             persisted = self.store.complete_tool_call(
                 session_id=state.session_id, turn_id=state.turn_id,
                 message=executed.message, state=executed.outcome.state,
@@ -700,6 +842,20 @@ class ConversationLoop:
             state.messages.append(executed.message)
             state.new_messages.append(executed.message)
             state.tool_outcomes.append(executed.outcome)
+            tool_event = f"tool.{executed.outcome.state}"
+            tool_logger = (
+                logger.info if executed.outcome.state == "succeeded"
+                else logger.warning
+            )
+            tool_logger(
+                '%s phase=%s tool_name=%s effect=%s duration_ms=%s error_type=%s',
+                tool_event,
+                'tool_round',
+                tool_call.name,
+                executed.outcome.effect_disposition,
+                tool_duration_ms,
+                executed.outcome.error_type,
+            )
             state.warnings.extend(runtime.observability.publish(
                 f"tool.{executed.outcome.state}", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -707,12 +863,27 @@ class ConversationLoop:
                 payload={
                     "tool_name": tool_call.name,
                     "effect": executed.outcome.effect_disposition,
+                    "duration_ms": tool_duration_ms,
+                    "error_type": executed.outcome.error_type,
                 },
             ))
             if executed.interrupt_reason == "cancelled":
                 raise TurnCancelled("turn cancelled during tool execution")
             if executed.interrupt_reason == "run_budget":
                 raise RunBudgetExceeded("turn budget expired during tool execution")
+        round_outcomes = state.tool_outcomes[outcome_start:]
+        failed_count = sum(
+            outcome.state != "succeeded" for outcome in round_outcomes
+        )
+        round_logger = logger.warning if failed_count else logger.info
+        round_logger(
+            'tool.round_completed phase=%s iteration=%s tool_call_count=%s failed_count=%s duration_ms=%s',
+            'tool_round',
+            state.iteration,
+            len(round_outcomes),
+            failed_count,
+            int((time.monotonic() - round_started) * 1000),
+        )
 
     def _execute_tool(
         self, runtime: TurnRuntime, state: LoopState, tool_call: ToolCall,
@@ -925,6 +1096,11 @@ class ConversationLoop:
         state.messages.extend(recovery.messages)
         state.new_messages.extend(recovery.messages)
         if recovery.messages:
+            logger.info(
+                'recovery.tool_pair_repaired phase=%s repair_count=%s',
+                'repair_unresolved_tools',
+                len(recovery.messages),
+            )
             state.warnings.extend(runtime.observability.publish(
                 "recovery.tool_pair_repaired", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
@@ -1014,6 +1190,14 @@ class ConversationLoop:
                     f"{label} failed: {type(exc).__name__}: {exc}"
                 )
         if self.recovery:
+            recovery_event = (
+                "recovery.completed" if state.status == "completed"
+                else "recovery.failed"
+            )
+            recovery_logger = (
+                logger.info if state.status == "completed" else logger.error
+            )
+            recovery_logger('%s status=%s', recovery_event, state.status)
             state.warnings.extend(runtime.observability.publish(
                 "recovery.completed" if state.status == "completed"
                 else "recovery.failed",
@@ -1021,12 +1205,22 @@ class ConversationLoop:
                 turn_id=state.turn_id,
                 payload={"status": state.status},
             ))
+        final_logger = logger.info if state.status == "completed" else logger.error
+        final_logger(
+            'turn.finalized status=%s completion_reason=%s duration_ms=%s',
+            state.status,
+            state.completion_reason,
+            int((time.monotonic() - state.started_at_monotonic) * 1000),
+        )
         state.warnings.extend(runtime.observability.publish(
             "turn.finalized", trace_id=state.trace_id,
             session_id=state.session_id, turn_id=state.turn_id,
             payload={
                 "status": state.status,
                 "completion_reason": state.completion_reason,
+                "duration_ms": int(
+                    (time.monotonic() - state.started_at_monotonic) * 1000
+                ),
             },
         ))
         return PhaseResult()
@@ -1038,6 +1232,7 @@ class ConversationLoop:
         self.heartbeat.unregister(state.lease)
         self.lease_store.release(state.lease)
         state.released = True
+        logger.debug('lease.released fencing_token=%s', state.lease.fencing_token)
         state.warnings.extend(runtime.observability.publish(
             "lease.released", trace_id=state.trace_id,
             session_id=state.session_id, turn_id=state.turn_id,

@@ -31,6 +31,19 @@ ttl_seconds = 30.0
 renew_interval_seconds = 10.0
 wait_timeout_seconds = 300.0
 
+
+[logging]
+enabled = true
+directory = "logs"
+level = "INFO"
+queue_capacity = 2048
+agent_max_size_mb = 5
+agent_backup_count = 3
+errors_max_size_mb = 2
+errors_backup_count = 2
+gateway_max_size_mb = 5
+gateway_backup_count = 3
+
 [[routes]]
 name = "primary"
 provider = "openai"

@@ -54,6 +54,19 @@ class LeasePolicy(FrozenStrictModel):
         return self
 
 
+class LoggingConfig(FrozenStrictModel):
+    enabled: bool = True
+    directory: Path = Path("logs")
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    queue_capacity: int = Field(default=2048, ge=16, le=100_000)
+    agent_max_size_mb: int = Field(default=5, ge=1, le=1024)
+    agent_backup_count: int = Field(default=3, ge=0, le=100)
+    errors_max_size_mb: int = Field(default=2, ge=1, le=1024)
+    errors_backup_count: int = Field(default=2, ge=0, le=100)
+    gateway_max_size_mb: int = Field(default=5, ge=1, le=1024)
+    gateway_backup_count: int = Field(default=3, ge=0, le=100)
+
+
 class ModelRoute(FrozenStrictModel):
     name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     provider: str = Field(min_length=1, max_length=80)
@@ -101,6 +114,7 @@ class AgentConfig(FrozenStrictModel):
     workers: WorkerPolicy = Field(default_factory=WorkerPolicy)
     timeouts: TimeoutPolicy = Field(default_factory=TimeoutPolicy)
     lease: LeasePolicy = Field(default_factory=LeasePolicy)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
     session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
     routes: tuple[ModelRoute, ...] = Field(min_length=1)
 

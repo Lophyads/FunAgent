@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import uuid
 import threading
+import time
 import inspect
+import logging
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Protocol
 
 from .lease import LeaseAcquireTimeout, LeaseHeartbeatService, SQLiteTurnLeaseStore
+from .logging_system import log_context
+from .models import AgentConfig
 from .observability import ObservabilityHub
 from .storage import LeaseLostError, SQLiteStore
 from .workers import DaemonWorkerPool
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeliveryAdapter(Protocol):
@@ -37,6 +44,7 @@ class DeliveryRuntime:
         lease_ttl_seconds: float = 30.0,
         observability: ObservabilityHub | None = None,
         queue_capacity: int = 128,
+        log_config: AgentConfig | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -48,6 +56,7 @@ class DeliveryRuntime:
             interval_seconds=lease_ttl_seconds / 3,
         )
         self._observability = observability
+        self._log_config = log_config
         self._pool = DaemonWorkerPool(
             1, queue_capacity, name="gateway-delivery"
         )
@@ -76,6 +85,10 @@ class DeliveryRuntime:
         return DeliveryBatch(delivered, failed)
 
     def _deliver_one(self, obligation: dict[str, object]) -> bool:
+        with log_context(self._log_config, str(obligation['session_id'])):
+            return self._deliver_one_bound(obligation)
+
+    def _deliver_one_bound(self, obligation: dict[str, object]) -> bool:
         session_id = str(obligation["session_id"])
         turn_id = str(obligation["turn_id"])
         obligation_id = str(obligation["id"])
@@ -94,10 +107,13 @@ class DeliveryRuntime:
             )
             if claimed is None:
                 return False
+            if self._log_config is not None:
+                logger.debug('delivery.attempted attempt=%s', int(claimed['attempts']) + 1)
             self._emit(
                 "delivery.attempted", session_id, turn_id,
                 {"attempt": int(claimed["attempts"]) + 1},
             )
+            send_started = time.monotonic()
             try:
                 if lost_event.is_set():
                     raise LeaseLostError("delivery lease was lost")
@@ -127,11 +143,15 @@ class DeliveryRuntime:
                 return False
             if not committed:
                 return False
-            self._emit(
-                "delivery.delivered" if acknowledged else "delivery.failed",
-                session_id, turn_id,
-                {"error_type": error_type} if error_type else {},
-            )
+            event = "delivery.delivered" if acknowledged else "delivery.failed"
+            payload = {
+                "duration_ms": int((time.monotonic() - send_started) * 1000),
+                **({"error_type": error_type} if error_type else {}),
+            }
+            if self._log_config is not None:
+                log_method = logger.info if acknowledged else logger.warning
+                log_method('%s payload=%s', event, payload)
+            self._emit(event, session_id, turn_id, payload)
             return acknowledged
         finally:
             self._heartbeat.unregister(lease)

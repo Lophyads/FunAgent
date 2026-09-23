@@ -36,6 +36,29 @@ CLI 支持 `/new`、`/session` 和 `/exit`。恢复已有会话：
 uv run agentcore chat --config agentcore.toml --session <session-id>
 ```
 
+## 诊断日志
+
+CLI 和 Gateway 默认将脱敏的诊断日志写到配置目录下的 `logs/`：
+`agent.log` 记录普通执行，`errors.log` 记录 WARNING 及以上，
+Gateway 还写 `gateway.log`。文件按大小轮转；日志故障不会改变 Turn 结果。
+主链路记录 Turn 开始与结束、Provider 尝试和响应、工具轮次与单个工具结果；
+DEBUG 级别另记录请求组装时的消息和工具数量，以及相位边界。
+关键诊断由各模块的具名 logger 显式写入；生命周期事件的发布不会自动生成日志。
+`[logging]` 可调整级别、目录、队列容量与各文件大小及备份数。
+
+```powershell
+uv run agentcore logs list --config agentcore.toml
+uv run agentcore logs agent --config agentcore.toml -n 100 --level WARNING
+uv run agentcore logs agent --config agentcore.toml --session <session-id> --since 1h
+uv run agentcore logs gateway --config agentcore.toml -f
+```
+
+日志查看还支持按组件筛选。原始 Session ID 写入文本日志；默认 INFO 只记录执行摘要。
+DEBUG 可记录截断并脱敏的用户输入和工具参数预览，启用时应限制日志目录访问权限。
+旧 JSONL 日志首次启动时归档到 logs/legacy-jsonl/，查看命令只读取新文本日志。
+嵌入 Python 的 `AgentCore` 不自动配置文件日志；需要时先调用
+`configure_logging(config)` 并在关闭 AgentCore 后关闭返回的 handle。
+
 ## Python API
 
 同步宿主：

@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import threading
 import uuid
 from typing import Any
 
 from .core import AgentCore
 from .delivery import DeliveryAdapter, DeliveryRuntime
+from .logging_system import LoggingHandle, configure_logging, log_context
 from .models import AgentConfig, TurnResult, TurnTrigger, UserInput
 from .workers import TurnQueueFullError, TurnSubmission, submit_daemon_call
+
+
+logger = logging.getLogger(__name__)
 
 
 class GatewayRuntime:
@@ -37,6 +42,7 @@ class GatewayRuntime:
             lease_ttl_seconds=config.lease.ttl_seconds,
             observability=self.agent._observability,
             queue_capacity=config.workers.queue_capacity,
+            log_config=config,
         )
         self._max_recovery_attempts = max_recovery_attempts
         self._runtime_id = str(uuid.uuid4())
@@ -44,6 +50,7 @@ class GatewayRuntime:
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
+        self._log_handle: LoggingHandle | None = None
         self._inbound_open = False
         self._recovery_submissions: list[TurnSubmission[TurnResult]] = []
         self._scheduled_sessions: set[str] = set()
@@ -68,6 +75,35 @@ class GatewayRuntime:
         await self.aclose()
 
     def start_blocking(self) -> None:
+        with log_context(self.agent._config):
+            self._start_blocking_bound()
+
+    def _start_blocking_bound(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("GatewayRuntime is closed")
+            if self._started:
+                return
+            if self._log_handle is None:
+                self._log_handle = configure_logging(
+                    self.agent._config, mode="gateway"
+                )
+        try:
+            self._start_blocking_impl()
+        except BaseException as exc:
+            logger.error('runtime.startup_failed error_type=%s', type(exc).__name__)
+            self.agent._observability.publish(
+                "runtime.startup_failed", trace_id="runtime",
+                payload={"error_type": type(exc).__name__},
+            )
+            if self._log_handle is not None:
+                self._log_handle.close(
+                    timeout=self.agent._config.timeouts.finalize_seconds
+                )
+                self._log_handle = None
+            raise
+
+    def _start_blocking_impl(self) -> None:
         with self._lock:
             if self._closed:
                 raise RuntimeError("GatewayRuntime is closed")
@@ -77,6 +113,7 @@ class GatewayRuntime:
             self.last_shutdown_clean = (
                 self.agent._store.record_runtime_start(self._runtime_id)
             )
+            logger.info('runtime.startup_started')
             self.agent._observability.publish(
                 "runtime.startup_started", trace_id="runtime"
             )
@@ -91,6 +128,8 @@ class GatewayRuntime:
                 if readiness is False:
                     raise RuntimeError("delivery adapter is not ready")
             converted = self.agent._store.convert_stale_active_turns()
+            if converted:
+                logger.warning('recovery.interrupted_turns_converted session_count=%s', len(converted))
             self.agent._observability.publish(
                 "recovery.interrupted_turns_converted", trace_id="runtime",
                 payload={"session_count": len(converted)},
@@ -121,6 +160,7 @@ class GatewayRuntime:
                 name="gateway-recovery-monitor", daemon=True,
             )
             self._monitor_thread.start()
+            logger.info('runtime.ready recovery_count=%s', len(pending))
             self.agent._observability.publish(
                 "runtime.ready", trace_id="runtime",
                 payload={"recovery_count": len(pending)},
@@ -133,6 +173,10 @@ class GatewayRuntime:
         await asyncio.shield(asyncio.wrap_future(future))
 
     def _schedule_recovery(self, session_id: str) -> bool:
+        with log_context(self.agent._config, session_id):
+            return self._schedule_recovery_bound(session_id)
+
+    def _schedule_recovery_bound(self, session_id: str) -> bool:
         with self._lock:
             if self._closed or session_id in self._scheduled_sessions:
                 return True
@@ -161,6 +205,7 @@ class GatewayRuntime:
                 )
                 self._recovery_submissions.append(submission)
                 self._scheduled_sessions.add(session_id)
+                logger.info('recovery.scheduled')
                 self.agent._observability.publish(
                     "recovery.scheduled", trace_id="runtime",
                     session_id=session_id,
@@ -172,10 +217,15 @@ class GatewayRuntime:
                 raise
 
     def _monitor_recovery(self) -> None:
+        with log_context(self.agent._config):
+            self._monitor_recovery_bound()
+
+    def _monitor_recovery_bound(self) -> None:
         while not self._monitor_stop.wait(self._monitor_interval):
             try:
                 converted = self.agent._store.convert_stale_active_turns()
                 if converted:
+                    logger.warning('recovery.interrupted_turns_converted session_count=%s', len(converted))
                     self.agent._observability.publish(
                         "recovery.interrupted_turns_converted",
                         trace_id="runtime",
@@ -187,6 +237,7 @@ class GatewayRuntime:
                 for session_id in pending:
                     self._schedule_recovery(session_id)
             except Exception as exc:
+                logger.error('recovery.monitor_failed error_type=%s', type(exc).__name__)
                 self.agent._observability.publish(
                     "recovery.monitor_failed", trace_id="runtime",
                     payload={"error_type": type(exc).__name__},
@@ -241,6 +292,20 @@ class GatewayRuntime:
         return results
 
     def close_blocking(self) -> None:
+        with log_context(self.agent._config):
+            self._close_blocking_bound()
+
+    def _close_blocking_bound(self) -> None:
+        try:
+            self._close_blocking_impl()
+        finally:
+            if self._log_handle is not None:
+                self._log_handle.close(
+                    timeout=self.agent._config.timeouts.finalize_seconds
+                )
+                self._log_handle = None
+
+    def _close_blocking_impl(self) -> None:
         self._monitor_stop.set()
         with self._lock:
             if self._closed:
@@ -256,6 +321,7 @@ class GatewayRuntime:
             if self._started and turns_drained and delivery_drained:
                 self.agent._store.mark_runtime_clean(self._runtime_id)
         except Exception as exc:
+            logger.warning('runtime.shutdown_incomplete error_type=%s', type(exc).__name__)
             self.agent._observability.publish(
                 "runtime.shutdown_incomplete", trace_id="runtime",
                 payload={"error_type": type(exc).__name__},

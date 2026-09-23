@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextvars import copy_context
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from .builtins import default_tool_catalog
@@ -17,6 +18,7 @@ from .interfaces import (
     ReviewScheduler, ToolGuard, TurnCancelled,
 )
 from .lease import LeaseHeartbeatService, SQLiteTurnLeaseStore, TurnLeaseStore
+from .logging_system import log_context
 from .models import AgentConfig, MemoryItem, TurnResult, TurnTrigger, UserInput
 from .observability import EventSink, LifecycleObserver, ObservabilityHub
 from .prompt_builder import StaticSystemPromptBuilder, SystemPromptBuilder
@@ -34,8 +36,6 @@ from .workers import (
     WorkerQueueFullError, submit_daemon_call,
 )
 
-
-logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
@@ -56,6 +56,9 @@ class _BoundedMemoryProvider:
             timeout=self._agent._config.timeouts.memory_seconds,
             cancel_event=None, deadline=None,
         )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentCore:
@@ -130,19 +133,29 @@ class AgentCore:
             legacy_bindings=legacy_tool_bindings,
         )
         self._owner_id = str(uuid.uuid4())
-        self._heartbeat = LeaseHeartbeatService(
-            self._lease_store, ttl_seconds=config.lease.ttl_seconds,
-            interval_seconds=config.lease.renew_interval_seconds,
-            on_renewed=lambda lease: self._observability.publish(
+
+        def on_lease_renewed(lease) -> None:
+            with log_context(config, lease.session_id):
+                logger.debug('lease.renewed fencing_token=%s', lease.fencing_token)
+            self._observability.publish(
                 "lease.renewed", trace_id=lease.turn_id,
                 session_id=lease.session_id, turn_id=lease.turn_id,
                 payload={"fencing_token": lease.fencing_token},
-            ),
-            on_lost=lambda lease, exc: self._observability.publish(
+            )
+
+        def on_lease_lost(lease, exc) -> None:
+            with log_context(config, lease.session_id):
+                logger.error('lease.lost error_type=%s', type(exc).__name__)
+            self._observability.publish(
                 "lease.lost", trace_id=lease.turn_id,
                 session_id=lease.session_id, turn_id=lease.turn_id,
                 payload={"error_type": type(exc).__name__},
-            ),
+            )
+
+        self._heartbeat = LeaseHeartbeatService(
+            self._lease_store, ttl_seconds=config.lease.ttl_seconds,
+            interval_seconds=config.lease.renew_interval_seconds,
+            on_renewed=on_lease_renewed, on_lost=on_lease_lost,
         )
         self._route_states = tuple(RouteState() for _ in config.routes)
         self._dispatcher = TurnDispatcher(
@@ -230,10 +243,15 @@ class AgentCore:
         await asyncio.shield(asyncio.wrap_future(future))
 
     def close_blocking(self) -> None:
+        with log_context(self._config):
+            self._close_blocking_bound()
+
+    def _close_blocking_bound(self) -> None:
         with self._lifecycle_lock:
             if self._closed:
                 return
             self._closed = True
+        logger.info('runtime.shutdown_started')
         self._observability.publish("runtime.shutdown_started", trace_id="runtime")
         timeout = self._config.timeouts.finalize_seconds
         drained = self._dispatcher.close(timeout=timeout)
@@ -243,19 +261,25 @@ class AgentCore:
         )
         try:
             self._provider_resolver.close()
-        except BaseException:
-            logger.exception("provider resolver close failed")
+        except BaseException as exc:
+            logger.error('runtime.provider_close_failed error_type=%s', type(exc).__name__)
+            self._observability.publish(
+                "runtime.provider_close_failed", trace_id="runtime",
+                payload={"error_type": type(exc).__name__},
+            )
         if self._started:
             self._store.close()
         if not (drained and heartbeat_stopped and operations_stopped):
+            logger.warning('runtime.shutdown_incomplete')
             self._observability.publish(
                 "runtime.shutdown_incomplete", trace_id="runtime"
             )
         else:
+            logger.info('runtime.closed')
             self._observability.publish("runtime.closed", trace_id="runtime")
         warnings = self._observability.close(timeout)
-        for warning in warnings:
-            logger.warning(warning)
+        if warnings:
+            logger.warning('runtime.observability_warning warning_count=%s', len(warnings))
 
     async def aclose(self) -> None:
         future = submit_daemon_call(self.close_blocking, name="agentcore-close")
@@ -306,6 +330,8 @@ class AgentCore:
                 ),
             )
         except TurnQueueFullError:
+            with log_context(self._config, effective_session_id):
+                logger.warning('runtime.queue_saturated')
             self._observability.publish(
                 "runtime.queue_saturated", trace_id="runtime",
                 session_id=effective_session_id, turn_id=turn_id,
@@ -369,7 +395,8 @@ class AgentCore:
         self, function: Callable[[], T], *, timeout: float,
         cancel_event: threading.Event | None, deadline: float | None,
     ) -> T:
-        future = self._operation_pool.submit(function)
+        context = copy_context()
+        future = self._operation_pool.submit(lambda: context.run(function))
         started = time.monotonic()
         while True:
             if cancel_event is not None and cancel_event.is_set():

@@ -107,3 +107,64 @@ def test_config_rejects_legacy_api_key_env(tmp_path):
 
     with pytest.raises(ValueError):
         load_config(config_path)
+
+def test_logging_config_resolves_relative_directory(tmp_path):
+    config_path = tmp_path / "nested" / "agentcore.toml"
+    config_path.parent.mkdir()
+    _write_config(config_path)
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[logging]\ndirectory = \"diagnostics\"\nlevel = \"DEBUG\"\n")
+
+    config = load_config(config_path)
+
+    assert config.logging.directory == (config_path.parent / "diagnostics").resolve()
+    assert config.logging.level == "DEBUG"
+
+
+def test_cli_logs_list_and_filter(tmp_path, capsys):
+    import logging
+    from agentcore.logging_system import configure_logging, log_context
+
+    config_path = tmp_path / "agentcore.toml"
+    _write_config(config_path)
+    config = load_config(config_path)
+    with configure_logging(config) as handle:
+        with log_context(config, "cli-session"):
+            logging.getLogger("agentcore.cli_test").info(
+                "turn.finalized status=completed"
+            )
+        assert handle.runtime is not None and handle.runtime.flush(2)
+
+    assert run_cli(["logs", "list", "--config", str(config_path)]) == 0
+    assert "agent" in capsys.readouterr().out
+    assert run_cli([
+        "logs", "agent", "--config", str(config_path),
+        "--session", "cli-session",
+    ]) == 0
+    captured = capsys.readouterr()
+    assert "turn.finalized status=completed" in captured.out
+    assert "[cli-session]" in captured.out
+
+
+def test_cli_session_filter_without_existing_logs(tmp_path, capsys):
+    config_path = tmp_path / "agentcore.toml"
+    _write_config(config_path)
+
+    code = run_cli([
+        "logs", "agent", "--config", str(config_path),
+        "--session", "unknown",
+    ])
+
+    assert code == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_rejects_legacy_log_options(tmp_path):
+    import pytest
+
+    config_path = tmp_path / "agentcore.toml"
+    _write_config(config_path)
+    for option in ("--trace", "--json"):
+        with pytest.raises(SystemExit) as exc:
+            run_cli(["logs", "agent", "--config", str(config_path), option])
+        assert exc.value.code == 2

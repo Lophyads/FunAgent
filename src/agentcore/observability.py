@@ -115,8 +115,8 @@ class ObservabilityHub:
             return ("observability hub is closed",)
         occurred_at = time.time()
         safe_payload = self._freeze(self._sanitize(payload or {}))
-        safe_session = self._digest(session_id) if session_id else None
-        safe_turn = self._digest(turn_id) if turn_id else None
+        safe_session = self._digest("session", session_id) if session_id else None
+        safe_turn = self._digest("turn", turn_id) if turn_id else None
         event = AgentEvent(
             name=name, occurred_at=occurred_at, trace_id=trace_id,
             session_id=safe_session, turn_id=safe_turn, phase=phase,
@@ -133,7 +133,7 @@ class ObservabilityHub:
                 warnings.append(f"observer {index} timed out")
             except BaseException as exc:
                 warnings.append(
-                    f"observer {index} failed: {type(exc).__name__}: {exc}"
+                    f"observer {index} failed: {type(exc).__name__}"
                 )
         envelope = EventEnvelope(
             event_id=str(uuid.uuid4()), name=name, occurred_at=occurred_at,
@@ -167,7 +167,7 @@ class ObservabilityHub:
                 warnings.append(f"event sink {index}.close timed out")
             except BaseException as exc:
                 warnings.append(
-                    f"event sink {index}.close failed: {type(exc).__name__}: {exc}"
+                    f"event sink {index}.close failed: {type(exc).__name__}"
                 )
         return tuple(warnings)
 
@@ -189,8 +189,10 @@ class ObservabilityHub:
             return tuple(ObservabilityHub._freeze(item) for item in value)
         return value
 
-    def _digest(self, value: str) -> str:
-        return hashlib.sha256(self._salt + value.encode("utf-8")).hexdigest()[:24]
+    def _digest(self, kind: str, value: str) -> str:
+        return hashlib.sha256(
+            self._salt + kind.encode("utf-8") + b":" + value.encode("utf-8")
+        ).hexdigest()[:24]
 
     def _sanitize(self, value: Mapping[str, Any]) -> dict[str, JsonValue]:
         safe: dict[str, JsonValue] = {}

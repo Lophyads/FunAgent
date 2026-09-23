@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from typing import Any, Callable, Protocol
 
 from .interfaces import TurnCancelled
 from .models import (
+    AgentConfig,
     CanonicalModelRequest,
     LeaseHandle,
     Message,
@@ -16,6 +18,9 @@ from .models import (
     TurnError,
 )
 from .session_context import SessionRuntimeSnapshot
+
+
+logger = logging.getLogger(__name__)
 
 
 class OperationTimeoutError(TimeoutError):
@@ -53,6 +58,7 @@ class LoopState:
     session_id: str
     turn_id: str
     trace_id: str
+    started_at_monotonic: float = field(default_factory=time.monotonic)
     lease: LeaseHandle | None = None
     context: SessionRuntimeSnapshot | None = None
     messages: list[Message] = field(default_factory=list)
@@ -86,6 +92,7 @@ class LoopState:
 
 @dataclass(frozen=True, slots=True)
 class TurnRuntime:
+    config: AgentConfig
     store: Any
     lease_store: Any
     observability: Any
@@ -133,6 +140,7 @@ def run_phase(
 ) -> PhaseResult:
     if phase.check_active:
         runtime.check_active(state)
+    logger.debug('turn.phase_started phase=%s iteration=%s', phase.name, state.iteration)
     state.warnings.extend(runtime.observability.publish(
         "turn.phase_started", trace_id=state.trace_id,
         session_id=state.session_id, turn_id=state.turn_id,
@@ -142,13 +150,26 @@ def run_phase(
         result = phase(runtime, state)
         phase.validate_postconditions(state)
     except BaseException as exc:
+        logger.error('turn.phase_failed phase=%s error_type=%s', phase.name, type(exc).__name__)
         state.warnings.extend(runtime.observability.publish(
             "turn.phase_failed", trace_id=state.trace_id,
             session_id=state.session_id, turn_id=state.turn_id,
             phase=phase.name,
             payload={"error_type": type(exc).__name__},
         ))
+        if type(exc).__name__ in {
+            "StorageError", "DatabaseError", "OperationalError",
+            "IntegrityError",
+        }:
+            logger.error('storage.failure phase=%s error_type=%s', phase.name, type(exc).__name__)
+            state.warnings.extend(runtime.observability.publish(
+                "storage.failure", trace_id=state.trace_id,
+                session_id=state.session_id, turn_id=state.turn_id,
+                phase=phase.name,
+                payload={"error_type": type(exc).__name__},
+            ))
         raise
+    logger.debug('turn.phase_finished phase=%s action=%s', phase.name, result.action.value)
     state.warnings.extend(runtime.observability.publish(
         "turn.phase_finished", trace_id=state.trace_id,
         session_id=state.session_id, turn_id=state.turn_id,

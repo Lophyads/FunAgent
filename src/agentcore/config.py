@@ -25,6 +25,7 @@ def load_config(path: str | Path) -> AgentConfig:
         "workers": raw.get("workers", {}),
         "timeouts": raw.get("timeouts", {}),
         "lease": raw.get("lease", {}),
+        "logging": raw.get("logging", {}),
         "session_defaults": raw.get("session", {}),
         "routes": raw.get("routes", []),
     }
@@ -33,4 +34,9 @@ def load_config(path: str | Path) -> AgentConfig:
         config = config.model_copy(
             update={"database_path": (config_path.parent / config.database_path).resolve()}
         )
+    if not config.logging.directory.is_absolute():
+        logging_config = config.logging.model_copy(
+            update={"directory": (config_path.parent / config.logging.directory).resolve()}
+        )
+        config = config.model_copy(update={"logging": logging_config})
     return config
