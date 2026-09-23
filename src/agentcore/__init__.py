@@ -1,8 +1,8 @@
 from .builtins import default_tool_catalog, register_builtin_tools
 from .config import load_config
-from .delivery import DeliveryAdapter, DeliveryBatch, DeliveryRuntime
-from .gateway import GatewayRuntime
-from .logging_system import LoggingHandle, configure_logging
+from gateway.delivery import DeliveryAdapter, DeliveryBatch, DeliveryRuntime
+from gateway.gateway import GatewayRuntime
+from log.logging_system import LoggingHandle, configure_logging
 from .core import AgentCore, TurnQueueFullError, WorkerQueueFullError
 from .interfaces import (
     AllowAllGuard,
@@ -91,8 +91,8 @@ from .session_context import (
     ToolsetRebindError,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
-from .tools import ToolCatalog, ToolSpec
-from .toolsets import (
+from tools.tools import ToolCatalog, ToolSpec
+from tools.toolsets import (
     DefaultToolsetResolver,
     ToolBinding,
     ToolsetRequest,

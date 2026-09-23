@@ -19,7 +19,7 @@ from typing import Iterator
 import portalocker
 from concurrent_log_handler import ConcurrentRotatingFileHandler
 
-from .models import AgentConfig, LoggingConfig
+from agentcore.models import AgentConfig, LoggingConfig
 
 _LOG_FILES = {"agent": "agent.log", "errors": "errors.log", "gateway": "gateway.log"}
 _LOG_FORMAT = "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
@@ -261,7 +261,7 @@ class LoggingRuntime:
                     if item.levelno >= logging.WARNING:
                         destinations.append("errors")
                     if self._gateway_users and (
-                        item.name.startswith(("agentcore.gateway", "agentcore.delivery"))
+                        item.name.startswith(("gateway.", "agentcore.gateway", "agentcore.delivery"))
                         or item.getMessage().startswith(("recovery.", "runtime."))
                     ):
                         destinations.append("gateway")

@@ -8,8 +8,8 @@ from typing import Sequence
 
 from .builtins import default_tool_catalog
 from .config import load_config
-from .logging_system import configure_logging
-from .logs_cli import list_logs, tail_logs
+from log.logging_system import configure_logging
+from log.logs_cli import list_logs, tail_logs
 from .core import AgentCore
 
 

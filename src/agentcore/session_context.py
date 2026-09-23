@@ -13,8 +13,8 @@ from .prompt_builder import (
     SystemPromptSnapshot,
 )
 from .storage import PersistedSessionContext, SQLiteStore
-from .tools import ToolCatalog
-from .toolsets import (
+from tools.tools import ToolCatalog
+from tools.toolsets import (
     ToolsetRequest,
     ToolsetResolver,
     ToolsetSnapshot,

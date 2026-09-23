@@ -18,7 +18,7 @@ from .interfaces import (
     ReviewScheduler, ToolGuard, TurnCancelled,
 )
 from .lease import LeaseHeartbeatService, SQLiteTurnLeaseStore, TurnLeaseStore
-from .logging_system import log_context
+from log.logging_system import log_context
 from .models import AgentConfig, MemoryItem, TurnResult, TurnTrigger, UserInput
 from .observability import EventSink, LifecycleObserver, ObservabilityHub
 from .prompt_builder import StaticSystemPromptBuilder, SystemPromptBuilder
@@ -28,8 +28,8 @@ from .provider_runtime import (
 )
 from .session_context import SessionBuildRequest, SessionContextFactory
 from .storage import SQLiteStore
-from .tools import ToolCatalog
-from .toolsets import DefaultToolsetResolver, ToolsetResolver
+from tools.tools import ToolCatalog
+from tools.toolsets import DefaultToolsetResolver, ToolsetResolver
 from .turn_state import OperationTimeoutError, RunBudgetExceeded
 from .workers import (
     DaemonWorkerPool, TurnDispatcher, TurnQueueFullError, TurnReservation,

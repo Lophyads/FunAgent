@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator, TextIO
 
 from .logging_system import resolve_logging_directory, _session_tag
-from .models import AgentConfig
+from agentcore.models import AgentConfig
 
 LOG_FILES = {"agent": "agent.log", "errors": "errors.log", "gateway": "gateway.log"}
 LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}

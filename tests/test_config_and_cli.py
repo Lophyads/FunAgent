@@ -123,7 +123,7 @@ def test_logging_config_resolves_relative_directory(tmp_path):
 
 def test_cli_logs_list_and_filter(tmp_path, capsys):
     import logging
-    from agentcore.logging_system import configure_logging, log_context
+    from log.logging_system import configure_logging, log_context
 
     config_path = tmp_path / "agentcore.toml"
     _write_config(config_path)

@@ -8,7 +8,7 @@ from typing import Any, Callable, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
-from .interfaces import ToolContext
+from agentcore.interfaces import ToolContext
 
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)

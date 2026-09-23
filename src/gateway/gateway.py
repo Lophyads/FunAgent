@@ -7,11 +7,11 @@ import threading
 import uuid
 from typing import Any
 
-from .core import AgentCore
+from agentcore.core import AgentCore
 from .delivery import DeliveryAdapter, DeliveryRuntime
-from .logging_system import LoggingHandle, configure_logging, log_context
-from .models import AgentConfig, TurnResult, TurnTrigger, UserInput
-from .workers import TurnQueueFullError, TurnSubmission, submit_daemon_call
+from log.logging_system import LoggingHandle, configure_logging, log_context
+from agentcore.models import AgentConfig, TurnResult, TurnTrigger, UserInput
+from agentcore.workers import TurnQueueFullError, TurnSubmission, submit_daemon_call
 
 
 logger = logging.getLogger(__name__)

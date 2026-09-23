@@ -13,8 +13,8 @@ from agentcore import (
     AgentConfig, GatewayRuntime, LoggingConfig, ModelRoute,
     NormalizedModelResponse, ToolCall, configure_logging,
 )
-from agentcore.logging_system import log_context
-from agentcore.logs_cli import _follow, list_logs, tail_logs
+from log.logging_system import log_context
+from log.logs_cli import _follow, list_logs, tail_logs
 from agentcore.observability import ObservabilityHub
 from conftest import ScriptedTransport, scripted_provider_stack
 
@@ -218,7 +218,7 @@ def test_gateway_logs_delivery_with_session(
         assert result.status == "completed"
     raw = _text(tmp_path / "logs" / "gateway.log")
     assert "runtime.ready" in raw
-    assert "[gateway-session] agentcore.delivery: delivery.delivered" in raw
+    assert "[gateway-session] gateway.delivery: delivery.delivered" in raw
     assert "private-input" not in raw
 
 
@@ -299,7 +299,7 @@ def test_queue_saturation_and_bounded_close(config_factory, monkeypatch):
 
 
 def test_follow_reopens_after_rotation(tmp_path, monkeypatch):
-    import agentcore.logs_cli as logs_cli
+    import log.logs_cli as logs_cli
 
     path = tmp_path / "agent.log"
     first = "2026-09-23 00:00:00,000 INFO agentcore.test: first\n"
@@ -377,7 +377,7 @@ def test_two_processes_rotate_valid_text_lines(tmp_path):
 
 
 def test_redaction_failure_drops_record(config_factory, monkeypatch, tmp_path):
-    import agentcore.logging_system as logging_system
+    import log.logging_system as logging_system
 
     config = config_factory()
     with configure_logging(config) as handle:
@@ -397,7 +397,7 @@ def test_redaction_failure_drops_record(config_factory, monkeypatch, tmp_path):
 def test_migration_failure_preserves_legacy_file(
     config_factory, monkeypatch, tmp_path,
 ):
-    import agentcore.logging_system as logging_system
+    import log.logging_system as logging_system
 
     config = config_factory()
     directory = tmp_path / "logs"

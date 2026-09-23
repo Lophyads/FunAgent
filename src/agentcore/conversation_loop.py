@@ -19,7 +19,7 @@ from .interfaces import (
     ToolGuard, ToolInvocation, TurnCancelled, TurnSnapshot,
 )
 from .lease import LeaseAcquireTimeout, LeaseHeartbeatService, TurnLeaseStore
-from .logging_system import log_context
+from log.logging_system import log_context
 from .models import (
     AgentConfig, CanonicalModelRequest, Message, NormalizedModelResponse,
     ToolCall, ToolOutcome, TurnError, TurnResult, UserInput,
@@ -32,7 +32,7 @@ from .session_context import (
     ToolsetRebindError,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
-from .tools import encode_tool_error, encode_tool_success
+from tools.tools import encode_tool_error, encode_tool_success
 from .turn_state import (
     AttemptState, FunctionPhase, LoopState, OperationTimeoutError, PhaseAction,
     PhaseResult, RunBudgetExceeded, TurnRuntime, run_phase,

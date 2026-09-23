@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from .models import LeaseFence, LeaseHandle, Message, ToolCall, ToolOutcome, TurnError
-from .tools import encode_tool_error
+from tools.tools import encode_tool_error
 
 
 _SCHEMA = """
