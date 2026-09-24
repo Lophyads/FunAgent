@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from agentcore import (
     Message, NormalizedModelResponse, SQLiteStore, StorageError,
-    ToolCall, ToolSpec,
+    ToolCall, ToolEntry,
 )
 from agentcore.storage import LeaseLostError, SCHEMA_VERSION
 from conftest import ScriptedTransport
@@ -132,7 +132,7 @@ def test_existing_session_uses_new_toolset_but_original_prompt(
     )
     with agent_factory(config, transports={"primary": transport}) as agent:
         assert agent.run_turn_blocking("one", session_id="same").status == "completed"
-        agent.update_tools((ToolSpec(
+        agent.update_tools((ToolEntry(
             tool_id="echo", implementation_version="2", name="echo",
             description="Echo text", args_model=EchoArgs,
             handler=lambda args, context: args.text, side_effects="none",

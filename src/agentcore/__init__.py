@@ -1,4 +1,3 @@
-from .builtins import default_tool_catalog, register_builtin_tools
 from .config import load_config
 from gateway.delivery import DeliveryAdapter, DeliveryBatch, DeliveryRuntime
 from gateway.gateway import GatewayRuntime
@@ -90,14 +89,15 @@ from .session_context import (
     SessionSnapshotConflict,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
-from tools.tools import ToolCatalog, ToolSpec
+from tools.registry import ToolEntry, ToolRegistry
+from tools.model_tools import default_tool_registry
 from tools.toolsets import (
     DefaultToolsetResolver,
-    ToolBinding,
     ToolsetRequest,
     ToolsetResolver,
-    ToolsetSnapshot,
 )
+from .tool_execution import ToolExecution, ToolExecutor
+from .tool_round import ToolRoundRunner
 from .turn_phase import (
     PhaseAction,
     PhaseResult,
@@ -133,12 +133,13 @@ __all__ = [
     "SessionContextResolution", "SessionDefaults", "SessionRuntimeSnapshot",
     "SessionSnapshotConflict", "StaticProviderResolver",
     "StaticSystemPromptBuilder", "StorageError", "SystemPromptBuilder",
-    "SystemPromptSnapshot", "TimeoutPolicy", "ToolBinding", "ToolCall",
-    "ToolCatalog", "ToolContext", "ToolGuard", "ToolInvocation", "ToolOutcome",
-    "ToolSpec", "ToolsetRequest", "ToolsetResolver",
-    "ToolsetSnapshot", "Transport", "TurnCancelled", "TurnError", "TurnLeaseStore",
+    "SystemPromptSnapshot", "TimeoutPolicy", "ToolCall", "ToolEntry",
+    "ToolContext", "ToolGuard", "ToolInvocation", "ToolOutcome",
+    "ToolExecution", "ToolExecutor", "ToolRegistry", "ToolRoundRunner",
+    "ToolsetRequest", "ToolsetResolver", "Transport",
+    "TurnCancelled", "TurnError", "TurnLeaseStore",
     "TurnPhase", "TurnQueueFullError", "TurnResult", "TurnRuntime",
     "TurnSnapshot", "TurnTrigger", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",
     "WorkerQueueFullError", "default_api_mode_registry",
-    "default_tool_catalog", "load_config", "register_builtin_tools",
+    "default_tool_registry", "load_config",
 ]

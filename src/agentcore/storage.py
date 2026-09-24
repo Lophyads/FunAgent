@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import LeaseFence, LeaseHandle, Message, ToolCall, ToolOutcome
-from tools.tools import encode_tool_error
+from tools.results import encode_tool_error
 
 
 SCHEMA_VERSION = 8

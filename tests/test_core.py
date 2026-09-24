@@ -11,9 +11,9 @@ from agentcore import (
     MemoryItem,
     NormalizedModelResponse,
     ToolCall,
-    ToolCatalog,
+    ToolRegistry,
     ToolContext,
-    ToolSpec,
+    ToolEntry,
 )
 
 from conftest import ScriptedTransport
@@ -27,17 +27,17 @@ class ApprovalArgs(BaseModel):
     value: str
 
 
-def _catalog_with(*specs: ToolSpec) -> ToolCatalog:
-    catalog = ToolCatalog()
-    for spec in specs:
-        catalog.register(spec)
-    return catalog
+def _registry_with(*entries: ToolEntry) -> ToolRegistry:
+    registry = ToolRegistry()
+    for entry in entries:
+        registry.register(entry)
+    return registry
 
 
-def _tool_spec(
+def _tool_entry(
     name: str, args_model: type[BaseModel], handler, **kwargs,
-) -> ToolSpec:
-    return ToolSpec(
+) -> ToolEntry:
+    return ToolEntry(
         tool_id=f"test.{name}", implementation_version="1", name=name,
         description=f"Test tool {name}.", args_model=args_model,
         handler=handler, **kwargs,
@@ -98,7 +98,7 @@ async def test_tool_call_is_persisted_before_handler_and_replayed(
         NormalizedModelResponse(content="finished", finish_reason="stop"),
     )
     async with agent_factory(
-        config, tool_catalog=_catalog_with(_tool_spec("echo", EchoArgs, echo)),
+        config, tool_registry=_registry_with(_tool_entry("echo", EchoArgs, echo)),
         transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("use echo", session_id="tools")
@@ -176,7 +176,7 @@ async def test_approval_required_defaults_to_deny(config_factory, agent_factory)
     )
     async with agent_factory(
         config_factory(),
-        tool_catalog=_catalog_with(_tool_spec(
+        tool_registry=_registry_with(_tool_entry(
             "sensitive", ApprovalArgs, sensitive, requires_approval=True,
         )),
         transports={"primary": transport},
@@ -204,7 +204,7 @@ async def test_approved_tool_executes(config_factory, agent_factory):
     )
     async with agent_factory(
         config_factory(),
-        tool_catalog=_catalog_with(_tool_spec(
+        tool_registry=_registry_with(_tool_entry(
             "sensitive", ApprovalArgs,
             lambda args, context: {"value": args.value}, requires_approval=True,
         )),
@@ -226,7 +226,7 @@ async def test_tool_result_is_bounded(config_factory, agent_factory):
     )
     async with agent_factory(
         config_factory(tool_result_max_chars=256),
-        tool_catalog=_catalog_with(_tool_spec(
+        tool_registry=_registry_with(_tool_entry(
             "large", ApprovalArgs, lambda args, context: "x" * 10_000,
         )),
         transports={"primary": transport},
@@ -281,7 +281,7 @@ async def test_multiple_tools_execute_sequentially(config_factory, agent_factory
         NormalizedModelResponse(content="both done", finish_reason="stop"),
     )
     async with agent_factory(
-        config_factory(), tool_catalog=_catalog_with(_tool_spec("echo", EchoArgs, echo)),
+        config_factory(), tool_registry=_registry_with(_tool_entry("echo", EchoArgs, echo)),
         transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("two tools", session_id="multi")
@@ -313,7 +313,7 @@ async def test_guard_failure_is_fail_closed(config_factory, agent_factory):
         NormalizedModelResponse(content="safe", finish_reason="stop"),
     )
     async with agent_factory(
-        config_factory(), tool_catalog=_catalog_with(_tool_spec("echo", EchoArgs, echo)),
+        config_factory(), tool_registry=_registry_with(_tool_entry("echo", EchoArgs, echo)),
         transports={"primary": transport}, guard=BrokenGuard(),
     ) as agent:
         result = await agent.run_turn("guard", session_id="guard")

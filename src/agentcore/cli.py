@@ -6,7 +6,6 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-from .builtins import default_tool_catalog
 from .config import load_config
 from log.logging_system import configure_logging
 from log.logs_cli import list_logs, tail_logs
@@ -40,7 +39,7 @@ def _chat(config_path: Path, requested_session: str | None) -> int:
     print(f"session: {session_id}")
     print("commands: /new, /session, /exit")
 
-    with configure_logging(config, mode="cli"), AgentCore(config, default_tool_catalog()) as agent:
+    with configure_logging(config, mode="cli"), AgentCore(config) as agent:
         while True:
             try:
                 line = input("you> ")

@@ -48,6 +48,7 @@ platform = "generic"
 config_version = "1"
 enabled_skills = []
 enabled_toolsets = ["default"]
+disabled_toolsets = []
 permissions = []
 
 

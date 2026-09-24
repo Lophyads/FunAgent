@@ -10,7 +10,6 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextvars import copy_context
 from typing import Any, Callable, Sequence, TypeVar
 
-from .builtins import default_tool_catalog
 from .conversation_loop import ConversationLoop
 from .turn_phase import RouteState
 from .interfaces import (
@@ -29,7 +28,8 @@ from .provider_runtime import (
 )
 from .session_context import SessionBuildRequest, SessionContextFactory
 from .storage import SQLiteStore
-from tools.tools import ToolCatalog, ToolSpec
+from tools.registry import ToolEntry, ToolRegistry
+from tools.model_tools import default_tool_registry
 from tools.toolsets import DefaultToolsetResolver, ToolsetResolver
 from .turn_state import OperationTimeoutError, RunBudgetExceeded
 from .workers import (
@@ -68,7 +68,7 @@ class AgentCore:
     def __init__(
         self,
         config: AgentConfig,
-        tool_catalog: ToolCatalog | None = None,
+        tool_registry: ToolRegistry | None = None,
         prompt_builder: SystemPromptBuilder | None = None,
         toolset_resolver: ToolsetResolver | None = None,
         provider_resolver: ProviderResolver | None = None,
@@ -90,8 +90,8 @@ class AgentCore:
         self._delivery_destination = delivery_destination
         self._max_recovery_attempts = max_recovery_attempts
         self._config = config
-        self._catalog = tool_catalog or default_tool_catalog()
-        self._catalog.freeze()
+        self._tool_registry = tool_registry or default_tool_registry()
+        self._tool_registry.freeze()
         self._prompt_builder = prompt_builder or StaticSystemPromptBuilder(
             config.system_prompt
         )
@@ -126,7 +126,8 @@ class AgentCore:
         self._bounded_memory = _BoundedMemoryProvider(self, self._memory)
         self._session_contexts = SessionContextFactory(
             store=self._store, prompt_builder=self._prompt_builder,
-            toolset_resolver=self._toolset_resolver, catalog=self._catalog,
+            toolset_resolver=self._toolset_resolver,
+            registry=self._tool_registry,
             memory=self._bounded_memory,
             defaults=SessionBuildRequest.from_defaults(config.session_defaults),
             memory_max_chars=config.memory_max_chars,
@@ -164,12 +165,12 @@ class AgentCore:
         self._started = False
         self._closed = False
 
-    def update_tools(self, specs: Sequence[ToolSpec[Any]]) -> None:
-        """Publish a new catalog for future turns without mutating active snapshots."""
+    def update_tools(self, entries: Sequence[ToolEntry[Any]]) -> None:
+        """Publish a new registry generation for future turns."""
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("AgentCore is closed")
-            self._catalog.replace_all(tuple(specs))
+            self._tool_registry.replace_all(tuple(entries))
 
     def _validate_sync_extensions(self) -> None:
         targets: list[tuple[Any, str, str]] = [

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 from .interfaces import MemoryProvider
 from .models import LeaseHandle, Message, SessionDefaults, UserInput
 from .prompt_builder import PromptBuildRequest, SystemPromptBuilder, SystemPromptSnapshot
 from .storage import PersistedSession, SQLiteStore
-from tools.tools import ToolCatalog
-from tools.toolsets import ToolsetRequest, ToolsetResolver, ToolsetSnapshot
+from tools.model_tools import load_tools
+from tools.registry import ToolEntry, ToolRegistry
+from tools.toolsets import ToolsetRequest, ToolsetResolver
 
 
 class SessionContextError(RuntimeError):
@@ -31,6 +33,7 @@ class SessionBuildRequest:
     config_version: str
     enabled_skills: tuple[str, ...] = ()
     enabled_toolsets: tuple[str, ...] = ("default",)
+    disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -45,6 +48,7 @@ class SessionBuildRequest:
             platform=defaults.platform, config_version=defaults.config_version,
             enabled_skills=defaults.enabled_skills,
             enabled_toolsets=defaults.enabled_toolsets,
+            disabled_toolsets=defaults.disabled_toolsets,
             permissions=defaults.permissions,
         )
 
@@ -54,7 +58,10 @@ class SessionRuntimeSnapshot:
     session_id: str
     build_request: SessionBuildRequest
     prompt: SystemPromptSnapshot
-    toolset: ToolsetSnapshot
+    tools: tuple[Mapping[str, Any], ...]
+    valid_tool_names: frozenset[str]
+    entries_by_name: Mapping[str, ToolEntry[Any]]
+    tool_schema_bytes: bytes
     created_at: float
 
 
@@ -66,18 +73,18 @@ class SessionContextResolution:
 
 
 class SessionContextFactory:
-    """Freeze prompt at bootstrap; resolve current tool bindings for every turn."""
+    """Freeze the prompt and load one consistent tool view for each turn."""
 
     def __init__(
         self, *, store: SQLiteStore, prompt_builder: SystemPromptBuilder,
-        toolset_resolver: ToolsetResolver, catalog: ToolCatalog,
+        toolset_resolver: ToolsetResolver, registry: ToolRegistry,
         memory: MemoryProvider, defaults: SessionBuildRequest,
         memory_max_chars: int,
     ) -> None:
         self._store = store
         self._prompt_builder = prompt_builder
         self._toolset_resolver = toolset_resolver
-        self._catalog = catalog
+        self._registry = registry
         self._memory = memory
         self._defaults = defaults
         self._memory_max_chars = memory_max_chars
@@ -130,7 +137,7 @@ class SessionContextFactory:
         if (prompt.content_bytes != prompt.text.encode("utf-8") or
             hashlib.sha256(prompt.content_bytes).hexdigest() != prompt.fingerprint):
             raise SessionContextError("prompt builder returned inconsistent bytes")
-        toolset = self._resolve_tools(request)
+        tools, names, entries, schema_bytes = self._load_tools(request)
         persisted = self._store.create_session(
             session_id, profile=request.profile, surface=request.surface,
             platform=request.platform, system_prompt_bytes=prompt.content_bytes,
@@ -138,8 +145,16 @@ class SessionContextFactory:
             fence=lease.fence,
         )
         return SessionContextResolution(
-            SessionRuntimeSnapshot(session_id, request, prompt, toolset,
-                                   persisted.created_at),
+            SessionRuntimeSnapshot(
+                session_id=session_id,
+                build_request=request,
+                prompt=prompt,
+                tools=tools,
+                valid_tool_names=names,
+                entries_by_name=entries,
+                tool_schema_bytes=schema_bytes,
+                created_at=persisted.created_at,
+            ),
             True, tuple(warnings),
         )
 
@@ -159,6 +174,7 @@ class SessionContextFactory:
             platform=persisted.platform, config_version=current.config_version,
             enabled_skills=current.enabled_skills,
             enabled_toolsets=current.enabled_toolsets,
+            disabled_toolsets=current.disabled_toolsets,
             permissions=current.permissions,
         )
         prompt_bytes = persisted.system_prompt_bytes
@@ -167,20 +183,43 @@ class SessionContextFactory:
             fingerprint=hashlib.sha256(prompt_bytes).hexdigest(),
         )
         return SessionContextResolution(
-            SessionRuntimeSnapshot(
-                persisted.session_id, effective, prompt,
-                self._resolve_tools(effective), persisted.created_at,
-            ),
+            self._runtime_snapshot(persisted, effective, prompt),
             False,
         )
 
-    def _resolve_tools(self, request: SessionBuildRequest) -> ToolsetSnapshot:
-        return self._toolset_resolver.resolve(ToolsetRequest(
+    def _runtime_snapshot(
+        self,
+        persisted: PersistedSession,
+        request: SessionBuildRequest,
+        prompt: SystemPromptSnapshot,
+    ) -> SessionRuntimeSnapshot:
+        tools, names, entries, schema_bytes = self._load_tools(request)
+        return SessionRuntimeSnapshot(
+            session_id=persisted.session_id,
+            build_request=request,
+            prompt=prompt,
+            tools=tools,
+            valid_tool_names=names,
+            entries_by_name=entries,
+            tool_schema_bytes=schema_bytes,
+            created_at=persisted.created_at,
+        )
+
+    def _load_tools(
+        self, request: SessionBuildRequest,
+    ) -> tuple[
+        tuple[Mapping[str, Any], ...],
+        frozenset[str],
+        Mapping[str, ToolEntry[Any]],
+        bytes,
+    ]:
+        return load_tools(ToolsetRequest(
             profile=request.profile, surface=request.surface,
             platform=request.platform,
             enabled_toolsets=request.enabled_toolsets,
+            disabled_toolsets=request.disabled_toolsets,
             permissions=request.permissions,
-        ), self._catalog)
+        ), self._registry, self._toolset_resolver)
 
 
 __all__ = [

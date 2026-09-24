@@ -74,7 +74,7 @@ def test_cli_chat_can_be_exercised_without_a_real_provider(tmp_path, monkeypatch
     _write_config(config_path)
 
     class FakeAgent:
-        def __init__(self, config, catalog):
+        def __init__(self, config):
             self.config = config
         def __enter__(self):
             return self

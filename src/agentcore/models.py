@@ -93,6 +93,7 @@ class SessionDefaults(FrozenStrictModel):
     config_version: str = "1"
     enabled_skills: tuple[str, ...] = ()
     enabled_toolsets: tuple[str, ...] = ("default",)
+    disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
 
     @field_validator("profile", "surface", "platform", "config_version")

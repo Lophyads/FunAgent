@@ -10,6 +10,7 @@ from agentcore import (
     LeaseAcquireTimeout, LeaseLostError, NormalizedModelResponse,
     NormalizedProviderError, RunBudgetExceeded, SQLiteStore,
     SessionSnapshotConflict, StorageError, ToolCall, TurnCancelled, TurnTrigger,
+    ToolExecutor,
 )
 from agentcore.conversation_loop import ConversationLoop
 from agentcore.session_context import RecoverySessionMissing, SessionContextFactory
@@ -109,7 +110,7 @@ def test_phase_actions_and_missing_prerequisites_are_explicit():
 
 
 def test_missing_tool_lease_fails_before_operation_submission():
-    loop = object.__new__(TurnPhases)
+    executor = object.__new__(ToolExecutor)
     state = LoopState("session", "turn", "trace")
     state.context = object()
     submitted = []
@@ -118,10 +119,12 @@ def test_missing_tool_lease_fails_before_operation_submission():
         submitted.append(True)
         raise AssertionError("operation must not be submitted")
 
-    loop.call_operation = submit
+    runtime = SimpleNamespace(call_operation=submit)
     with pytest.raises(RuntimeError, match="execute_tool requires lease"):
-        loop._execute_tool(
-            None, state, ToolCall(id="call", name="example", arguments="{}"),
+        executor.execute(
+            runtime, state,
+            ToolCall(id="call", name="example", arguments="{}"),
+            parent_message_id=1,
         )
     assert not submitted
 

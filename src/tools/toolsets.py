@@ -1,18 +1,30 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Protocol, Sequence
 
-from .tools import ToolCatalog, ToolHandler, ToolSpec
+from .registry import ToolEntry
 
 
-def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+# Named compositions are policy, while ToolEntry.toolset is the tool's base category.
+TOOLSETS: dict[str, dict[str, tuple[str, ...]]] = {
+    "default": {
+        "tools": (
+            "calculator", "current_time", "list_directory", "read_file",
+            "search_files",
+        ),
+        "includes": (),
+    },
+    "file": {
+        "tools": (
+            "list_directory", "read_file", "search_files", "write_file",
+            "patch_file",
+        ),
+        "includes": (),
+    },
+    "terminal": {"tools": ("terminal",), "includes": ()},
+    "coding": {"tools": (), "includes": ("default", "file", "terminal")},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,76 +33,59 @@ class ToolsetRequest:
     surface: str
     platform: str
     enabled_toolsets: tuple[str, ...]
-    permissions: frozenset[str]
+    disabled_toolsets: tuple[str, ...] = ()
+    permissions: frozenset[str] = frozenset()
 
-
-@dataclass(frozen=True, slots=True)
-class ToolBinding:
-    tool_id: str
-    implementation_version: str
-    name: str
-    schema_bytes: bytes
-    handler: ToolHandler[Any]
-    spec: ToolSpec[Any]
-
-@dataclass(frozen=True, slots=True)
-class ToolsetSnapshot:
-    bindings: tuple[ToolBinding, ...]
-    schema_bytes: bytes
-    fingerprint: str
-
-    def get(self, name: str) -> ToolBinding | None:
-        return next((binding for binding in self.bindings if binding.name == name), None)
-
-    def definitions(self) -> tuple[Mapping[str, Any], ...]:
-        decoded = json.loads(self.schema_bytes.decode("utf-8"))
-        return tuple(MappingProxyType(item) for item in decoded)
 
 class ToolsetResolver(Protocol):
     def resolve(
-        self, request: ToolsetRequest, catalog: ToolCatalog
-    ) -> ToolsetSnapshot: ...
+        self, request: ToolsetRequest, entries: Sequence[ToolEntry]
+    ) -> tuple[str, ...]: ...
 
 
 class DefaultToolsetResolver:
+    """Resolve Session toolset policy to deterministic candidate tool names."""
+
     def resolve(
-        self, request: ToolsetRequest, catalog: ToolCatalog
-    ) -> ToolsetSnapshot:
-        enabled = frozenset(request.enabled_toolsets)
-        specs = [
-            spec for spec in catalog.specs()
-            if spec.toolsets.intersection(enabled)
-            and spec.required_permissions.issubset(request.permissions)
-        ]
-        return _snapshot_from_specs(specs)
+        self, request: ToolsetRequest, entries: Sequence[ToolEntry]
+    ) -> tuple[str, ...]:
+        by_toolset: dict[str, set[str]] = {}
+        registered_names: set[str] = set()
+        for entry in entries:
+            registered_names.add(entry.name)
+            by_toolset.setdefault(entry.toolset, set()).add(entry.name)
+
+        enabled: set[str] = set()
+        for name in request.enabled_toolsets:
+            enabled.update(_resolve_toolset(name, by_toolset, set()))
+
+        disabled: set[str] = set()
+        for name in request.disabled_toolsets:
+            disabled.update(_resolve_toolset(name, by_toolset, set()))
+
+        return tuple(sorted((enabled - disabled).intersection(registered_names)))
 
 
-def _snapshot_from_specs(specs: list[ToolSpec[Any]]) -> ToolsetSnapshot:
-    ordered = sorted(specs, key=lambda spec: (spec.tool_id, spec.name))
-    bindings = tuple(
-        ToolBinding(
-            tool_id=spec.tool_id,
-            implementation_version=spec.implementation_version,
-            name=spec.name,
-            schema_bytes=canonical_json_bytes(spec.definition()),
-            handler=spec.handler,
-            spec=spec,
-        )
-        for spec in ordered
-    )
-    schema_bytes = canonical_json_bytes([spec.definition() for spec in ordered])
-    return ToolsetSnapshot(
-        bindings=bindings,
-        schema_bytes=schema_bytes,
-        fingerprint=hashlib.sha256(schema_bytes).hexdigest(),
-    )
+def _resolve_toolset(
+    name: str, registered: dict[str, set[str]], visiting: set[str]
+) -> set[str]:
+    if name in visiting:
+        cycle = " -> ".join((*sorted(visiting), name))
+        raise ValueError(f"toolset include cycle: {cycle}")
+    definition = TOOLSETS.get(name)
+    if definition is None and name not in registered:
+        raise ValueError(f"unknown toolset: {name}")
+
+    visiting.add(name)
+    tools = set(registered.get(name, ()))
+    if definition is not None:
+        tools.update(definition["tools"])
+        for included in definition["includes"]:
+            tools.update(_resolve_toolset(included, registered, visiting))
+    visiting.remove(name)
+    return tools
 
 
 __all__ = [
-    "DefaultToolsetResolver",
-    "ToolBinding",
-    "ToolsetRequest",
-    "ToolsetResolver",
-    "ToolsetSnapshot",
-    "canonical_json_bytes",
+    "DefaultToolsetResolver", "TOOLSETS", "ToolsetRequest", "ToolsetResolver",
 ]

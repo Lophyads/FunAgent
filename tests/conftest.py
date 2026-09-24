@@ -18,11 +18,11 @@ from agentcore import (
     RetryPolicy,
     StaticProviderResolver,
     TimeoutPolicy,
-    ToolCatalog,
+    ToolRegistry,
     WireRequest,
     WireResponse,
     WorkerPolicy,
-    default_tool_catalog,
+    default_tool_registry,
 )
 from agentcore.provider_runtime import normalize_provider_exception
 
@@ -113,12 +113,12 @@ def scripted_provider_stack(
 def agent_factory():
     def factory(
         config: AgentConfig, *, transports: Mapping[str, ScriptedTransport],
-        tool_catalog: ToolCatalog | None = None, **kwargs: Any,
+        tool_registry: ToolRegistry | None = None, **kwargs: Any,
     ) -> AgentCore:
         resolver, api_modes, _ = scripted_provider_stack(config, transports)
         return AgentCore(
             config,
-            tool_catalog=tool_catalog or default_tool_catalog(),
+            tool_registry=tool_registry or default_tool_registry(),
             provider_resolver=resolver,
             api_modes=api_modes,
             **kwargs,

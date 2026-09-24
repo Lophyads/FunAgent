@@ -64,10 +64,10 @@ DEBUG 可记录截断并脱敏的用户输入和工具参数预览，启用时�
 同步宿主：
 
 ```python
-from agentcore import AgentCore, default_tool_catalog, load_config
+from agentcore import AgentCore, load_config
 
 config = load_config("agentcore.toml")
-with AgentCore(config, default_tool_catalog()) as agent:
+with AgentCore(config) as agent:
     result = agent.run_turn_blocking("Calculate 12 * 8")
     print(result.final_text)
 ```
@@ -77,11 +77,11 @@ with AgentCore(config, default_tool_catalog()) as agent:
 ```python
 import asyncio
 
-from agentcore import AgentCore, default_tool_catalog, load_config
+from agentcore import AgentCore, load_config
 
 
 async def main() -> None:
-    async with AgentCore(load_config("agentcore.toml"), default_tool_catalog()) as agent:
+    async with AgentCore(load_config("agentcore.toml")) as agent:
         result = await agent.run_turn("What time is it in Asia/Shanghai?")
         print(result.final_text)
 
@@ -90,8 +90,10 @@ asyncio.run(main())
 ```
 
 可通过 keyword-only `session_request` 指定新 Session 的身份及当前工具权限。
+`AgentCore` 初始化时会自动发现并注册内置 `tools/*_tool.py`。只有测试、嵌入集成或
+自定义工具集合需要显式传入 `tool_registry=`。
 既有 Session 的 profile/surface/platform 不允许改变，Prompt 保持原样；当前配置和
-Catalog 的工具变更只影响后续 Turn。
+Registry 的工具变更只影响后续 Turn。
 
 ## Gateway 与回复投递
 
@@ -125,13 +127,13 @@ delivery obligation。`GatewayRuntime.wait_for_recovery()` 可用作启动恢复
 
 ## 自定义工具
 
-进程级 `ToolCatalog` 描述可用实现，`ToolsetResolver` 决定每个 Turn 能看到哪些
+进程级 `ToolRegistry` 描述可用实现，`ToolsetResolver` 决定每个 Turn 能看到哪些
 工具。每个实现必须提供稳定的 `tool_id` 与 `implementation_version`：
 
 ```python
 from pydantic import BaseModel, Field
 
-from agentcore import ToolCatalog, ToolContext, ToolSpec
+from agentcore import ToolContext, ToolEntry, ToolRegistry
 
 
 class GreetArgs(BaseModel):
@@ -142,8 +144,8 @@ def greet(args: GreetArgs, context: ToolContext):
     return {"message": f"Hello, {args.name}!"}
 
 
-catalog = ToolCatalog()
-catalog.register(ToolSpec(
+registry = ToolRegistry()
+registry.register(ToolEntry(
     tool_id="example.greet",
     implementation_version="1",
     name="greet",
@@ -154,8 +156,10 @@ catalog.register(ToolSpec(
 ))
 ```
 
-`AgentCore` 构造时冻结初始 Catalog；调用 `agent.update_tools(specs)` 可原子发布新定义，
-仅影响后续 Turn，进行中的 Turn 继续使用已解析的工具快照。Session 只冻结 system prompt。
+`AgentCore` 构造时冻结初始 Registry；调用 `agent.update_tools(entries)` 可原子发布新定义，
+仅影响后续 Turn，进行中的 Turn 继续使用本轮已加载的 `ToolEntry`。Session 只冻结 system prompt。
+内置工具由 `tools/*_tool.py` 的 `register_tools(registry)` 自动发现；
+`enabled_toolsets`、`disabled_toolsets`、权限和 `check_fn` 共同决定模型可见工具。
 异步 handler 会被拒绝；异步服务需要由集成方提供显式
 同步适配器。工具超时表示 Core 停止等待，不表示线程被强制终止。已进入只读 handler
 后结果为 `unknown/none`；已进入可能有副作用的 handler 后结果为

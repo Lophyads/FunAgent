@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
-from .interfaces import ToolContext
-from tools.tools import ToolCatalog, ToolSpec
+from agentcore.interfaces import ToolContext
+from .registry import ToolEntry, ToolRegistry
 
 
 class CalculatorArgs(BaseModel):
@@ -50,16 +50,21 @@ def _evaluate(node: ast.AST, budget: list[int]) -> int | float:
         if isinstance(node.op, ast.Pow) and abs(right) > 10:
             raise ValueError("exponent is out of range")
         value = _BINARY_OPERATORS[type(node.op)](left, right)
-        if type(value) not in (int, float) or not math.isfinite(float(value)) or abs(value) > 1e18:
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(float(value))
+            or abs(value) > 1e18
+        ):
             raise ValueError("result is out of range")
         return value
     raise ValueError(f"unsupported expression element: {type(node).__name__}")
 
 
 def _calculator(args: CalculatorArgs, context: ToolContext) -> dict[str, object]:
-    tree = ast.parse(args.expression, mode="eval")
-    value = _evaluate(tree, [64])
-    return {"expression": args.expression, "value": value}
+    return {
+        "expression": args.expression,
+        "value": _evaluate(ast.parse(args.expression, mode="eval"), [64]),
+    }
 
 
 def _current_time(args: CurrentTimeArgs, context: ToolContext) -> dict[str, str]:
@@ -67,35 +72,30 @@ def _current_time(args: CurrentTimeArgs, context: ToolContext) -> dict[str, str]
         zone = ZoneInfo(args.timezone)
     except ZoneInfoNotFoundError as exc:
         raise ValueError(f"unknown timezone: {args.timezone}") from exc
-    now = datetime.now(zone)
-    return {"timezone": args.timezone, "iso8601": now.isoformat()}
+    return {
+        "timezone": args.timezone,
+        "iso8601": datetime.now(zone).isoformat(),
+    }
 
 
-def register_builtin_tools(catalog: ToolCatalog) -> ToolCatalog:
-    catalog.register(
-        ToolSpec(
-            tool_id="builtin.calculator",
-            implementation_version="1",
-            name="calculator",
-            description="Evaluate a bounded arithmetic expression using numbers and +, -, *, /, //, %, or **.",
-            args_model=CalculatorArgs,
-            handler=_calculator,
-            side_effects="none",
-        )
-    )
-    catalog.register(
-        ToolSpec(
-            tool_id="builtin.current_time",
-            implementation_version="1",
-            name="current_time",
-            description="Return the current time in an IANA timezone such as UTC or Asia/Shanghai.",
-            args_model=CurrentTimeArgs,
-            handler=_current_time,
-            side_effects="none",
-        )
-    )
-    return catalog
-
-
-def default_tool_catalog() -> ToolCatalog:
-    return register_builtin_tools(ToolCatalog())
+def register_tools(registry: ToolRegistry) -> None:
+    registry.register(ToolEntry(
+        tool_id="builtin.calculator", implementation_version="1",
+        name="calculator",
+        description=(
+            "Evaluate a bounded arithmetic expression using numbers and "
+            "+, -, *, /, //, %, or **."
+        ),
+        args_model=CalculatorArgs, handler=_calculator,
+        toolset="default", side_effects="none",
+    ))
+    registry.register(ToolEntry(
+        tool_id="builtin.current_time", implementation_version="1",
+        name="current_time",
+        description=(
+            "Return the current time in an IANA timezone such as UTC or "
+            "Asia/Shanghai."
+        ),
+        args_model=CurrentTimeArgs, handler=_current_time,
+        toolset="default", side_effects="none",
+    ))

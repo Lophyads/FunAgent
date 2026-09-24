@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import inspect
-import json
 import logging
 import random
 import threading
@@ -10,20 +8,19 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MappingProxyType
 from typing import Any, Callable, Protocol
 
 from openai import APIError
 from pydantic import ValidationError
 
 from .interfaces import (
-    Approver, CancellationToken, MemoryUpdater, ReviewScheduler, ToolContext,
-    ToolGuard, ToolInvocation, TurnCancelled, TurnSnapshot,
+    Approver, CancellationToken, MemoryUpdater, ReviewScheduler, ToolGuard,
+    TurnCancelled, TurnSnapshot,
 )
 from .lease import LeaseAcquireTimeout, LeaseHeartbeatService, TurnLeaseStore
 from .models import (
     AgentConfig, CanonicalModelRequest, Message, NormalizedModelResponse,
-    ToolCall, ToolOutcome, TurnError, TurnResult, UserInput,
+    ToolOutcome, TurnError, TurnResult, UserInput,
 )
 from .provider_runtime import (
     ApiModeRegistry, AttemptContext, NormalizedProviderError, ProviderResolver,
@@ -33,12 +30,12 @@ from .session_context import (
     SessionSnapshotConflict,
 )
 from .storage import LeaseLostError, SQLiteStore, StorageError
-from tools.tools import encode_tool_error, encode_tool_success
+from .tool_execution import ToolExecutor
+from .tool_round import ToolRoundRunner
 from .turn_state import (
     AttemptState, LoopState, OperationTimeoutError, RunBudgetExceeded,
     TurnRuntime,
 )
-from .workers import WorkerQueueFullError
 
 
 
@@ -182,14 +179,6 @@ class RouteState:
             self.cooldown_until = 0.0
 
 
-@dataclass(frozen=True, slots=True)
-class _ToolExecution:
-    message: Message
-    outcome: ToolOutcome
-    invocation: ToolInvocation
-    interrupt_reason: str | None = None
-
-
 class TurnPhases:
     """Concrete synchronous turn phases and their execution helpers."""
 
@@ -230,7 +219,12 @@ class TurnPhases:
         self.recovery = recovery
         self.delivery_destination = delivery_destination
         self.max_recovery_attempts = max_recovery_attempts
-        self._tool_parent_id: int | None = None
+        self.tool_executor = ToolExecutor(
+            config=config, store=store, guard=guard, approver=approver,
+        )
+        self.tool_round_runner = ToolRoundRunner(
+            store=store, executor=self.tool_executor,
+        )
 
     def turn_started(self, state: LoopState) -> None:
         logger.info('turn.started')
@@ -583,14 +577,14 @@ class TurnPhases:
             state.request = CanonicalModelRequest.build(
                 system_prompt=context.prompt.text,
                 messages=tuple(state.messages),
-                tool_schema_bytes=context.toolset.schema_bytes,
+                tool_schema_bytes=context.tool_schema_bytes,
             )
             logger.debug(
                 'turn.request_assembled phase=%s iteration=%s message_count=%s tool_count=%s',
                 'assemble_request',
                 state.iteration,
                 len(state.request.messages),
-                len(context.toolset.bindings),
+                len(context.tools),
             )
             return PhaseResult()
 
@@ -632,7 +626,7 @@ class TurnPhases:
             response = state.require_response('tool_round')
             if not response.tool_calls:
                 raise RuntimeError('tool_round requires response with tool_calls')
-            self._run_tool_round(runtime, state, response)
+            self.tool_round_runner.run(runtime, state, response)
             return PhaseResult(PhaseAction.CONTINUE)
 
         def validate(state: LoopState, result: PhaseResult) -> None:
@@ -967,312 +961,6 @@ class TurnPhases:
                 ))
         raise ProviderExhausted(failures)
 
-    def _run_tool_round(
-        self, runtime: TurnRuntime, state: LoopState,
-        response: NormalizedModelResponse,
-    ) -> None:
-        context = state.require_context('tool_round')
-        lease = state.require_lease('tool_round')
-        call_ids = [call.id for call in response.tool_calls]
-        logger.info(
-            'tool.round_preparing phase=%s iteration=%s tool_call_count=%s '
-            'tool_names=%s finish_reason=%s response_content_present=%s '
-            'response_content_length=%s duplicate_call_id_count=%s',
-            'tool_round',
-            state.iteration,
-            len(response.tool_calls),
-            [call.name for call in response.tool_calls],
-            response.finish_reason,
-            response.content is not None,
-            len(response.content) if response.content is not None else 0,
-            len(call_ids) - len(set(call_ids)),
-        )
-        try:
-            effects = {
-                call.id: (
-                    context.toolset.get(call.name).spec.side_effects
-                    if context.toolset.get(call.name) else "possible"
-                ) for call in response.tool_calls
-            }
-            assistant = Message.assistant_tools(
-                response.tool_calls, content=response.content,
-                tool_call_effects=effects,
-            )
-        except ValidationError as exc:
-            logger.error(
-                'tool.message_validation_failed phase=%s iteration=%s '
-                'tool_call_count=%s response_content_present=%s '
-                'response_content_length=%s validation_errors=%s',
-                'tool_round',
-                state.iteration,
-                len(response.tool_calls),
-                response.content is not None,
-                len(response.content) if response.content is not None else 0,
-                self._validation_error_details(exc),
-            )
-            raise
-        try:
-            self._tool_parent_id = self.store.append_tool_calls(
-                state.session_id, assistant, fence=lease.fence,
-            )
-        except BaseException as exc:
-            logger.error(
-                'tool.stage_failed phase=%s iteration=%s tool_call_count=%s '
-                'error_type=%s',
-                'tool_round',
-                state.iteration,
-                len(response.tool_calls),
-                type(exc).__name__,
-            )
-            raise
-        round_started = time.monotonic()
-        outcome_start = len(state.tool_outcomes)
-        logger.info(
-            'tool.round_started phase=%s iteration=%s tool_call_count=%s',
-            'tool_round',
-            state.iteration,
-            len(response.tool_calls),
-        )
-        for call in response.tool_calls:
-            runtime.observability.publish(
-                "tool.pending", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                phase="tool_round", payload={"tool_name": call.name},
-            )
-        state.messages.append(assistant)
-        state.new_messages.append(assistant)
-        state.assistant_message = assistant
-        for tool_call in response.tool_calls:
-            runtime.check_active(state)
-            logger.debug(
-                'tool.arguments_preview tool_name=%s preview=%s',
-                tool_call.name,
-                tool_call.arguments[:200].replace('\r', ' ').replace('\n', ' '),
-            )
-            tool_started = time.monotonic()
-            executed = self._execute_tool(runtime, state, tool_call)
-            tool_duration_ms = int((time.monotonic() - tool_started) * 1000)
-            self.store.append_tool_result(
-                state.session_id, executed.message, fence=lease.fence,
-            )
-            state.messages.append(executed.message)
-            state.new_messages.append(executed.message)
-            state.tool_outcomes.append(executed.outcome)
-            tool_event = f"tool.{executed.outcome.state}"
-            tool_logger = (
-                logger.info if executed.outcome.state == "succeeded"
-                else logger.warning
-            )
-            tool_logger(
-                '%s phase=%s tool_name=%s effect=%s duration_ms=%s error_type=%s',
-                tool_event,
-                'tool_round',
-                tool_call.name,
-                executed.outcome.effect_disposition,
-                tool_duration_ms,
-                executed.outcome.error_type,
-            )
-            state.warnings.extend(runtime.observability.publish(
-                f"tool.{executed.outcome.state}", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                phase="tool_round",
-                payload={
-                    "tool_name": tool_call.name,
-                    "effect": executed.outcome.effect_disposition,
-                    "duration_ms": tool_duration_ms,
-                    "error_type": executed.outcome.error_type,
-                },
-            ))
-            if executed.interrupt_reason == "cancelled":
-                raise TurnCancelled("turn cancelled during tool execution")
-            if executed.interrupt_reason == "run_budget":
-                raise RunBudgetExceeded("turn budget expired during tool execution")
-        round_outcomes = state.tool_outcomes[outcome_start:]
-        failed_count = sum(
-            outcome.state != "succeeded" for outcome in round_outcomes
-        )
-        round_logger = logger.warning if failed_count else logger.info
-        round_logger(
-            'tool.round_completed phase=%s iteration=%s tool_call_count=%s failed_count=%s duration_ms=%s',
-            'tool_round',
-            state.iteration,
-            len(round_outcomes),
-            failed_count,
-            int((time.monotonic() - round_started) * 1000),
-        )
-
-    def _execute_tool(
-        self, runtime: TurnRuntime, state: LoopState, tool_call: ToolCall,
-    ) -> _ToolExecution:
-        context = state.require_context('execute_tool')
-        lease = state.require_lease('execute_tool')
-        binding = context.toolset.get(tool_call.name)
-        if binding is None:
-            invocation = self._invocation(state, tool_call, {}, False)
-            return self._tool_result(
-                tool_call, invocation,
-                encode_tool_error(
-                    "unknown_tool", f"Unknown tool: {tool_call.name}",
-                    self.config.tool_result_max_chars,
-                ),
-                side_effects="possible", state_name="failed",
-                effect="not_applied", error_type="unknown_tool",
-            )
-        spec = binding.spec
-        try:
-            raw_args = json.loads(tool_call.arguments or "{}")
-            if not isinstance(raw_args, dict):
-                raise ValueError("tool arguments must decode to an object")
-            args_model = spec.args_model.model_validate(raw_args)
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            invocation = self._invocation(
-                state, tool_call, {}, spec.requires_approval
-            )
-            return self._tool_result(
-                tool_call, invocation,
-                encode_tool_error(
-                    "invalid_arguments", f"{type(exc).__name__}: {exc}",
-                    self.config.tool_result_max_chars,
-                ),
-                side_effects=spec.side_effects, state_name="failed",
-                effect="not_applied", error_type="invalid_arguments",
-            )
-        invocation = self._invocation(
-            state, tool_call, args_model.model_dump(mode="json"),
-            spec.requires_approval,
-        )
-        denied = self._authorize_tool(runtime, invocation, spec.requires_approval)
-        if denied is not None:
-            return self._tool_result(
-                tool_call, invocation,
-                encode_tool_error(
-                    denied[0], denied[1], self.config.tool_result_max_chars
-                ),
-                side_effects=spec.side_effects, state_name="denied",
-                effect="not_applied", error_type=denied[0],
-            )
-        started = threading.Event()
-        cancellation = CancellationToken(runtime.cancel_event)
-
-        def invoke() -> Any:
-            cancellation.raise_if_cancelled()
-            runtime.check_active(state)
-            self.store.assert_lease(lease)
-            started.set()
-            runtime.observability.publish(
-                "tool.running", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                phase="tool_round",
-                payload={"tool_name": tool_call.name},
-            )
-            value = binding.handler(
-                args_model,
-                ToolContext(
-                    state.session_id, state.turn_id, tool_call.id, cancellation
-                ),
-            )
-            if inspect.isawaitable(value):
-                close = getattr(value, "close", None)
-                if close is not None:
-                    close()
-                raise TypeError("tool handler returned an awaitable")
-            return value
-
-        try:
-            value = self.call_operation(
-                invoke,
-                timeout=spec.timeout_seconds or self.config.timeouts.tool_seconds,
-                cancel_event=runtime.cancel_event, deadline=runtime.deadline,
-            )
-        except TurnCancelled:
-            return self._unknown_or_not_executed(
-                tool_call, invocation, spec.side_effects,
-                started=started.is_set(), reason="cancelled",
-            )
-        except RunBudgetExceeded:
-            result = self._unknown_or_not_executed(
-                tool_call, invocation, spec.side_effects,
-                started=started.is_set(), reason="run_budget",
-            )
-            if not started.is_set():
-                raise
-            return result
-        except OperationTimeoutError:
-            return self._unknown_or_not_executed(
-                tool_call, invocation, spec.side_effects,
-                started=started.is_set(), reason="tool_timeout",
-            )
-        except WorkerQueueFullError:
-            return self._unknown_or_not_executed(
-                tool_call, invocation, spec.side_effects,
-                started=False, reason="executor_saturated",
-            )
-        except BaseException as exc:
-            effect = (
-                "none" if spec.side_effects == "none"
-                else ("unknown" if started.is_set() else "not_applied")
-            )
-            return self._tool_result(
-                tool_call, invocation,
-                encode_tool_error(
-                    "tool_execution_error", f"{type(exc).__name__}: {exc}",
-                    self.config.tool_result_max_chars,
-                ),
-                side_effects=spec.side_effects,
-                state_name="failed" if started.is_set() else "not_executed",
-                effect=effect, error_type="tool_execution_error",
-            )
-        effect = "none" if spec.side_effects == "none" else "confirmed"
-        return self._tool_result(
-            tool_call, invocation,
-            encode_tool_success(value, self.config.tool_result_max_chars),
-            side_effects=spec.side_effects, state_name="succeeded",
-            effect=effect, error_type=None,
-        )
-
-    def _authorize_tool(
-        self, runtime: TurnRuntime, invocation: ToolInvocation,
-        requires_approval: bool,
-    ) -> tuple[str, str] | None:
-        try:
-            decision = self.call_operation(
-                lambda: self.guard.check(invocation),
-                timeout=self.config.timeouts.policy_seconds,
-                cancel_event=runtime.cancel_event, deadline=runtime.deadline,
-            )
-        except (TurnCancelled, RunBudgetExceeded):
-            raise
-        except BaseException as exc:
-            return (
-                "guard_error",
-                f"tool guard failed closed: {type(exc).__name__}: {exc}",
-            )
-        if not decision.allowed:
-            return "policy_denied", decision.reason or "tool call denied by policy"
-        if not requires_approval:
-            return None
-        if self.approver is None:
-            return (
-                "approval_required",
-                "tool requires approval but no Approver is configured",
-            )
-        try:
-            approval = self.call_operation(
-                lambda: self.approver.approve(invocation),
-                timeout=self.config.timeouts.policy_seconds,
-                cancel_event=runtime.cancel_event, deadline=runtime.deadline,
-            )
-        except (TurnCancelled, RunBudgetExceeded):
-            raise
-        except BaseException as exc:
-            return (
-                "approval_error",
-                f"approval failed closed: {type(exc).__name__}: {exc}",
-            )
-        if not approval.approved:
-            return "approval_denied", approval.reason or "tool call was denied"
-        return None
-
     def _cleanup(self, runtime: TurnRuntime, state: LoopState) -> None:
         phases = (
             FunctionPhase(
@@ -1550,75 +1238,6 @@ class TurnPhases:
         return min(
             backoff,
             max(policy.max_delay_seconds, policy.max_retry_after_seconds),
-        )
-
-    def _unknown_or_not_executed(
-        self, call: ToolCall, invocation: ToolInvocation, side_effects: str,
-        *, started: bool, reason: str,
-    ) -> _ToolExecution:
-        if started:
-            return self._tool_result(
-                call, invocation,
-                encode_tool_error(
-                    "outcome_unknown",
-                    "Tool execution stopped being observed; its outcome is unknown.",
-                    self.config.tool_result_max_chars,
-                ),
-                side_effects=side_effects, state_name="unknown",
-                effect="none" if side_effects == "none" else "unknown",
-                error_type=reason,
-                interrupt_reason=(
-                    reason if reason in {"cancelled", "run_budget"} else None
-                ),
-            )
-        return self._tool_result(
-            call, invocation,
-            encode_tool_error(
-                "not_executed", "Tool handler was not entered.",
-                self.config.tool_result_max_chars,
-            ),
-            side_effects=side_effects, state_name="not_executed",
-            effect="not_applied", error_type=reason,
-            interrupt_reason=(
-                reason if reason in {"cancelled", "run_budget"} else None
-            ),
-        )
-
-    @staticmethod
-    def _invocation(
-        state: LoopState, call: ToolCall, arguments: dict[str, Any],
-        requires_approval: bool,
-    ) -> ToolInvocation:
-        return ToolInvocation(
-            session_id=state.session_id, turn_id=state.turn_id,
-            tool_call_id=call.id, tool_name=call.name,
-            arguments=MappingProxyType(arguments),
-            requires_approval=requires_approval,
-        )
-
-    def _tool_result(
-        self, call: ToolCall, invocation: ToolInvocation, content: str, *,
-        side_effects: str, state_name: str, effect: str,
-        error_type: str | None,
-        interrupt_reason: str | None = None,
-    ) -> _ToolExecution:
-        if self._tool_parent_id is None:
-            raise StorageError("tool result has no persisted assistant parent")
-        outcome = ToolOutcome(
-            tool_call_id=call.id, tool_name=call.name,
-            side_effects=side_effects, state=state_name,
-            effect_disposition=effect, error_type=error_type,
-        )
-        return _ToolExecution(
-            message=Message.tool_result(
-                content, tool_call_id=call.id, tool_name=call.name,
-                effect_disposition=effect,
-                reply_to_message_id=self._tool_parent_id,
-                tool_outcome_state=state_name,
-                tool_error_type=error_type,
-            ),
-            outcome=outcome, invocation=invocation,
-            interrupt_reason=interrupt_reason,
         )
 
     @staticmethod

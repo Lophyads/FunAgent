@@ -9,8 +9,8 @@ import pytest
 from pydantic import BaseModel
 
 from agentcore import (
-    NormalizedModelResponse, TimeoutPolicy, ToolCall, ToolCatalog, ToolContext,
-    ToolSpec, TurnQueueFullError, WorkerPolicy,
+    NormalizedModelResponse, TimeoutPolicy, ToolCall, ToolContext, ToolEntry,
+    ToolRegistry, TurnQueueFullError, WorkerPolicy,
 )
 from conftest import ScriptedTransport
 
@@ -19,14 +19,14 @@ class SlowArgs(BaseModel):
     value: str
 
 
-def _catalog_with(spec: ToolSpec) -> ToolCatalog:
-    catalog = ToolCatalog()
-    catalog.register(spec)
-    return catalog
+def _registry_with(entry: ToolEntry) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(entry)
+    return registry
 
 
-def _tool_spec(name: str, handler, **kwargs) -> ToolSpec:
-    return ToolSpec(
+def _tool_entry(name: str, handler, **kwargs) -> ToolEntry:
+    return ToolEntry(
         tool_id=f"test.{name}", implementation_version="1", name=name,
         description=f"Test tool {name}.", args_model=SlowArgs, handler=handler,
         **kwargs,
@@ -167,7 +167,7 @@ async def test_tool_timeout_is_unknown_and_does_not_block_event_loop(config_fact
     )
     async with agent_factory(
         config_factory(timeouts=TimeoutPolicy(tool_seconds=0.02)),
-        tool_catalog=_catalog_with(_tool_spec("slow", slow_tool, side_effects="possible", timeout_seconds=0.02)),
+        tool_registry=_registry_with(_tool_entry("slow", slow_tool, side_effects="possible", timeout_seconds=0.02)),
         transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("run", session_id="timeout")
@@ -183,11 +183,11 @@ async def test_tool_timeout_is_unknown_and_does_not_block_event_loop(config_fact
 
 
 def test_async_extensions_are_rejected(config_factory, agent_factory, final_response):
-    catalog = ToolCatalog()
+    registry = ToolRegistry()
     async def async_tool(args: SlowArgs, context: ToolContext):
         return None
     with pytest.raises(TypeError, match="async tool"):
-        catalog.register(_tool_spec("async_tool", async_tool))
+        registry.register(_tool_entry("async_tool", async_tool))
 
     class AsyncTransport:
         async def send(self, request, context):
@@ -221,7 +221,7 @@ async def test_run_budget_expiry_during_tool_keeps_budget_completion_reason(conf
     transport = ScriptedTransport(NormalizedModelResponse(tool_calls=[ToolCall(id="budget-tool", name="budget_slow", arguments='{"value":"x"}')], finish_reason="tool_calls"))
     async with agent_factory(
         config_factory(timeouts=TimeoutPolicy(run_budget_seconds=0.1, tool_seconds=1.0)),
-        tool_catalog=_catalog_with(_tool_spec("budget_slow", slow, side_effects="possible", timeout_seconds=1.0)),
+        tool_registry=_registry_with(_tool_entry("budget_slow", slow, side_effects="possible", timeout_seconds=1.0)),
         transports={"primary": transport},
     ) as agent:
         result = await agent.run_turn("run", session_id="budget-tool")

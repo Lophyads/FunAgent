@@ -10,9 +10,9 @@ from agentcore import (
     Message,
     NormalizedModelResponse,
     ToolCall,
-    ToolCatalog,
+    ToolRegistry,
     ToolOutcome,
-    ToolSpec,
+    ToolEntry,
     TurnError,
     TurnResult,
 )
@@ -164,17 +164,17 @@ def test_canonical_request_fingerprint_is_stable():
     assert first.fingerprint == second.fingerprint
 
 
-def test_tool_catalog_freezes_and_uses_versioned_identity():
-    catalog = ToolCatalog()
-    catalog.register(ToolSpec(
+def test_tool_registry_freezes_and_uses_versioned_identity():
+    registry = ToolRegistry()
+    registry.register(ToolEntry(
         tool_id="echo", implementation_version="1", name="echo",
         description="Echo text.", args_model=EchoArgs,
         handler=lambda args, context: args.text,
     ))
-    catalog.freeze()
-    assert catalog.get_versioned("echo", "1") is catalog.get("echo")
+    registry.freeze()
+    assert registry.get_versioned("echo", "1") is registry.get_entry("echo")
     with pytest.raises(RuntimeError, match="frozen"):
-        catalog.register(ToolSpec(
+        registry.register(ToolEntry(
             tool_id="late", implementation_version="1", name="late",
             description="Too late.", args_model=EchoArgs,
             handler=lambda args, context: args.text,
