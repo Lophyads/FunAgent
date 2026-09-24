@@ -37,7 +37,7 @@ def test_turn_logs_raw_session_and_milestones(
         assert result.status == "completed"
         assert handle.runtime is not None and handle.runtime.flush(2)
     raw = _text(tmp_path / "logs" / "agent.log")
-    assert "[caller-chosen-session] agentcore.conversation_loop: turn.started" in raw
+    assert "[caller-chosen-session] agentcore.turn_phase: turn.started" in raw
     assert "turn.admitted" in raw
     assert "provider.request" in raw
     assert "provider.response" in raw

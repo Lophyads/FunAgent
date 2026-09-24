@@ -98,14 +98,16 @@ from tools.toolsets import (
     ToolsetResolver,
     ToolsetSnapshot,
 )
+from .turn_phase import (
+    PhaseAction,
+    PhaseResult,
+    TurnPhase,
+)
 from .turn_state import (
     AttemptState,
     LoopState,
     OperationTimeoutError,
-    PhaseAction,
-    PhaseResult,
     RunBudgetExceeded,
-    TurnPhase,
     TurnRuntime,
 )
 

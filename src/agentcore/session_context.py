@@ -19,6 +19,10 @@ class SessionSnapshotConflict(SessionContextError):
     pass
 
 
+class RecoverySessionMissing(SessionContextError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class SessionBuildRequest:
     profile: str
@@ -92,7 +96,7 @@ class SessionContextFactory:
     ) -> SessionContextResolution:
         persisted = self._store.load_session(session_id)
         if persisted is None:
-            raise SessionContextError("cannot recover a missing session")
+            raise RecoverySessionMissing("cannot recover a missing session")
         return self._load(persisted, None)
 
     def _create(
@@ -182,4 +186,5 @@ class SessionContextFactory:
 __all__ = [
     "SessionBuildRequest", "SessionContextError", "SessionContextFactory",
     "SessionContextResolution", "SessionRuntimeSnapshot", "SessionSnapshotConflict",
+    "RecoverySessionMissing",
 ]

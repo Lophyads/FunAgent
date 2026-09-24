@@ -11,7 +11,8 @@ from contextvars import copy_context
 from typing import Any, Callable, Sequence, TypeVar
 
 from .builtins import default_tool_catalog
-from .conversation_loop import ConversationLoop, RouteState
+from .conversation_loop import ConversationLoop
+from .turn_phase import RouteState
 from .interfaces import (
     AllowAllGuard, Approver, MemoryProvider, MemoryUpdater,
     NoopMemoryProvider, NoopMemoryUpdater, NoopReviewScheduler,

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 from .interfaces import TurnCancelled
 from .models import (
@@ -20,27 +18,12 @@ from .models import (
 from .session_context import SessionRuntimeSnapshot
 
 
-logger = logging.getLogger(__name__)
-
-
 class OperationTimeoutError(TimeoutError):
     pass
 
 
 class RunBudgetExceeded(TimeoutError):
     pass
-
-
-class PhaseAction(str, Enum):
-    FALLTHROUGH = "fallthrough"
-    BREAK = "break"
-    RETURN = "return"
-    CONTINUE = "continue"
-
-
-@dataclass(frozen=True, slots=True)
-class PhaseResult:
-    action: PhaseAction = PhaseAction.FALLTHROUGH
 
 
 @dataclass(slots=True)
@@ -137,81 +120,7 @@ class TurnRuntime:
             self.lease_store.assert_current(state.lease)
 
 
-class TurnPhase(Protocol):
-    name: str
-    check_active: bool
-
-    def __call__(self, runtime: TurnRuntime, state: LoopState) -> PhaseResult: ...
-
-    def validate_postconditions(self, state: LoopState) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class FunctionPhase:
-    name: str
-    function: Callable[[TurnRuntime, LoopState], PhaseResult]
-    validator: Callable[[LoopState], None] = lambda state: None
-    check_active: bool = True
-
-    def __call__(self, runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-        return self.function(runtime, state)
-
-    def validate_postconditions(self, state: LoopState) -> None:
-        self.validator(state)
-
-
-def run_phase(
-    phase: TurnPhase, runtime: TurnRuntime, state: LoopState,
-) -> PhaseResult:
-    if phase.check_active:
-        runtime.check_active(state)
-    logger.debug('turn.phase_started phase=%s iteration=%s', phase.name, state.iteration)
-    state.warnings.extend(runtime.observability.publish(
-        "turn.phase_started", trace_id=state.trace_id,
-        session_id=state.session_id, turn_id=state.turn_id,
-        phase=phase.name, payload={"iteration": state.iteration},
-    ))
-    try:
-        result = phase(runtime, state)
-        phase.validate_postconditions(state)
-    except BaseException as exc:
-        logger.error('turn.phase_failed phase=%s error_type=%s', phase.name, type(exc).__name__)
-        state.warnings.extend(runtime.observability.publish(
-            "turn.phase_failed", trace_id=state.trace_id,
-            session_id=state.session_id, turn_id=state.turn_id,
-            phase=phase.name,
-            payload={"error_type": type(exc).__name__},
-        ))
-        if type(exc).__name__ in {
-            "StorageError", "DatabaseError", "OperationalError",
-            "IntegrityError",
-        }:
-            logger.error('storage.failure phase=%s error_type=%s', phase.name, type(exc).__name__)
-            state.warnings.extend(runtime.observability.publish(
-                "storage.failure", trace_id=state.trace_id,
-                session_id=state.session_id, turn_id=state.turn_id,
-                phase=phase.name,
-                payload={"error_type": type(exc).__name__},
-            ))
-        raise
-    logger.debug('turn.phase_finished phase=%s action=%s', phase.name, result.action.value)
-    state.warnings.extend(runtime.observability.publish(
-        "turn.phase_finished", trace_id=state.trace_id,
-        session_id=state.session_id, turn_id=state.turn_id,
-        phase=phase.name, payload={"action": result.action.value},
-    ))
-    return result
-
-
 __all__ = [
-    "AttemptState",
-    "FunctionPhase",
-    "LoopState",
-    "OperationTimeoutError",
-    "PhaseAction",
-    "PhaseResult",
-    "RunBudgetExceeded",
-    "TurnPhase",
-    "TurnRuntime",
-    "run_phase",
+    "AttemptState", "LoopState", "OperationTimeoutError",
+    "RunBudgetExceeded", "TurnRuntime",
 ]
