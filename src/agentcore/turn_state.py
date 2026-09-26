@@ -27,17 +27,6 @@ class RunBudgetExceeded(TimeoutError):
 
 
 @dataclass(slots=True)
-class AttemptState:
-    attempt_id: str
-    route_index: int
-    route_name: str
-    attempt_number: int
-    request_fingerprint: str
-    started_at: float
-    provider_error: BaseException | None = None
-
-
-@dataclass(slots=True)
 class LoopState:
     session_id: str
     turn_id: str
@@ -46,14 +35,12 @@ class LoopState:
     lease: LeaseHandle | None = None
     context: SessionRuntimeSnapshot | None = None
     messages: list[Message] = field(default_factory=list)
-    new_messages: list[Message] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     iteration: int = 0
     active_route_index: int = 0
     request: CanonicalModelRequest | None = None
     response: NormalizedModelResponse | None = None
     assistant_message: Message | None = None
-    attempt: AttemptState | None = None
     status: str = "failed"
     completion_reason: str = "turn_failed"
     final_text: str | None = None
@@ -71,7 +58,6 @@ class LoopState:
     user_driven_recovery: bool = False
     finalized: bool = False
     released: bool = False
-    business_error: BaseException | None = None
 
     def require_lease(self, phase: str) -> LeaseHandle:
         lease = self.lease
@@ -98,7 +84,7 @@ class LoopState:
         return response
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TurnRuntime:
     config: AgentConfig
     store: Any
@@ -108,19 +94,38 @@ class TurnRuntime:
     lease_lost_event: threading.Event
     deadline: float | None
     call_operation: Callable[..., Any]
+    _budget_lock: threading.RLock = field(default_factory=threading.RLock)
+    _paused_at: float | None = None
+
+    def pause_budget(self) -> None:
+        with self._budget_lock:
+            if self._paused_at is not None:
+                raise RuntimeError("run budget is already paused")
+            self._paused_at = time.monotonic()
+
+    def resume_budget(self) -> None:
+        with self._budget_lock:
+            if self._paused_at is None:
+                return
+            if self.deadline is not None:
+                self.deadline += time.monotonic() - self._paused_at
+            self._paused_at = None
 
     def check_active(self, state: LoopState) -> None:
         if self.cancel_event.is_set():
             raise TurnCancelled("turn was cancelled")
         if self.lease_lost_event.is_set():
             raise TurnCancelled("session lease was lost")
-        if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise RunBudgetExceeded("turn run budget was exhausted")
+        with self._budget_lock:
+            if self._paused_at is None and (
+                self.deadline is not None and time.monotonic() >= self.deadline
+            ):
+                raise RunBudgetExceeded("turn run budget was exhausted")
         if state.lease is not None:
             self.lease_store.assert_current(state.lease)
 
 
 __all__ = [
-    "AttemptState", "LoopState", "OperationTimeoutError",
+    "LoopState", "OperationTimeoutError",
     "RunBudgetExceeded", "TurnRuntime",
 ]

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Mapping
 
-from .interfaces import MemoryProvider
+from .interfaces import MemoryProvider, TurnHostContext
+from .runtime_cwd import ResolvedWorkspace
+from tools.context import BackendProbes, ToolAvailabilityContext
+from tools.lifecycle import SessionResourceKey
+from tools.services import ToolServices
 from .models import LeaseHandle, Message, SessionDefaults, UserInput
 from .prompt_builder import PromptBuildRequest, SystemPromptBuilder, SystemPromptSnapshot
 from .storage import PersistedSession, SQLiteStore
@@ -35,6 +40,7 @@ class SessionBuildRequest:
     enabled_toolsets: tuple[str, ...] = ("default",)
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
+    workspace: Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("profile", "surface", "platform", "config_version"):
@@ -55,14 +61,14 @@ class SessionBuildRequest:
 
 @dataclass(frozen=True, slots=True)
 class SessionRuntimeSnapshot:
-    session_id: str
-    build_request: SessionBuildRequest
+    """Immutable prompt, tools, and resource binding used by one turn."""
+
     prompt: SystemPromptSnapshot
-    tools: tuple[Mapping[str, Any], ...]
-    valid_tool_names: frozenset[str]
     entries_by_name: Mapping[str, ToolEntry[Any]]
     tool_schema_bytes: bytes
-    created_at: float
+    workspace: ResolvedWorkspace
+    resource_key: SessionResourceKey
+    resource_generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +85,7 @@ class SessionContextFactory:
         self, *, store: SQLiteStore, prompt_builder: SystemPromptBuilder,
         toolset_resolver: ToolsetResolver, registry: ToolRegistry,
         memory: MemoryProvider, defaults: SessionBuildRequest,
-        memory_max_chars: int,
+        memory_max_chars: int, services: ToolServices,
     ) -> None:
         self._store = store
         self._prompt_builder = prompt_builder
@@ -88,27 +94,30 @@ class SessionContextFactory:
         self._memory = memory
         self._defaults = defaults
         self._memory_max_chars = memory_max_chars
+        self._services = services
 
     def create_or_load(
         self, session_id: str, user_input: UserInput,
         request: SessionBuildRequest | None, lease: LeaseHandle,
+        host_context: TurnHostContext = TurnHostContext(),
     ) -> SessionContextResolution:
         persisted = self._store.load_session(session_id)
         if persisted is None:
-            return self._create(session_id, user_input, request or self._defaults, lease)
-        return self._load(persisted, request)
+            return self._create(session_id, user_input, request or self._defaults, lease, host_context)
+        return self._load(persisted, request, lease, host_context)
 
     def load_existing(
         self, session_id: str, lease: LeaseHandle,
+        host_context: TurnHostContext = TurnHostContext(),
     ) -> SessionContextResolution:
         persisted = self._store.load_session(session_id)
         if persisted is None:
             raise RecoverySessionMissing("cannot recover a missing session")
-        return self._load(persisted, None)
+        return self._load(persisted, None, lease, host_context)
 
     def _create(
         self, session_id: str, user_input: UserInput,
-        request: SessionBuildRequest, lease: LeaseHandle,
+        request: SessionBuildRequest, lease: LeaseHandle, host_context: TurnHostContext,
     ) -> SessionContextResolution:
         warnings: list[str] = []
         try:
@@ -137,29 +146,20 @@ class SessionContextFactory:
         if (prompt.content_bytes != prompt.text.encode("utf-8") or
             hashlib.sha256(prompt.content_bytes).hexdigest() != prompt.fingerprint):
             raise SessionContextError("prompt builder returned inconsistent bytes")
-        tools, names, entries, schema_bytes = self._load_tools(request)
-        persisted = self._store.create_session(
+        snapshot = self._runtime_snapshot(session_id, request, prompt, lease, host_context)
+        self._store.create_session(
             session_id, profile=request.profile, surface=request.surface,
             platform=request.platform, system_prompt_bytes=prompt.content_bytes,
             user_message=Message.user(user_input.text, metadata=user_input.metadata),
             fence=lease.fence,
         )
         return SessionContextResolution(
-            SessionRuntimeSnapshot(
-                session_id=session_id,
-                build_request=request,
-                prompt=prompt,
-                tools=tools,
-                valid_tool_names=names,
-                entries_by_name=entries,
-                tool_schema_bytes=schema_bytes,
-                created_at=persisted.created_at,
-            ),
-            True, tuple(warnings),
+            snapshot, True, tuple(warnings),
         )
 
     def _load(
         self, persisted: PersistedSession, request: SessionBuildRequest | None,
+        lease: LeaseHandle, host_context: TurnHostContext,
     ) -> SessionContextResolution:
         current = request or self._defaults
         identity = (persisted.profile, persisted.surface, persisted.platform)
@@ -169,13 +169,9 @@ class SessionContextFactory:
             raise SessionSnapshotConflict(
                 "explicit session identity differs from the persisted session"
             )
-        effective = SessionBuildRequest(
-            profile=persisted.profile, surface=persisted.surface,
-            platform=persisted.platform, config_version=current.config_version,
-            enabled_skills=current.enabled_skills,
-            enabled_toolsets=current.enabled_toolsets,
-            disabled_toolsets=current.disabled_toolsets,
-            permissions=current.permissions,
+        effective = replace(
+            current, profile=persisted.profile,
+            surface=persisted.surface, platform=persisted.platform,
         )
         prompt_bytes = persisted.system_prompt_bytes
         prompt = SystemPromptSnapshot(
@@ -183,43 +179,45 @@ class SessionContextFactory:
             fingerprint=hashlib.sha256(prompt_bytes).hexdigest(),
         )
         return SessionContextResolution(
-            self._runtime_snapshot(persisted, effective, prompt),
+            self._runtime_snapshot(
+                persisted.session_id, effective, prompt, lease, host_context,
+            ),
             False,
         )
 
     def _runtime_snapshot(
         self,
-        persisted: PersistedSession,
+        session_id: str,
         request: SessionBuildRequest,
         prompt: SystemPromptSnapshot,
+        lease: LeaseHandle, host_context: TurnHostContext,
     ) -> SessionRuntimeSnapshot:
-        tools, names, entries, schema_bytes = self._load_tools(request)
+        key = SessionResourceKey(self._store.resource_namespace, request.profile, session_id)
+        workspace, generation = self._services.begin_turn(
+            key, lease.owner_id, lease.turn_id, request.workspace,
+        )
+        availability = ToolAvailabilityContext(
+            self._services.config.tools, workspace, host_context.capabilities,
+            BackendProbes(self._services.available),
+        )
+        entries, schema_bytes = self._load_tools(request, availability)
         return SessionRuntimeSnapshot(
-            session_id=persisted.session_id,
-            build_request=request,
             prompt=prompt,
-            tools=tools,
-            valid_tool_names=names,
             entries_by_name=entries,
             tool_schema_bytes=schema_bytes,
-            created_at=persisted.created_at,
+            workspace=workspace, resource_key=key, resource_generation=generation,
         )
 
     def _load_tools(
-        self, request: SessionBuildRequest,
-    ) -> tuple[
-        tuple[Mapping[str, Any], ...],
-        frozenset[str],
-        Mapping[str, ToolEntry[Any]],
-        bytes,
-    ]:
+        self, request: SessionBuildRequest, availability: ToolAvailabilityContext,
+    ) -> tuple[Mapping[str, ToolEntry[Any]], bytes]:
         return load_tools(ToolsetRequest(
             profile=request.profile, surface=request.surface,
             platform=request.platform,
             enabled_toolsets=request.enabled_toolsets,
             disabled_toolsets=request.disabled_toolsets,
             permissions=request.permissions,
-        ), self._registry, self._toolset_resolver)
+        ), self._registry, self._toolset_resolver, availability=availability)
 
 
 __all__ = [

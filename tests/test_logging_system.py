@@ -207,7 +207,7 @@ def test_gateway_logs_delivery_with_session(
         def send(self, *, obligation_id: str, destination: str, text: str) -> bool:
             return True
 
-    with GatewayRuntime(
+    with configure_logging(config, mode="gateway"), GatewayRuntime(
         config, Adapter(), provider_resolver=resolver, api_modes=api_modes
     ) as gateway:
         result = gateway.run_turn_blocking("private-input", session_id="gateway-session")

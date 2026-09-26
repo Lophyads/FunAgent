@@ -48,6 +48,7 @@ class DeliveryRuntime:
     ) -> None:
         self.store = store
         self.adapter = adapter
+        self.destination = adapter.destination
         self._leases = SQLiteTurnLeaseStore(store)
         self._ttl = lease_ttl_seconds
         self._owner_id = str(uuid.uuid4())
@@ -57,9 +58,11 @@ class DeliveryRuntime:
         )
         self._observability = observability
         self._log_config = log_config
-        self._pool = DaemonWorkerPool(
-            1, queue_capacity, name="gateway-delivery"
-        )
+        try:
+            self._pool = DaemonWorkerPool(1, queue_capacity, name="gateway-delivery")
+        except BaseException:
+            self._heartbeat.close(log_config.timeouts.finalize_seconds if log_config else 5.0)
+            raise
 
     def submit_drain(
         self, session_id: str | None = None
@@ -67,16 +70,17 @@ class DeliveryRuntime:
         return self._pool.submit(lambda: self.drain(session_id))
 
     def close(self, timeout: float) -> bool:
-        drained = self._pool.close(cancel_pending=False, timeout=timeout)
-        heartbeat_stopped = self._heartbeat.close(timeout)
-        return drained and heartbeat_stopped
+        deadline = time.monotonic() + max(0, timeout)
+        if not self._pool.close(cancel_pending=False, timeout=timeout):
+            return False
+        return self._heartbeat.close(max(0, deadline - time.monotonic()))
 
     def drain(self, session_id: str | None = None) -> DeliveryBatch:
         delivered = failed = 0
         for obligation in self.store.list_pending_deliveries():
             if session_id is not None and obligation["session_id"] != session_id:
                 continue
-            if obligation["destination"] != self.adapter.destination:
+            if obligation["destination"] != self.destination:
                 continue
             if self._deliver_one(obligation):
                 delivered += 1

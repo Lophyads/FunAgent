@@ -10,6 +10,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+from tools.config import ToolServiceConfig, WorkspaceConfig
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -117,6 +120,9 @@ class AgentConfig(FrozenStrictModel):
     lease: LeasePolicy = Field(default_factory=LeasePolicy)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    tools: ToolServiceConfig = Field(default_factory=ToolServiceConfig)
+    approval_store_path: Path | None = Field(default=None, exclude=True)
     routes: tuple[ModelRoute, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -459,7 +465,6 @@ class TurnResult(StrictModel):
     final_text: str | None = None
     session_id: str
     turn_id: str
-    new_messages: list[Message] = Field(default_factory=list)
     iterations: int = 0
     route_used: str | None = None
     usage: dict[str, int] = Field(default_factory=dict)

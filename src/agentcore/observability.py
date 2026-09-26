@@ -98,6 +98,8 @@ class ObservabilityHub:
         )
         self._sink_pool = DaemonWorkerPool(1, capacity, name="agentcore-event-sink")
         self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._sink_close_futures = {}
         self._dropped = 0
         self._drop_lock = threading.Lock()
 
@@ -149,27 +151,39 @@ class ObservabilityHub:
         return tuple(warnings)
 
     def close(self, timeout: float) -> tuple[str, ...]:
-        if self._closed.is_set():
-            return ()
-        self._closed.set()
-        warnings: list[str] = []
-        if not self._observer_pool.close(cancel_pending=True, timeout=timeout):
-            warnings.append("observer pool did not stop before timeout")
-        if not self._sink_pool.close(cancel_pending=False, timeout=timeout):
-            warnings.append("event sink queue did not drain before timeout")
-        for index, sink in enumerate(self._sinks):
-            try:
-                future = submit_daemon_call(
-                    sink.close, name=f"agentcore-sink-close-{index}"
-                )
-                future.result(timeout=max(0.0, timeout))
-            except FutureTimeoutError:
-                warnings.append(f"event sink {index}.close timed out")
-            except BaseException as exc:
-                warnings.append(
-                    f"event sink {index}.close failed: {type(exc).__name__}"
-                )
-        return tuple(warnings)
+        deadline = time.monotonic() + max(0, timeout)
+        remaining = lambda: max(0, deadline - time.monotonic())
+        if not self._close_lock.acquire(timeout=remaining()):
+            return ("observability cleanup is already running",)
+        try:
+            self._closed.set()
+            warnings: list[str] = []
+            if not self._observer_pool.close(cancel_pending=True, timeout=remaining()):
+                warnings.append("observer pool did not stop before timeout")
+            sinks_drained = self._sink_pool.close(cancel_pending=False, timeout=remaining())
+            if not sinks_drained:
+                warnings.append("event sink queue did not drain before timeout")
+                return tuple(warnings)
+            for index, sink in enumerate(self._sinks):
+                future = self._sink_close_futures.get(index)
+                if future is None:
+                    if remaining() == 0:
+                        warnings.append(f"event sink {index}.close budget exhausted")
+                        continue
+                    future = submit_daemon_call(sink.close, name=f"agentcore-sink-close-{index}")
+                    self._sink_close_futures[index] = future
+                try:
+                    future.result(timeout=remaining())
+                except FutureTimeoutError:
+                    warnings.append(f"event sink {index}.close timed out")
+                    if future.done():
+                        self._sink_close_futures.pop(index, None)
+                except BaseException as exc:
+                    self._sink_close_futures.pop(index, None)
+                    warnings.append(f"event sink {index}.close failed: {type(exc).__name__}")
+            return tuple(warnings)
+        finally:
+            self._close_lock.release()
 
     def _publish_sinks(self, event: EventEnvelope) -> None:
         for sink in self._sinks:

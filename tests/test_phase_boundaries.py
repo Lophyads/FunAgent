@@ -7,7 +7,7 @@ import inspect
 import pytest
 
 from agentcore import (
-    LeaseAcquireTimeout, LeaseLostError, NormalizedModelResponse,
+    LeaseAcquireTimeout, LeaseLostError, Message, NormalizedModelResponse,
     NormalizedProviderError, RunBudgetExceeded, SQLiteStore,
     SessionSnapshotConflict, StorageError, ToolCall, TurnCancelled, TurnTrigger,
     ToolExecutor,
@@ -107,6 +107,35 @@ def test_phase_actions_and_missing_prerequisites_are_explicit():
     for name in ("lease", "context", "request", "response"):
         with pytest.raises(RuntimeError, match=f"sample_phase requires {name}"):
             getattr(state, f"require_{name}")("sample_phase")
+
+
+def test_tool_round_validation_ignores_matching_ids_in_older_history():
+    call = ToolCall(id="reused-id", name="current_time", arguments="{}")
+    old_assistant = Message.assistant_tools([call])
+    old_result = Message.tool_result(
+        "old result", tool_call_id=call.id, tool_name=call.name,
+        effect_disposition="none", reply_to_message_id=1,
+        tool_outcome_state="succeeded",
+    )
+    current_assistant = Message.assistant_tools([call])
+    state = LoopState("session", "turn", "trace")
+    state.response = NormalizedModelResponse(
+        tool_calls=[call], finish_reason="tool_calls",
+    )
+    state.assistant_message = current_assistant
+    state.messages = [old_assistant, old_result, current_assistant]
+    phase = object.__new__(TurnPhases)._tool_round_phase()
+    verdict = PhaseResult(PhaseAction.CONTINUE)
+
+    with pytest.raises(RuntimeError, match="unresolved tool calls"):
+        phase.validate_postconditions(state, verdict)
+
+    state.messages.append(Message.tool_result(
+        "new result", tool_call_id=call.id, tool_name=call.name,
+        effect_disposition="none", reply_to_message_id=3,
+        tool_outcome_state="succeeded",
+    ))
+    phase.validate_postconditions(state, verdict)
 
 
 def test_missing_tool_lease_fails_before_operation_submission():
@@ -488,7 +517,7 @@ def test_recovery_session_missing_is_a_phase_break(
         outer_errors.append(exc)
         return original(self, runtime, state, exc)
 
-    def missing_session(self, session_id, lease):
+    def missing_session(self, session_id, lease, host_context):
         raise RecoverySessionMissing("recovery session is absent")
 
     monkeypatch.setattr(TurnPhases, "handle_outer_loop_error", outer)

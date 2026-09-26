@@ -14,33 +14,44 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - 顺序工具执行、Pydantic 参数校验、guard、approval 与未知副作用恢复语义。
 - GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
 - 隔离的 Observer/EventSink 可观测性路径及集中敏感信息脱敏。
+- Web 搜索/提取、文本 browser、AX-only computer_use 与跨 CLI/Gateway 的 clarify/审批交互。
 
 ## 快速开始
 
-复制配置，创建同目录 `.env`，然后启动同步 CLI：
+CLI 在同一进程内通过 GatewayRuntime 使用 AgentCore，无需启动独立服务：
 
 ```powershell
 Copy-Item agentcore.toml.example agentcore.toml
-Set-Content .env 'OPENAI_API_KEY=your-key'
 uv sync --extra dev
 uv run agentcore chat --config agentcore.toml
-```
-
-`load_config()` 自动加载配置文件同目录的 `.env`，已有进程环境变量优先。route 通过
-`credential_ref = "env:OPENAI_API_KEY"` 引用密钥；密钥值不会写入 TOML、Session
-Snapshot、SQLite 或观测事件。
-
-CLI 支持 `/new`、`/session` 和 `/exit`。恢复已有会话：
-
-```powershell
+# 恢复已有 Session
 uv run agentcore chat --config agentcore.toml --session <session-id>
 ```
 
+在配置文件同目录的 `.env` 中设置模型密钥。load_config() 自动加载该文件，
+已有环境变量优先；route 通过 `credential_ref = "env:OPENAI_API_KEY"` 引用密钥。
+
+CLI 支持 `/new`、`/session`、`/exit`。主线程消息泵负责 clarify 和审批输入，
+同步 AgentTurn 在 daemon worker 中运行。交互期间 EOF 或 Ctrl+C 会取消当前任务；
+退出时进程入口依次关闭自有 Gateway、共享工具服务和日志。
+`/new` 只有在旧 Session 资源重置成功后才切换，不删除历史或永久授权。
+
+默认工具集会纳入可用的 web_search、web_extract、browser 九个文本动作、
+computer_use 和 clarify。搜索使用隔离的 DDGS 子进程；长网页写入工作区
+.funagent/artifacts/，可通过 read_file 阅读。browser 需显式安装兼容的
+agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不自动安装或
+升级外部程序；不可用工具会从当轮模型 schema 隐藏。computer_use 首版只提供
+文本 AX capture，拒绝 SOM/vision 和图像型 capture_after。默认拒绝 Web/browser
+访问本地及私有地址。
+
+可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
+；该命令不下载或升级程序。
+
 ## 诊断日志
 
-CLI 和 Gateway 默认将脱敏的诊断日志写到配置目录下的 `logs/`：
+CLI 在进程入口配置脱敏的诊断日志，默认写到配置目录下的 `logs/`：
 `agent.log` 记录普通执行，`errors.log` 记录 WARNING 及以上，
-Gateway 还写 `gateway.log`。文件按大小轮转；日志故障不会改变 Turn 结果。
+平台 Gateway 宿主可使用 `configure_logging(config, mode="gateway")`，同时写入 `gateway.log`。文件按大小轮转；日志故障不会改变 Turn 结果。
 主链路记录 Turn 开始与结束、Provider 尝试和响应、工具轮次与单个工具结果；
 DEBUG 级别另记录请求组装时的消息和工具数量，以及相位边界。
 关键诊断由各模块的具名 logger 显式写入；生命周期事件的发布不会自动生成日志。
@@ -54,85 +65,73 @@ uv run agentcore logs gateway --config agentcore.toml -f
 ```
 
 日志查看还支持按组件筛选。原始 Session ID 写入文本日志；默认 INFO 只记录执行摘要。
-DEBUG 可记录截断并脱敏的用户输入和工具参数预览，启用时应限制日志目录访问权限。
+DEBUG 仅保留内容长度和已隐藏的预览占位符，不记录用户输入、网页正文、
+工具参数或人工答复。仍应限制日志目录访问权限。
 旧 JSONL 日志首次启动时归档到 logs/legacy-jsonl/，查看命令只读取新文本日志。
 嵌入 Python 的 `AgentCore` 不自动配置文件日志；需要时先调用
 `configure_logging(config)` 并在关闭 AgentCore 后关闭返回的 handle。
 
 ## Python API
 
-同步宿主：
+进程入口显式初始化工具系统，再创建 Agent。初始化时自动发现一次 `tools/*_tool.py`；
+相同配置可重复初始化，配置冲突会报错，关闭后不能再次初始化。
 
 ```python
-from agentcore import AgentCore, load_config
+from agentcore import (
+    AgentCore, ToolSystemConfig, load_config,
+    initialize_tool_system, shutdown_tool_system,
+)
 
 config = load_config("agentcore.toml")
-with AgentCore(config) as agent:
-    result = agent.run_turn_blocking("Calculate 12 * 8")
-    print(result.final_text)
-```
-
-异步宿主的 facade 不承载状态机：
-
-```python
-import asyncio
-
-from agentcore import AgentCore, load_config
-
-
-async def main() -> None:
-    async with AgentCore(load_config("agentcore.toml")) as agent:
-        result = await agent.run_turn("What time is it in Asia/Shanghai?")
+initialize_tool_system(ToolSystemConfig.from_agent_config(config))
+try:
+    with AgentCore(config) as agent:
+        result = agent.run_turn_blocking("Calculate 12 * 8")
         print(result.final_text)
-
-
-asyncio.run(main())
+finally:
+    report = shutdown_tool_system(timeout=5)
+    if not report.completed:
+        print(report.issues)
 ```
 
-可通过 keyword-only `session_request` 指定新 Session 的身份及当前工具权限。
-`AgentCore` 初始化时会自动发现并注册内置 `tools/*_tool.py`。只有测试、嵌入集成或
-自定义工具集合需要显式传入 `tool_registry=`。
-既有 Session 的 profile/surface/platform 不允许改变，Prompt 保持原样；当前配置和
-Registry 的工具变更只影响后续 Turn。
+异步宿主可使用 `async with AgentCore(config)` 和 `await agent.run_turn(...)`，
+初始化与全局关闭仍由进程入口负责。Agent 不接受工具注册表或服务注入，也不会关闭共享服务。
 
-## Gateway 与回复投递
+通过 `session_request` 指定 Session 身份、权限和可信工作区请求。
+既有 Session 的 profile/surface/platform 不允许改变，Prompt 保持原样；
+Registry 更新只影响后续 Turn。直接调用默认没有人工交互能力；需要交互时传入
+`TurnHostContext(HostCapabilities(...), interaction_port)`。
 
-有外部投递目标时使用 `GatewayRuntime`。Adapter 必须以确定性的
-`obligation_id` 作为幂等键；仅在目标确认成功后返回 `True`。未确认回复保留在
-SQLite 中，下一次启动先重试投递，再安排需要模型继续处理的 Session。
+## Gateway、交互与回复投递
 
-```python
-from agentcore import GatewayRuntime, load_config
+CLI 的产品链路为 CLI → GatewayRuntime → AgentCore。CLI 负责输入和展示；
+GatewayRuntime 负责 Session 接入、交互路由、恢复和可选投递，不包含模型循环。
 
+- 进程入口初始化工具系统、配置日志并创建 Gateway；退出时共享一个总预算顺序清理。
+- CLI 使用 poll 模式，调用 submit_turn 后等待原始 TurnSubmission，按 Session 消费交互。
+- clarify/审批答复经 resolve_interaction 直接唤醒 Broker，不进入 Turn FIFO。
+- attach 返回的恢复 submission 使用同一消息泵；未完成工具不会自动重放。
+- detach 会取消对应 Session 的任务和交互，但不等于重置共享工具资源。
+- 本地 CLI 直接展示 TurnResult，不创建终端投递义务。
 
-class ChatAdapter:
-    destination = "chat:room"
+平台宿主可使用 push 模式及同步 InteractionPort，并按需要配置 DeliveryAdapter。
+投递通过 obligation_id 幂等处理，失败后只重试发送、不重跑模型或工具。
+示例见 [examples/interaction_host.py](examples/interaction_host.py)，完整契约见
+[CLI 经 Gateway 接入设计](docs/funagent-cli-gateway-development-design.md)。
 
-    def __init__(self, client):
-        self.client = client
-
-    def send(self, *, obligation_id: str, destination: str, text: str) -> bool:
-        response = self.client.send_text(
-            destination, text, idempotency_key=obligation_id
-        )
-        return response.acknowledged
-
-
-with GatewayRuntime(load_config("agentcore.toml"), ChatAdapter(client)) as gateway:
-    result = gateway.run_turn_blocking("Hello")
-```
-
-普通 `AgentCore` 仍返回 `TurnResult` 给调用方；它没有外部投递目标时不会创建
-delivery obligation。`GatewayRuntime.wait_for_recovery()` 可用作启动恢复的等待屏障。
+Registry 和 ToolServices 在同一进程内共享，资源按数据库命名空间/profile/session_id 隔离。
+替换 Agent 不释放 Session 资源；关闭 Gateway 不关闭其他使用者借用的进程服务。
+全局 shutdown 由最外层进程入口负责，不由借用 Gateway 的界面负责。
 
 ## 自定义工具
 
-进程级 `ToolRegistry` 描述可用实现，`ToolsetResolver` 决定每个 Turn 能看到哪些
-工具。每个实现必须提供稳定的 `tool_id` 与 `implementation_version`：
+`ToolRegistry` 保存实现定义；`toolsets.py` 决定候选工具；
+`model_tools.py` 自动发现、校验并发布整批定义，再按本轮权限和能力生成模型工具列表。
+
+将下面的模块放入 `src/tools/greet_tool.py`，下次进程初始化时自动发现：
 
 ```python
 from pydantic import BaseModel, Field
-
 from agentcore import ToolContext, ToolEntry, ToolRegistry
 
 
@@ -141,29 +140,31 @@ class GreetArgs(BaseModel):
 
 
 def greet(args: GreetArgs, context: ToolContext):
+    context.check_active()
     return {"message": f"Hello, {args.name}!"}
 
 
-registry = ToolRegistry()
-registry.register(ToolEntry(
-    tool_id="example.greet",
-    implementation_version="1",
-    name="greet",
-    description="Greet a person by name.",
-    args_model=GreetArgs,
-    handler=greet,
-    side_effects="none",
-))
+def register_tools(registry: ToolRegistry) -> None:
+    registry.register(ToolEntry(
+        tool_id="example.greet", implementation_version="1",
+        name="greet", description="Greet a person by name.",
+        args_model=GreetArgs, handler=greet, side_effects="none",
+    ))
 ```
 
-`AgentCore` 构造时冻结初始 Registry；调用 `agent.update_tools(entries)` 可原子发布新定义，
-仅影响后续 Turn，进行中的 Turn 继续使用本轮已加载的 `ToolEntry`。Session 只冻结 system prompt。
-内置工具由 `tools/*_tool.py` 的 `register_tools(registry)` 自动发现；
-`enabled_toolsets`、`disabled_toolsets`、权限和 `check_fn` 共同决定模型可见工具。
-异步 handler 会被拒绝；异步服务需要由集成方提供显式
-同步适配器。工具超时表示 Core 停止等待，不表示线程被强制终止。已进入只读 handler
-后结果为 `unknown/none`；已进入可能有副作用的 handler 后结果为
-`unknown/unknown`。未完成工具永不自动重放。
+注册代码只声明固定元数据，不捕获 Agent、目录或服务实例。
+Handler 从 `context.workspace`、`context.interactions` 和 `context.resources`
+获取本次调用的能力；`check_fn` 接收只读 `ToolAvailabilityContext`。
+候选工具依次经过 toolset、权限、宿主能力和后端可用性检查。
+
+显式管理更新调用 `get_tool_registry().replace_all(entries)`，
+整批校验成功后才发布。进行中的 Turn 使用已加载的 ToolEntry。
+异步 Handler 被拒绝；工具超时只表示 Core 停止等待。
+真实 Handler 退出前保留资源使用记录；未完成工具永不自动重放。
+
+工作区通过 `[workspace] default_cwd/allowed_root` 配置，相对路径相对 TOML 文件目录解析。
+可信宿主可通过 `SessionBuildRequest.workspace` 指定目录，不能越过 allowed_root。
+不切换进程 cwd；已有资源时变更目录返回 `SessionWorkspaceConflict`，须先重置资源。
 
 ## Provider 扩展
 
@@ -183,14 +184,17 @@ SQLite 文件及其 WAL/SHM sidecar；旧会话数据不可恢复。
 
 ## 配置
 
+新增 tools 配置控制 Web/browser 私有地址策略、artifact 大小和交互等待时限；
+approvals.always 仅在人工选择永久授权后原子写入。
+
 - `[session]`：新 Session 的 profile、surface、skills、toolsets 与 permissions。
 - `[lease]`：TTL、heartbeat 周期和跨进程等待上限。
 - `[workers]`：turn/operation daemon worker 数量及有界队列。
 - `[timeouts]`：总预算和工具、策略、memory、observer、review、finalize 上限。
 - `[[routes]]`：有序 primary/fallback 路由。
 
-当前版本不包含 HTTP Gateway 服务、Cron、Subagent、MCP、上下文压缩、多模态或
-exactly-once 工具保证。
+当前版本提供同步 CLI 和可嵌入的 GatewayRuntime；不包含独立网络 Gateway、TUI、Cron、
+Subagent、MCP、上下文压缩、多模态或 exactly-once 工具保证。
 
 ## 验收
 

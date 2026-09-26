@@ -59,31 +59,32 @@ class DaemonWorkerPool:
             if self._outstanding >= self._capacity:
                 raise WorkerQueueFullError(f"worker pool {self._name} is saturated")
             self._outstanding += 1
-        future: Future[T] = Future()
-        self._queue.put(_WorkItem(future=future, function=function))
+            future: Future[T] = Future()
+            self._queue.put(_WorkItem(future=future, function=function))
         return future
 
     def close(self, *, cancel_pending: bool, timeout: float) -> bool:
-        with self._lock:
-            if self._closed:
-                return not any(thread.is_alive() for thread in self._threads)
-            self._closed = True
-
-        if cancel_pending:
-            while True:
-                try:
-                    item = self._queue.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(item, _WorkItem):
-                    item.future.cancel()
-                    with self._lock:
-                        self._outstanding -= 1
-                self._queue.task_done()
-
-        for _ in self._threads:
-            self._queue.put(_STOP)
         deadline = time.monotonic() + max(0.0, timeout)
+        cancelled = []
+        with self._lock:
+            first_close = not self._closed
+            self._closed = True
+            if first_close:
+                if cancel_pending:
+                    while True:
+                        try:
+                            item = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if isinstance(item, _WorkItem):
+                            cancelled.append(item.future)
+                            self._outstanding -= 1
+                        self._queue.task_done()
+                for _ in self._threads:
+                    self._queue.put(_STOP)
+        # Future callbacks may call back into the pool; never run them under its lock.
+        for future in cancelled:
+            future.cancel()
         for thread in self._threads:
             thread.join(max(0.0, deadline - time.monotonic()))
         return not any(thread.is_alive() for thread in self._threads)
@@ -106,6 +107,8 @@ class DaemonWorkerPool:
                     with self._lock:
                         self._outstanding -= 1
                 self._queue.task_done()
+                # A shared worker must not retain the last turn/host while idle.
+                del item
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +234,6 @@ class TurnDispatcher:
             if self._jobs.pop(id(job), None) is None:
                 return
             self._total -= 1
-            job.future.cancel()
             lane = self._waiting.get(job.session_id)
             if lane:
                 lane.remove(job)
@@ -247,23 +249,23 @@ class TurnDispatcher:
                     if not lane:
                         self._waiting.pop(job.session_id, None)
                     self._blocked_sessions.discard(job.session_id)
+        job.future.cancel()
         if next_job is not None:
             self._dispatch(next_job)
 
     def close(self, *, timeout: float) -> bool:
         with self._lock:
-            if self._closed:
-                return self._pool.close(cancel_pending=False, timeout=timeout)
             self._closed = True
             jobs = list(self._jobs.values())
             waiting = [job for lane in self._waiting.values() for job in lane]
             self._waiting.clear()
             for job in waiting:
-                if job.future.cancel():
-                    self._jobs.pop(id(job), None)
-                    self._total -= 1
+                self._jobs.pop(id(job), None)
+                self._total -= 1
             for job in jobs:
                 job.cancel_event.set()
+        for job in waiting:
+            job.future.cancel()
         return self._pool.close(cancel_pending=False, timeout=timeout)
 
     def _dispatch(self, job: _TurnJob[Any]) -> None:

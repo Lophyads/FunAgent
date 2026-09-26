@@ -15,3 +15,5 @@ build/
 
 logs/
 .correlation-key
+.funagent/
+*.approvals.lock

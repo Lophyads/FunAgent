@@ -90,7 +90,6 @@ class ToolRoundRunner:
                 phase="tool_round", payload={"tool_name": call.name},
             )
         state.messages.append(assistant)
-        state.new_messages.append(assistant)
         state.assistant_message = assistant
 
         for tool_call in response.tool_calls:
@@ -98,7 +97,7 @@ class ToolRoundRunner:
             logger.debug(
                 "tool.arguments_preview tool_name=%s preview=%s",
                 tool_call.name,
-                tool_call.arguments[:200].replace("\r", " ").replace("\n", " "),
+                "[redacted]",
             )
             tool_started = time.monotonic()
             executed = self._executor.execute(
@@ -110,7 +109,6 @@ class ToolRoundRunner:
                 state.session_id, executed.message, fence=lease.fence,
             )
             state.messages.append(executed.message)
-            state.new_messages.append(executed.message)
             state.tool_outcomes.append(executed.outcome)
             tool_event = f"tool.{executed.outcome.state}"
             tool_logger = (

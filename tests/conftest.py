@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import threading
+from dataclasses import replace
+from contextlib import contextmanager
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -22,9 +26,81 @@ from agentcore import (
     WireRequest,
     WireResponse,
     WorkerPolicy,
-    default_tool_registry,
 )
 from agentcore.provider_runtime import normalize_provider_exception
+
+from agentcore.interfaces import CancellationToken, ToolContext, TurnHostContext, HostCapabilities
+from tools.config import ToolSystemConfig, WorkspaceConfig
+from tools.context import ToolAvailabilityContext, BackendProbes, ToolUse, ToolInteractions, ToolResources
+from tools.lifecycle import SessionResourceKey
+from tools.model_tools import discover_builtin_tools
+from tools import runtime as tool_runtime
+from tools.runtime import initialize_tool_system, get_tool_registry, get_tool_services, shutdown_tool_system
+
+
+def builtin_registry():
+    registry = ToolRegistry()
+    discover_builtin_tools(registry)
+    return registry
+
+
+def configure_tools(config, *, entries=None, approver=None):
+    system_config = replace(ToolSystemConfig.from_agent_config(config), approver=approver)
+    if tool_runtime._state == "UNINITIALIZED":
+        initialize_tool_system(system_config)
+    else:
+        tool_runtime.validate_tool_config(system_config)
+    if entries is not None:
+        entries.freeze()
+        get_tool_registry().replace_all(entries.entries())
+
+
+@pytest.fixture(autouse=True)
+def isolated_tool_runtime(monkeypatch):
+    from tools.browser_backend import AgentBrowserBackend
+    from tools.computer_backend import CuaCliBackend
+    # Tests never probe optional binaries on the developer's machine.
+    monkeypatch.setattr(AgentBrowserBackend, "available", classmethod(lambda cls: False))
+    monkeypatch.setattr(CuaCliBackend, "_probe_available", classmethod(lambda cls: False))
+    monkeypatch.setattr(CuaCliBackend, "_availability_cache", None)
+    yield
+    report = shutdown_tool_system(timeout=3)
+    assert report.completed, report
+    with tool_runtime._lock:
+        tool_runtime._state = "UNINITIALIZED"
+        tool_runtime._startup_cwd = None
+        tool_runtime._config = tool_runtime._registry = tool_runtime._services = None
+
+
+@pytest.fixture
+def availability(tmp_path):
+    from agentcore.runtime_cwd import ResolvedWorkspace
+    return ToolAvailabilityContext(
+        ToolSystemConfig().tools, ResolvedWorkspace(tmp_path, tmp_path),
+        HostCapabilities(), BackendProbes(lambda name: name in {"search", "web_extract"}),
+    )
+
+
+@pytest.fixture
+def context_factory(tmp_path):
+    @contextmanager
+    def factory(session_id="s1", turn_id="t1", call_id="c1", *, host=None, check_active=lambda: None):
+        if tool_runtime._state == "UNINITIALIZED":
+            initialize_tool_system(ToolSystemConfig(workspace=WorkspaceConfig(default_cwd=tmp_path, allowed_root=tmp_path)))
+        services = get_tool_services()
+        key = SessionResourceKey("test", "test", session_id)
+        workspace, generation = services.begin_turn(key, "test-owner", turn_id)
+        use = ToolUse(services, key, generation, "test-owner", turn_id, call_id, check_active)
+        try:
+            with services.tool_use(use):
+                yield ToolContext(
+                    session_id, turn_id, call_id, workspace,
+                    ToolInteractions(use, host or TurnHostContext(), lambda: None, lambda: None),
+                    ToolResources(use), CancellationToken(threading.Event()), use.check,
+                )
+        finally:
+            services.end_turn("test-owner", turn_id)
+    return factory
 
 
 class ScriptedTransport:
@@ -90,6 +166,7 @@ class ScriptedApiModeAdapter:
 def scripted_provider_stack(
     config: AgentConfig, transports: Mapping[str, ScriptedTransport],
 ) -> tuple[StaticProviderResolver, ApiModeRegistry, ScriptedApiModeAdapter]:
+    configure_tools(config)
     adapter = ScriptedApiModeAdapter()
     api_modes = ApiModeRegistry()
     api_modes.register(adapter)
@@ -115,10 +192,10 @@ def agent_factory():
         config: AgentConfig, *, transports: Mapping[str, ScriptedTransport],
         tool_registry: ToolRegistry | None = None, **kwargs: Any,
     ) -> AgentCore:
+        configure_tools(config, entries=tool_registry, approver=kwargs.pop("approver", None))
         resolver, api_modes, _ = scripted_provider_stack(config, transports)
         return AgentCore(
             config,
-            tool_registry=tool_registry or default_tool_registry(),
             provider_resolver=resolver,
             api_modes=api_modes,
             **kwargs,

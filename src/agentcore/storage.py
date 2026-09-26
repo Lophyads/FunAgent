@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -133,6 +134,11 @@ class SQLiteStore:
         self._anchor: sqlite3.Connection | None = None
         self._opened = False
         self._state_lock = threading.RLock()
+
+    @property
+    def resource_namespace(self) -> str:
+        """Stable for a file database; unique for each in-memory store."""
+        return self._database if self._uri else os.path.normcase(str(Path(self.path).resolve()))
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -308,13 +314,15 @@ class SQLiteStore:
         )
         return cursor.rowcount == 1
 
-    def mark_stale_leases(self) -> list[str]:
+    def mark_stale_leases(self, session_ids: frozenset[str] | None = None) -> list[str]:
         now = time.time()
         with self._transaction() as connection:
             rows = connection.execute(
                 "SELECT session_id FROM session_leases WHERE owner_id IS NOT NULL "
                 "AND expires_at<=?", (now,),
             ).fetchall()
+            if session_ids is not None:
+                rows = [row for row in rows if str(row["session_id"]) in session_ids]
             marked = [
                 str(row["session_id"]) for row in rows
                 if self._mark_resume_if_unfinished(
@@ -374,7 +382,7 @@ class SQLiteStore:
         finally:
             connection.close()
 
-    def list_pending_recoveries(self, max_attempts: int) -> list[str]:
+    def list_pending_recoveries(self, max_attempts: int, session_ids: frozenset[str] | None = None) -> list[str]:
         connection = self._connection()
         try:
             rows = connection.execute(
@@ -382,7 +390,8 @@ class SQLiteStore:
                 "AND resume_attempts<? AND (resume_not_before IS NULL OR resume_not_before<=?) "
                 "ORDER BY updated_at,id", (max_attempts, time.time()),
             ).fetchall()
-            return [str(row["id"]) for row in rows]
+            return [str(row["id"]) for row in rows
+                    if session_ids is None or str(row["id"]) in session_ids]
         finally:
             connection.close()
 

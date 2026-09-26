@@ -7,7 +7,10 @@ import json
 import logging
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from .context import ToolAvailabilityContext
 
 from .registry import ToolEntry, ToolRegistry
 from .toolsets import DefaultToolsetResolver, ToolsetRequest, ToolsetResolver
@@ -18,48 +21,43 @@ logger = logging.getLogger(__name__)
 
 def discover_builtin_tools(registry: ToolRegistry) -> tuple[str, ...]:
     """Import every *_tool.py module and call its explicit registration hook."""
+    candidate = ToolRegistry()
     imported: list[str] = []
     tools_dir = Path(__file__).resolve().parent
     for path in sorted(tools_dir.glob("*_tool.py")):
         module_name = f"{__package__}.{path.stem}"
-        module = importlib.import_module(module_name)
-        register = getattr(module, "register_tools", None)
-        if not callable(register):
-            raise TypeError(f"{module_name} must define register_tools(registry)")
-        register(registry)
+        try:
+            module = importlib.import_module(module_name)
+            register = getattr(module, "register_tools", None)
+            if not callable(register):
+                raise TypeError("module must define register_tools(registry)")
+            register(candidate)
+        except Exception as exc:
+            raise ValueError(f"tool discovery failed in {module_name}: {exc}") from exc
         imported.append(module_name)
+    candidate.freeze()
+    registry.replace_all(candidate.entries())
     return tuple(imported)
-
-
-def default_tool_registry(
-    *, workspace_root: str | Path | None = None,
-) -> ToolRegistry:
-    registry = ToolRegistry(workspace_root=workspace_root)
-    discover_builtin_tools(registry)
-    return registry
 
 
 def get_tool_definitions(
     request: ToolsetRequest,
     registry: ToolRegistry,
     resolver: ToolsetResolver | None = None,
+    *, availability: ToolAvailabilityContext,
 ) -> tuple[dict[str, Any], ...]:
-    definitions, _, _, _ = load_tools(request, registry, resolver)
-    return definitions
+    _, schema_bytes = load_tools(request, registry, resolver, availability=availability)
+    return tuple(json.loads(schema_bytes))
 
 
 def load_tools(
     request: ToolsetRequest,
     registry: ToolRegistry,
     resolver: ToolsetResolver | None = None,
-) -> tuple[
-    tuple[dict[str, Any], ...],
-    frozenset[str],
-    Mapping[str, ToolEntry[Any]],
-    bytes,
-]:
+    *, availability: ToolAvailabilityContext,
+) -> tuple[Mapping[str, ToolEntry[Any]], bytes]:
     """Load definitions and matching entries from one registry generation."""
-    _, entries = registry.snapshot()
+    entries = registry.entries()
     selected_names = (resolver or DefaultToolsetResolver()).resolve(request, entries)
     entries_by_name = {entry.name: entry for entry in entries}
     check_results: dict[object, bool] = {}
@@ -71,10 +69,12 @@ def load_tools(
             continue
         if not entry.required_permissions.issubset(request.permissions):
             continue
+        if any(not getattr(availability.capabilities, name) for name in entry.required_capabilities):
+            continue
         if entry.check_fn is not None:
             if entry.check_fn not in check_results:
                 try:
-                    check_results[entry.check_fn] = bool(entry.check_fn())
+                    check_results[entry.check_fn] = bool(entry.check_fn(availability))
                 except Exception as exc:
                     check_results[entry.check_fn] = False
                     logger.warning(
@@ -91,15 +91,10 @@ def load_tools(
         definitions, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     selected_entries = MappingProxyType({entry.name: entry for entry in selected})
-    return (
-        definitions,
-        frozenset(selected_entries),
-        selected_entries,
-        schema_bytes,
-    )
+    return selected_entries, schema_bytes
 
 
 __all__ = [
-    "default_tool_registry", "discover_builtin_tools", "get_tool_definitions",
+    "discover_builtin_tools", "get_tool_definitions",
     "load_tools",
 ]

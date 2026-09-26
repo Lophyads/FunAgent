@@ -84,6 +84,7 @@ class LeaseHeartbeatService:
         self._commands: queue.Queue[tuple[str, object]] = queue.Queue()
         self._entries: dict[tuple[str, str, int], _HeartbeatEntry] = {}
         self._closed = threading.Event()
+        self._wake = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="agentcore-lease-heartbeat", daemon=True
         )
@@ -97,26 +98,27 @@ class LeaseHeartbeatService:
         if self._closed.is_set():
             raise RuntimeError("lease heartbeat service is closed")
         self._commands.put(("register", (lease, lost_event)))
+        self._wake.set()
 
     def unregister(self, lease: LeaseHandle) -> None:
         self._commands.put(("unregister", self._key(lease)))
+        self._wake.set()
 
     def close(self, timeout: float) -> bool:
-        if self._closed.is_set():
-            return not self._thread.is_alive()
-        self._closed.set()
-        self._commands.put(("stop", None))
+        if not self._closed.is_set():
+            self._closed.set()
+            self._commands.put(("stop", None))
+            self._wake.set()
         self._thread.join(max(0.0, timeout))
         return not self._thread.is_alive()
 
     def _run(self) -> None:
         while not self._closed.is_set():
+            self._wake.clear()
             self._drain_commands()
             now = time.monotonic()
-            next_wait = 0.25
             for key, entry in tuple(self._entries.items()):
                 if entry.next_renewal > now:
-                    next_wait = min(next_wait, entry.next_renewal - now)
                     continue
                 try:
                     renewed = self._store.renew(entry.lease, self._ttl)
@@ -130,14 +132,19 @@ class LeaseHeartbeatService:
                             pass
                 else:
                     entry.lease = renewed
-                    entry.next_renewal = now + self._interval
+                    entry.next_renewal = time.monotonic() + self._interval
                     if self._on_renewed is not None:
                         try:
                             self._on_renewed(renewed)
                         except BaseException:
                             pass
-            self._closed.wait(max(0.01, next_wait))
+            next_renewal = min(
+                (entry.next_renewal for entry in self._entries.values()),
+                default=time.monotonic() + 0.25,
+            )
+            self._wake.wait(max(0, next_renewal - time.monotonic()))
         self._drain_commands()
+        self._entries.clear()
 
     def _drain_commands(self) -> None:
         while True:

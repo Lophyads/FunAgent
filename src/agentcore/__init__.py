@@ -1,10 +1,12 @@
+"""Public API. Execution layers are loaded lazily to keep leaf modules independent."""
+
+from importlib import import_module
+
 from .config import load_config
-from gateway.delivery import DeliveryAdapter, DeliveryBatch, DeliveryRuntime
-from gateway.gateway import GatewayRuntime
 from log.logging_system import LoggingHandle, configure_logging
-from .core import AgentCore, TurnQueueFullError, WorkerQueueFullError
 from .interfaces import (
     AllowAllGuard,
+    HostCapabilities, TurnHostContext, HumanApprovalRequired,
     ApprovalDecision,
     Approver,
     CancellationToken,
@@ -20,6 +22,11 @@ from .interfaces import (
     ToolInvocation,
     TurnCancelled,
     TurnSnapshot,
+)
+from .interaction import (
+    InteractionBroker,
+    ApprovalPayload, ApprovalResponse, ClarifyPayload, ClarifyResponse, Question,
+    InteractionPort, InteractionRequest,
 )
 from .lease import (
     LeaseAcquireTimeout,
@@ -41,6 +48,7 @@ from .models import (
     RetryPolicy,
     SessionDefaults,
     TimeoutPolicy,
+    ToolServiceConfig,
     ToolCall,
     ToolOutcome,
     TurnError,
@@ -81,40 +89,27 @@ from .provider_runtime import (
     WireResponse,
     default_api_mode_registry,
 )
-from .session_context import (
-    SessionBuildRequest,
-    SessionContextFactory,
-    SessionContextResolution,
-    SessionRuntimeSnapshot,
-    SessionSnapshotConflict,
-)
 from .storage import LeaseLostError, SQLiteStore, StorageError
-from tools.registry import ToolEntry, ToolRegistry
-from tools.model_tools import default_tool_registry
+from tools.registry import ToolEntry, ToolExecutionPolicy, ToolRegistry
+from .approval import ApprovalGate, ApprovalGrantStore
+from tools.lifecycle import CleanupIssue, CleanupReport, SessionResourceKey, SessionResourcesBusyError
+from tools.config import ToolSystemConfig, WorkspaceConfig
+from tools.runtime import initialize_tool_system, get_tool_registry, get_tool_services, shutdown_tool_system
 from tools.toolsets import (
     DefaultToolsetResolver,
     ToolsetRequest,
     ToolsetResolver,
 )
-from .tool_execution import ToolExecution, ToolExecutor
-from .tool_round import ToolRoundRunner
-from .turn_phase import (
-    PhaseAction,
-    PhaseResult,
-    TurnPhase,
-)
-from .turn_state import (
-    AttemptState,
-    LoopState,
-    OperationTimeoutError,
-    RunBudgetExceeded,
-    TurnRuntime,
-)
 
 __all__ = [
+    "ApprovalGate", "ApprovalPayload", "ApprovalResponse", "ClarifyPayload", "ClarifyResponse",
+    "Question", "CleanupIssue", "CleanupReport", "SessionResourceKey", "SessionResourcesBusyError",
+    "ApprovalGrantStore", "InteractionBroker",
+    "InteractionPort", "InteractionRequest", "ToolExecutionPolicy",
+    "ToolServices",
     "AgentConfig", "AgentCore", "AgentEvent", "AllowAllGuard",
     "ApiModeAdapter", "ApiModeRegistry", "ApprovalDecision", "Approver",
-    "AttemptContext", "AttemptState", "CancellationToken",
+    "AttemptContext", "CancellationToken",
     "CanonicalModelRequest", "ChatCompletionsAdapter",
     "DefaultToolsetResolver", "DeliveryAdapter", "DeliveryBatch",
     "DeliveryRuntime", "EnvironmentCredentialResolver", "GatewayRuntime",
@@ -135,11 +130,50 @@ __all__ = [
     "StaticSystemPromptBuilder", "StorageError", "SystemPromptBuilder",
     "SystemPromptSnapshot", "TimeoutPolicy", "ToolCall", "ToolEntry",
     "ToolContext", "ToolGuard", "ToolInvocation", "ToolOutcome",
+    "ToolServiceConfig",
     "ToolExecution", "ToolExecutor", "ToolRegistry", "ToolRoundRunner",
     "ToolsetRequest", "ToolsetResolver", "Transport",
     "TurnCancelled", "TurnError", "TurnLeaseStore",
     "TurnPhase", "TurnQueueFullError", "TurnResult", "TurnRuntime",
     "TurnSnapshot", "TurnTrigger", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",
     "WorkerQueueFullError", "default_api_mode_registry",
-    "default_tool_registry", "load_config",
+    "load_config", "ToolSystemConfig", "WorkspaceConfig",
+    "initialize_tool_system", "get_tool_registry", "get_tool_services", "shutdown_tool_system",
+    "HostCapabilities", "TurnHostContext", "HumanApprovalRequired",
 ]
+
+
+_LAZY_EXPORTS = {
+    "DeliveryAdapter": "gateway.delivery",
+    "DeliveryBatch": "gateway.delivery",
+    "DeliveryRuntime": "gateway.delivery",
+    "GatewayRuntime": "gateway.gateway",
+    "AgentCore": ".core",
+    "TurnQueueFullError": ".workers",
+    "WorkerQueueFullError": ".workers",
+    "SessionBuildRequest": ".session_context",
+    "SessionContextFactory": ".session_context",
+    "SessionContextResolution": ".session_context",
+    "SessionRuntimeSnapshot": ".session_context",
+    "SessionSnapshotConflict": ".session_context",
+    "ToolServices": "tools.services",
+    "ToolExecution": ".tool_execution",
+    "ToolExecutor": ".tool_execution",
+    "ToolRoundRunner": ".tool_round",
+    "PhaseAction": ".turn_phase",
+    "PhaseResult": ".turn_phase",
+    "TurnPhase": ".turn_phase",
+    "LoopState": ".turn_state",
+    "OperationTimeoutError": ".turn_state",
+    "RunBudgetExceeded": ".turn_state",
+    "TurnRuntime": ".turn_state",
+}
+
+
+def __getattr__(name: str):
+    module = _LAZY_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value

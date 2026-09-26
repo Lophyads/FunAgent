@@ -12,6 +12,11 @@ TOOLSETS: dict[str, dict[str, tuple[str, ...]]] = {
         "tools": (
             "calculator", "current_time", "list_directory", "read_file",
             "search_files",
+            "web_search", "web_extract", "clarify",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images", "browser_console",
+            "computer_use",
         ),
         "includes": (),
     },

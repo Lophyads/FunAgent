@@ -1,6 +1,6 @@
 """Minimal custom tool example.
 
-Register tools before constructing AgentCore; the registry freezes at construction.
+Place this module in src/tools/greet_tool.py for automatic startup discovery.
 """
 
 from pydantic import BaseModel, Field
@@ -16,8 +16,7 @@ def greet(args: GreetArgs, context: ToolContext) -> dict[str, str]:
     return {"message": f"Hello, {args.name}!", "session_id": context.session_id}
 
 
-def build_registry() -> ToolRegistry:
-    registry = ToolRegistry()
+def register_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolEntry(
             tool_id="example.greet",
@@ -29,4 +28,3 @@ def build_registry() -> ToolRegistry:
             side_effects="none",
         )
     )
-    return registry

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from .interaction import InteractionPort
+    from .runtime_cwd import ResolvedWorkspace
+    from tools.context import ToolInteractions, ToolResources
 
 from .models import MemoryItem, TurnResult, UserInput
 
@@ -46,6 +51,29 @@ class GuardDecision:
 class ApprovalDecision:
     approved: bool
     reason: str = ""
+    scope: Literal["once", "session", "always"] = "once"
+
+
+@dataclass(frozen=True, slots=True)
+class HumanApprovalRequired:
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class HostCapabilities:
+    clarify: bool = False
+    approval: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TurnHostContext:
+    capabilities: HostCapabilities = HostCapabilities()
+    interaction_port: InteractionPort | None = None
+
+    def __post_init__(self) -> None:
+        interactive = self.capabilities.clarify or self.capabilities.approval
+        if interactive and self.interaction_port is None:
+            raise ValueError("interactive capabilities require an InteractionPort")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +81,11 @@ class ToolContext:
     session_id: str
     turn_id: str
     tool_call_id: str
-    cancellation: CancellationToken | None = None
+    workspace: ResolvedWorkspace
+    interactions: ToolInteractions
+    resources: ToolResources
+    cancellation: CancellationToken
+    check_active: Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +96,7 @@ class ToolInvocation:
     tool_name: str
     arguments: Mapping[str, Any]
     requires_approval: bool
+    approval_scopes: tuple[str, ...] = ()
 
 
 class ToolGuard(Protocol):
@@ -71,7 +104,7 @@ class ToolGuard(Protocol):
 
 
 class Approver(Protocol):
-    def approve(self, invocation: ToolInvocation) -> ApprovalDecision: ...
+    def approve(self, invocation: ToolInvocation) -> ApprovalDecision | HumanApprovalRequired: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +134,7 @@ class AllowAllGuard:
 
 
 __all__ = [
+    "HostCapabilities", "TurnHostContext", "HumanApprovalRequired",
     "AllowAllGuard",
     "ApprovalDecision",
     "Approver",

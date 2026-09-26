@@ -70,32 +70,36 @@ def test_dotenv_does_not_override_existing_environment(tmp_path, monkeypatch):
 
 
 def test_cli_chat_can_be_exercised_without_a_real_provider(tmp_path, monkeypatch, capsys):
+    from concurrent.futures import Future
+    from tools.lifecycle import CleanupReport
+
     config_path = tmp_path / "agentcore.toml"
     _write_config(config_path)
 
-    class FakeAgent:
-        def __init__(self, config):
+    class FakeGateway:
+        def __init__(self, config, **kwargs):
             self.config = config
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
+        def start_blocking(self):
+            pass
+        def close_blocking(self, **kwargs):
+            return CleanupReport()
+        def attach_session(self, session_id):
             return None
-        def run_turn_blocking(self, text, *, session_id):
-            return SimpleNamespace(
+        def submit_turn(self, text, session_id):
+            future = Future()
+            future.set_result(SimpleNamespace(
                 warnings=[], final_text="CLI answer", status="completed", error=None,
-            )
+            ))
+            return SimpleNamespace(future=future)
 
-    monkeypatch.setattr("agentcore.cli.AgentCore", FakeAgent)
+    monkeypatch.setattr("agentcore.cli.GatewayRuntime", FakeGateway)
     lines = iter(["hello from cli", "/exit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
-
     code = run_cli(["chat", "--config", str(config_path), "--session", "cli-session"])
-
     captured = capsys.readouterr()
     assert code == 0
     assert "session: cli-session" in captured.out
     assert "assistant> CLI answer" in captured.out
-
 
 def test_config_rejects_legacy_api_key_env(tmp_path):
     config_path = tmp_path / "agentcore.toml"

@@ -1,0 +1,34 @@
+"""Isolated one-shot DDGS search worker; invoked only by web_search."""
+
+from __future__ import annotations
+
+import json
+import sys
+
+
+def main() -> int:
+    try:
+        from ddgs import DDGS
+
+        request = json.load(sys.stdin)
+        results = list(DDGS().text(
+            request["query"], max_results=request["limit"]
+        ))
+        sanitized = [
+            {
+                "position": index + 1,
+                "title": str(item.get("title", ""))[:500],
+                "url": str(item.get("href") or item.get("url") or "")[:2048],
+                "description": str(item.get("body") or item.get("description") or "")[:1500],
+            }
+            for index, item in enumerate(results[:request["limit"]])
+        ]
+        json.dump({"results": sanitized}, sys.stdout, ensure_ascii=False)
+        return 0
+    except BaseException as exc:
+        json.dump({"error": type(exc).__name__}, sys.stdout)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

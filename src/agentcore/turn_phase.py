@@ -14,7 +14,7 @@ from openai import APIError
 from pydantic import ValidationError
 
 from .interfaces import (
-    Approver, CancellationToken, MemoryUpdater, ReviewScheduler, ToolGuard,
+    TurnHostContext, CancellationToken, MemoryUpdater, ReviewScheduler, ToolGuard,
     TurnCancelled, TurnSnapshot,
 )
 from .lease import LeaseAcquireTimeout, LeaseHeartbeatService, TurnLeaseStore
@@ -29,11 +29,12 @@ from .session_context import (
     RecoverySessionMissing, SessionBuildRequest, SessionContextFactory,
     SessionSnapshotConflict,
 )
+from .runtime_cwd import SessionWorkspaceConflict, WorkspaceValidationError
 from .storage import LeaseLostError, SQLiteStore, StorageError
 from .tool_execution import ToolExecutor
 from .tool_round import ToolRoundRunner
 from .turn_state import (
-    AttemptState, LoopState, OperationTimeoutError, RunBudgetExceeded,
+    LoopState, RunBudgetExceeded,
     TurnRuntime,
 )
 
@@ -190,7 +191,7 @@ class TurnPhases:
         session_contexts: SessionContextFactory, lease_store: TurnLeaseStore,
         heartbeat: LeaseHeartbeatService, provider_resolver: ProviderResolver,
         api_modes: ApiModeRegistry, route_states: tuple[RouteState, ...],
-        guard: ToolGuard, approver: Approver | None,
+        guard: ToolGuard, host_context: TurnHostContext,
         memory_updater: MemoryUpdater, review_scheduler: ReviewScheduler,
         observability: Any, call_operation: Any,
         recovery: bool = False, delivery_destination: str | None = None,
@@ -210,8 +211,7 @@ class TurnPhases:
         self.provider_resolver = provider_resolver
         self.api_modes = api_modes
         self.route_states = route_states
-        self.guard = guard
-        self.approver = approver
+        self.host_context = host_context
         self.memory_updater = memory_updater
         self.review_scheduler = review_scheduler
         self.observability = observability
@@ -219,19 +219,20 @@ class TurnPhases:
         self.recovery = recovery
         self.delivery_destination = delivery_destination
         self.max_recovery_attempts = max_recovery_attempts
-        self.tool_executor = ToolExecutor(
-            config=config, store=store, guard=guard, approver=approver,
-        )
         self.tool_round_runner = ToolRoundRunner(
-            store=store, executor=self.tool_executor,
+            store=store,
+            executor=ToolExecutor(
+                config=config, store=store, guard=guard,
+                host_context=host_context, owner_id=owner_id,
+            ),
         )
 
-    def turn_started(self, state: LoopState) -> None:
+    def turn_started(self) -> None:
         logger.info('turn.started')
         if not self.recovery:
             logger.debug(
                 'turn.user_preview %s',
-                self.user_input.text[:80].replace('\r', ' ').replace('\n', ' '),
+                '[redacted]',
             )
 
     def turn_ended(self, state: LoopState) -> None:
@@ -333,6 +334,10 @@ class TurnPhases:
     ) -> PhaseResult:
         if isinstance(exc, SessionSnapshotConflict):
             self._set_error(state, "failed", "session_snapshot_conflict", exc, False)
+        elif isinstance(exc, SessionWorkspaceConflict):
+            self._set_error(state, "failed", "session_workspace_conflict", exc, False)
+        elif isinstance(exc, WorkspaceValidationError):
+            self._set_error(state, "failed", "invalid_workspace", exc, False)
         elif isinstance(exc, LeaseAcquireTimeout):
             self._set_error(state, "failed", "lease_timeout", exc, True)
         elif isinstance(exc, LeaseLostError):
@@ -477,12 +482,12 @@ class TurnPhases:
             lease = state.require_lease('resolve_session_context')
             resolution = (
                 self.session_contexts.load_existing(
-                    state.session_id, lease
+                    state.session_id, lease, self.host_context,
                 )
                 if self.recovery else
                 self.session_contexts.create_or_load(
                     state.session_id, self.user_input, self.session_request,
-                    lease,
+                    lease, self.host_context,
                 )
             )
             state.context = resolution.snapshot
@@ -509,6 +514,7 @@ class TurnPhases:
             "resolve_session_context", resolve, validate,
             expected_errors=_INTERRUPTION_ERRORS + (
                 SessionSnapshotConflict, RecoverySessionMissing,
+                SessionWorkspaceConflict, WorkspaceValidationError,
             ),
             on_expected_error=self._expected_break,
         )
@@ -531,8 +537,6 @@ class TurnPhases:
                         state.session_id, message, fence=lease.fence
                     )
             state.submitted_message = message
-            if not self.recovery:
-                state.new_messages.append(message)
             state.admitted = True
             logger.info('turn.admitted')
             state.warnings.extend(runtime.observability.publish(
@@ -584,7 +588,7 @@ class TurnPhases:
                 'assemble_request',
                 state.iteration,
                 len(state.request.messages),
-                len(context.tools),
+                len(context.entries_by_name),
             )
             return PhaseResult()
 
@@ -631,12 +635,15 @@ class TurnPhases:
 
         def validate(state: LoopState, result: PhaseResult) -> None:
             response = state.require_response('tool_round')
-            wanted = {call.id for call in response.tool_calls}
-            actual = {
-                message.tool_call_id for message in state.new_messages
-                if message.role == "tool"
-            }
-            if not wanted.issubset(actual):
+            round_messages = state.messages[-(len(response.tool_calls) + 1):]
+            if (
+                len(round_messages) != len(response.tool_calls) + 1
+                or round_messages[0] is not state.assistant_message
+                or [
+                    message.tool_call_id if message.role == "tool" else None
+                    for message in round_messages[1:]
+                ] != [call.id for call in response.tool_calls]
+            ):
                 raise RuntimeError("tool round left unresolved tool calls")
 
         return FunctionPhase(
@@ -675,7 +682,6 @@ class TurnPhases:
             state.assistant_message = assistant
             state.final_text = text
             state.messages.append(assistant)
-            state.new_messages.append(assistant)
             state.finalized = True
             return PhaseResult(PhaseAction.BREAK)
 
@@ -717,12 +723,6 @@ class TurnPhases:
                 if cooldown > 0:
                     self._wait(runtime, state, cooldown)
                 attempt_id = str(uuid.uuid4())
-                state.attempt = AttemptState(
-                    attempt_id=attempt_id, route_index=route_index,
-                    route_name=route.name, attempt_number=attempt_number,
-                    request_fingerprint=request.fingerprint,
-                    started_at=time.time(),
-                )
                 state.provider_attempts += 1
                 state.route_attempts[route.name] = (
                     state.route_attempts.get(route.name, 0) + 1
@@ -803,7 +803,6 @@ class TurnPhases:
                     ):
                         raise
                     error = adapter.normalize_error(exc)
-                    state.attempt.provider_error = error
                     failure_payload = {
                         "route": route.name, "attempt": attempt_number,
                         "error_type": error.error_type,
@@ -882,12 +881,7 @@ class TurnPhases:
                 else:
                     route_state.clear()
                     response_content = normalized.content
-                    response_content_preview = (
-                        None if response_content is None else
-                        response_content[:1000]
-                        .replace('\r', '\\r')
-                        .replace('\n', '\\n')
-                    )
+                    response_content_preview = None
                     response_payload = {
                         "route": route.name,
                         "tool_call_count": len(normalized.tool_calls),
@@ -1027,7 +1021,6 @@ class TurnPhases:
         )
         state.warnings.extend(recovery.warnings)
         state.messages.extend(recovery.messages)
-        state.new_messages.extend(recovery.messages)
         for message in recovery.messages:
             side_effects = (
                 "none" if message.effect_disposition == "none" else "possible"
@@ -1175,7 +1168,7 @@ class TurnPhases:
         return TurnResult(
             status=state.status, final_text=state.final_text,
             session_id=state.session_id, turn_id=state.turn_id,
-            new_messages=state.new_messages, iterations=state.iteration,
+            iterations=state.iteration,
             route_used=state.route_used, usage=state.usage,
             warnings=state.warnings, error=state.error,
             completion_reason=state.completion_reason,
@@ -1242,7 +1235,7 @@ class TurnPhases:
 
     @staticmethod
     def _provider_request_message_details(
-        body: Mapping[str, Any], *, preview_chars: int = 500,
+        body: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         messages = body.get("messages")
         if not isinstance(messages, list):
@@ -1263,22 +1256,14 @@ class TurnPhases:
             content = message.get("content")
             if isinstance(content, str):
                 content_length: int | None = len(content)
-                content_preview: str | None = (
-                    content[:preview_chars]
-                    .replace('\r', '\\r')
-                    .replace('\n', '\\n')
-                )
+                content_preview: str | None = None
             elif content is None:
                 content_length = 0
                 content_preview = None
             else:
                 rendered = repr(content)
                 content_length = len(rendered)
-                content_preview = (
-                    rendered[:preview_chars]
-                    .replace('\r', '\\r')
-                    .replace('\n', '\\n')
-                )
+                content_preview = None
             raw_tool_calls = message.get("tool_calls")
             tool_calls = (
                 raw_tool_calls if isinstance(raw_tool_calls, list) else []

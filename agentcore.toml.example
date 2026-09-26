@@ -31,6 +31,19 @@ ttl_seconds = 30.0
 renew_interval_seconds = 10.0
 wait_timeout_seconds = 300.0
 
+[tools]
+allow_private_web_addresses = false
+allow_private_browser_addresses = false
+artifact_max_bytes = 2000000
+search_timeout_seconds = 30.0
+browser_idle_seconds = 900.0
+clarify_timeout_seconds = 3600.0
+approval_timeout_seconds = 300.0
+
+# Permanent approval scopes are written here only after explicit human approval.
+# [approvals]
+# always = ["cua:type:background"]
+
 
 [logging]
 enabled = true
@@ -63,3 +76,8 @@ enabled_skills = []
 enabled_toolsets = ["default"]
 disabled_toolsets = []
 permissions = []
+
+# Paths are relative to this config file; no process-wide chdir is used.
+[workspace]
+default_cwd = "."
+allowed_root = "."

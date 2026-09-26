@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import time
 import sqlite3
+import threading
 
 from agentcore import (
     GatewayRuntime, LeasePolicy, Message, NormalizedModelResponse,
@@ -61,6 +62,7 @@ def test_failed_delivery_replays_without_calling_model(
     replay_transport = ScriptedTransport()
     replay_adapter = RecordingAdapter(True)
     with _gateway(config, replay_adapter, replay_transport) as gateway:
+        gateway.delivery.submit_drain().result(timeout=3)
         assert gateway.agent._store.list_pending_deliveries() == []
         assert gateway.agent._store.list_pending_recoveries(3) == []
 
@@ -69,7 +71,7 @@ def test_failed_delivery_replays_without_calling_model(
     assert adapter.sent[0] == replay_adapter.sent[0]
 
 
-def test_startup_converts_crashed_turn_to_internal_recovery(
+def test_attach_converts_crashed_turn_to_internal_recovery(
     config_factory, agent_factory, final_response,
 ):
     config = config_factory()
@@ -95,14 +97,13 @@ def test_startup_converts_crashed_turn_to_internal_recovery(
         NormalizedModelResponse(content="continued", finish_reason="stop")
     )
     with _gateway(config, adapter, transport) as gateway:
-        recovered = gateway.wait_for_recovery()
+        recovered = gateway.attach_session("recover").future.result(timeout=3)
         gateway.delivery.drain()
         lifecycle = gateway.agent._store.get_session_recovery("recover")
         messages = gateway.agent._store.load_messages("recover")
 
-    assert len(recovered) == 1
-    assert recovered[0].status == "completed"
-    assert recovered[0].completion_reason == "model_final"
+    assert recovered.status == "completed"
+    assert recovered.completion_reason == "model_final"
     assert len(transport.requests) == 1
     assert lifecycle["resume_pending"] == 0
     assert sum(message.content == "second" for message in messages) == 1
@@ -110,9 +111,7 @@ def test_startup_converts_crashed_turn_to_internal_recovery(
     assert any(text == "continued" for _, text in adapter.sent)
 
 
-
-
-def test_startup_repair_marks_running_tool_unknown_without_replay(
+def test_attach_repairs_running_tool_without_replay(
     config_factory, agent_factory, final_response,
 ):
     config = config_factory()
@@ -144,7 +143,7 @@ def test_startup_repair_marks_running_tool_unknown_without_replay(
         NormalizedModelResponse(content="continued", finish_reason="stop")
     )
     with _gateway(config, RecordingAdapter(True), transport) as gateway:
-        assert gateway.wait_for_recovery()[0].status == "completed"
+        assert gateway.attach_session("tool-recover").future.result(timeout=3).status == "completed"
         messages = gateway.agent._store.load_messages("tool-recover")
 
     assert len(transport.requests) == 1
@@ -156,7 +155,6 @@ def test_startup_repair_marks_running_tool_unknown_without_replay(
         message.role == "tool" and message.tool_call_id == "uncertain"
         for message in messages
     ) == 1
-
 
 
 def test_failed_recovery_suspends_after_attempt_limit(
@@ -184,7 +182,7 @@ def test_failed_recovery_suspends_after_attempt_limit(
             NormalizedProviderError("bad request", status_code=400)
         ), max_recovery_attempts=1,
     ) as gateway:
-        result = gateway.wait_for_recovery()[0]
+        result = gateway.attach_session("suspend").future.result(timeout=3)
         lifecycle = gateway.agent._store.get_session_recovery("suspend")
 
     assert result.status == "failed"
@@ -199,7 +197,7 @@ def test_failed_recovery_suspends_after_attempt_limit(
         config, RecordingAdapter(), user_transport,
         max_recovery_attempts=1,
     ) as gateway:
-        assert gateway.wait_for_recovery() == []
+        assert gateway.attach_session("suspend") is None
         assert not user_transport.requests
         user_result = gateway.run_turn_blocking(
             "please continue", session_id="suspend"
@@ -209,7 +207,6 @@ def test_failed_recovery_suspends_after_attempt_limit(
     assert lifecycle["resume_pending"] == 0
     assert lifecycle["resume_suspended"] == 0
     assert len(user_transport.requests) == 1
-
 
 
 def test_nested_observability_payload_redacts_secrets():
@@ -236,7 +233,6 @@ def test_nested_observability_payload_redacts_secrets():
         events[0].payload["nested"]["safe"] = "modified"
 
 
-
 def test_reserved_recovery_lane_precedes_user_without_using_worker():
     dispatcher = TurnDispatcher(max_workers=1, capacity=3)
     order = []
@@ -258,7 +254,6 @@ def test_reserved_recovery_lane_precedes_user_without_using_worker():
         assert order == ["other", "recovery", "user"]
     finally:
         dispatcher.close(timeout=2)
-
 
 
 def test_quick_restart_recovers_after_stale_lease_expires(
@@ -287,24 +282,29 @@ def test_quick_restart_recovers_after_stale_lease_expires(
     )
     store.close()
 
-    transport = ScriptedTransport(
-        NormalizedModelResponse(content="resumed", finish_reason="stop")
-    )
-    with _gateway(config, RecordingAdapter(True), transport) as gateway:
-        assert gateway.wait_for_recovery() == []
-        deadline = time.monotonic() + 3
-        while not gateway._recovery_submissions and time.monotonic() < deadline:
-            time.sleep(0.05)
-        results = gateway.wait_for_recovery()
-        lifecycle = gateway.agent._store.get_session_recovery(
-            "quick-restart"
-        )
+    entered, release = threading.Event(), threading.Event()
 
-    assert len(results) == 1
-    assert results[0].status == "completed"
+    def resume(request):
+        entered.set()
+        assert release.wait(3)
+        return NormalizedModelResponse(content="resumed", finish_reason="stop")
+
+    transport = ScriptedTransport(resume)
+    try:
+        with _gateway(
+            config, RecordingAdapter(True), transport,
+            recovery_policy="owned", owns_database=True,
+        ) as gateway:
+            assert entered.wait(3)
+            recovery = gateway.attach_session("quick-restart")
+            release.set()
+            assert recovery.future.result(timeout=3).status == "completed"
+            lifecycle = gateway.agent._store.get_session_recovery("quick-restart")
+    finally:
+        release.set()
+
     assert lifecycle["resume_pending"] == 0
     assert len(transport.requests) == 1
-
 
 
 def test_normal_shutdown_leaves_no_pending_recovery(config_factory, final_response):

@@ -1,7 +1,6 @@
 """Tool registration, discovery, selection, and execution metadata."""
 
 from .model_tools import (
-    default_tool_registry,
     discover_builtin_tools,
     get_tool_definitions,
     load_tools,
@@ -11,6 +10,6 @@ from .toolsets import DefaultToolsetResolver, ToolsetRequest, ToolsetResolver
 
 __all__ = [
     "DefaultToolsetResolver", "ToolEntry", "ToolRegistry", "ToolsetRequest",
-    "ToolsetResolver", "default_tool_registry", "discover_builtin_tools",
+    "ToolsetResolver", "discover_builtin_tools",
     "get_tool_definitions", "load_tools",
 ]

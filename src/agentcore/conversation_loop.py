@@ -6,7 +6,7 @@ from typing import Any
 
 from log.logging_system import log_context
 
-from .interfaces import Approver, MemoryUpdater, ReviewScheduler, ToolGuard
+from .interfaces import TurnHostContext, MemoryUpdater, ReviewScheduler, ToolGuard
 from .lease import LeaseHeartbeatService, TurnLeaseStore
 from .models import AgentConfig, TurnResult, UserInput
 from .provider_runtime import ApiModeRegistry, ProviderResolver
@@ -27,7 +27,7 @@ class ConversationLoop:
         session_contexts: SessionContextFactory, lease_store: TurnLeaseStore,
         heartbeat: LeaseHeartbeatService, provider_resolver: ProviderResolver,
         api_modes: ApiModeRegistry, route_states: tuple[RouteState, ...],
-        guard: ToolGuard, approver: Approver | None,
+        guard: ToolGuard, host_context: TurnHostContext,
         memory_updater: MemoryUpdater, review_scheduler: ReviewScheduler,
         observability: Any, call_operation: Any,
         recovery: bool = False, delivery_destination: str | None = None,
@@ -40,7 +40,7 @@ class ConversationLoop:
             store=store, session_contexts=session_contexts,
             lease_store=lease_store, heartbeat=heartbeat,
             provider_resolver=provider_resolver, api_modes=api_modes,
-            route_states=route_states, guard=guard, approver=approver,
+            route_states=route_states, guard=guard, host_context=host_context,
             memory_updater=memory_updater,
             review_scheduler=review_scheduler, observability=observability,
             call_operation=call_operation, recovery=recovery,
@@ -66,7 +66,7 @@ class ConversationLoop:
                 call_operation=phases.call_operation,
             )
             try:
-                phases.turn_started(state)
+                phases.turn_started()
                 for phase in phases.setup_phases():
                     action = run_phase(phase, runtime, state).action
                     if action is PhaseAction.BREAK:

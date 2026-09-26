@@ -149,6 +149,9 @@ def test_turn_result_enforces_terminal_error_and_attempt_contracts():
             status="failed", error=TurnError(code="bad", message="bad"),
             **{**base, "provider_attempts": 2},
         )
+    assert "new_messages" not in TurnResult.model_fields
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        TurnResult(status="completed", new_messages=[], **base)
 
 
 def test_canonical_request_fingerprint_is_stable():
@@ -172,7 +175,8 @@ def test_tool_registry_freezes_and_uses_versioned_identity():
         handler=lambda args, context: args.text,
     ))
     registry.freeze()
-    assert registry.get_versioned("echo", "1") is registry.get_entry("echo")
+    entry = registry.get_entry("echo")
+    assert (entry.tool_id, entry.implementation_version) == ("echo", "1")
     with pytest.raises(RuntimeError, match="frozen"):
         registry.register(ToolEntry(
             tool_id="late", implementation_version="1", name="late",

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tools.runtime import get_tool_registry
 
 import sqlite3
 import time
@@ -132,7 +133,7 @@ def test_existing_session_uses_new_toolset_but_original_prompt(
     )
     with agent_factory(config, transports={"primary": transport}) as agent:
         assert agent.run_turn_blocking("one", session_id="same").status == "completed"
-        agent.update_tools((ToolEntry(
+        get_tool_registry().replace_all((ToolEntry(
             tool_id="echo", implementation_version="2", name="echo",
             description="Echo text", args_model=EchoArgs,
             handler=lambda args, context: args.text, side_effects="none",

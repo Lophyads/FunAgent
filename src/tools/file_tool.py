@@ -48,8 +48,10 @@ class PatchFileArgs(BaseModel):
     expected_sha256: str | None = Field(default=None, min_length=64, max_length=64)
 
 
-def _resolve(root: Path, raw_path: str) -> Path:
-    candidate = (root / raw_path).resolve()
+def _resolve(context: ToolContext, raw_path: str) -> Path:
+    context.check_active()
+    root = context.workspace.allowed_root
+    candidate = (context.workspace.cwd / raw_path).resolve()
     if not candidate.is_relative_to(root):
         raise ValueError("path is outside the workspace")
     relative = candidate.relative_to(root)
@@ -89,114 +91,132 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def register_tools(registry: ToolRegistry) -> None:
-    root = registry.workspace_root
-    workspace_available = lambda: root.is_dir()
+def list_directory(args: ListDirectoryArgs, context: ToolContext) -> dict:
+    context.check_active()
+    root = context.workspace.allowed_root
+    path = _resolve(context, args.path)
+    if not path.is_dir():
+        raise ValueError("path is not a directory")
+    entries = []
+    for child in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
+        if child.name in _IGNORED_NAMES:
+            continue
+        entries.append({
+            "name": child.name,
+            "type": "directory" if child.is_dir() else "file",
+        })
+        if len(entries) >= args.max_entries:
+            break
+    return {"path": os.path.relpath(path, context.workspace.cwd), "entries": entries}
 
-    def list_directory(args: ListDirectoryArgs, context: ToolContext) -> dict:
-        path = _resolve(root, args.path)
-        if not path.is_dir():
-            raise ValueError("path is not a directory")
-        entries = []
-        for child in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
-            if child.name in _IGNORED_NAMES:
+
+def read_file(args: ReadFileArgs, context: ToolContext) -> dict:
+    context.check_active()
+    root = context.workspace.allowed_root
+    path = _resolve(context, args.path)
+    lines = _read_text(path).splitlines()
+    start = args.start_line - 1
+    selected = [
+        {"line": number, "text": line[:1000]}
+        for number, line in enumerate(
+            lines[start:start + args.max_lines], start=args.start_line
+        )
+    ]
+    return {
+        "path": os.path.relpath(path, context.workspace.cwd),
+        "lines": selected,
+        "truncated": start + len(selected) < len(lines),
+    }
+
+
+def search_files(args: SearchFilesArgs, context: ToolContext) -> dict:
+    context.check_active()
+    root = context.workspace.allowed_root
+    base = _resolve(context, args.path)
+    if not base.is_dir():
+        raise ValueError("path is not a directory")
+    matches: list[dict[str, object]] = []
+    scanned = 0
+    for path in sorted(base.rglob(args.glob)):
+        if any(part in _IGNORED_NAMES for part in path.relative_to(root).parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.stat().st_size > _MAX_TEXT_BYTES:
+            continue
+        scanned += 1
+        if scanned > 1_000:
+            return {"matches": matches, "truncated": True}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for number, line in enumerate(lines, start=1):
+            if args.query.casefold() not in line.casefold():
                 continue
-            entries.append({
-                "name": child.name,
-                "type": "directory" if child.is_dir() else "file",
+            matches.append({
+                "path": os.path.relpath(path, context.workspace.cwd),
+                "line": number,
+                "text": line[:300],
             })
-            if len(entries) >= args.max_entries:
-                break
-        return {"path": str(path.relative_to(root)), "entries": entries}
-
-    def read_file(args: ReadFileArgs, context: ToolContext) -> dict:
-        path = _resolve(root, args.path)
-        lines = _read_text(path).splitlines()
-        start = args.start_line - 1
-        selected = [
-            {"line": number, "text": line[:1000]}
-            for number, line in enumerate(
-                lines[start:start + args.max_lines], start=args.start_line
-            )
-        ]
-        return {
-            "path": str(path.relative_to(root)),
-            "lines": selected,
-            "truncated": start + len(selected) < len(lines),
-        }
-
-    def search_files(args: SearchFilesArgs, context: ToolContext) -> dict:
-        base = _resolve(root, args.path)
-        if not base.is_dir():
-            raise ValueError("path is not a directory")
-        matches: list[dict[str, object]] = []
-        scanned = 0
-        for path in sorted(base.rglob(args.glob)):
-            if any(part in _IGNORED_NAMES for part in path.relative_to(root).parts):
-                continue
-            if path.is_symlink() or not path.is_file():
-                continue
-            if path.stat().st_size > _MAX_TEXT_BYTES:
-                continue
-            scanned += 1
-            if scanned > 1_000:
+            if len(matches) >= args.max_results:
                 return {"matches": matches, "truncated": True}
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except (OSError, UnicodeError):
-                continue
-            for number, line in enumerate(lines, start=1):
-                if args.query.casefold() not in line.casefold():
-                    continue
-                matches.append({
-                    "path": str(path.relative_to(root)),
-                    "line": number,
-                    "text": line[:300],
-                })
-                if len(matches) >= args.max_results:
-                    return {"matches": matches, "truncated": True}
-        return {"matches": matches, "truncated": False}
+    return {"matches": matches, "truncated": False}
 
-    def write_file(args: WriteFileArgs, context: ToolContext) -> dict:
-        path = _resolve(root, args.path)
-        if path == root or path.is_symlink() or path.is_dir():
-            raise ValueError("path must be a workspace file")
-        if path.exists():
-            current = _read_text(path)
-            if args.expected_sha256 is None:
-                raise ValueError("expected_sha256 is required to replace an existing file")
-            if _sha256_text(current) != args.expected_sha256.lower():
-                raise ValueError("file changed since it was read")
-        elif args.expected_sha256 is not None:
-            raise ValueError("expected file does not exist")
-        _atomic_write(path, args.content)
-        return {
-            "path": str(path.relative_to(root)),
-            "bytes": len(args.content.encode("utf-8")),
-            "sha256": _sha256_text(args.content),
-        }
 
-    def patch_file(args: PatchFileArgs, context: ToolContext) -> dict:
-        path = _resolve(root, args.path)
+def write_file(args: WriteFileArgs, context: ToolContext) -> dict:
+    context.check_active()
+    root = context.workspace.allowed_root
+    path = _resolve(context, args.path)
+    if path == root or path.is_symlink() or path.is_dir():
+        raise ValueError("path must be a workspace file")
+    if path.exists():
         current = _read_text(path)
-        if (
-            args.expected_sha256 is not None
-            and _sha256_text(current) != args.expected_sha256.lower()
-        ):
+        if args.expected_sha256 is None:
+            raise ValueError("expected_sha256 is required to replace an existing file")
+        if _sha256_text(current) != args.expected_sha256.lower():
             raise ValueError("file changed since it was read")
-        occurrences = current.count(args.old_text)
-        if occurrences != 1:
-            raise ValueError(
-                f"old_text must occur exactly once; found {occurrences} occurrences"
-            )
-        updated = current.replace(args.old_text, args.new_text, 1)
-        _atomic_write(path, updated)
-        return {
-            "path": str(path.relative_to(root)),
-            "bytes": len(updated.encode("utf-8")),
-            "sha256": _sha256_text(updated),
-        }
+    elif args.expected_sha256 is not None:
+        raise ValueError("expected file does not exist")
+    context.check_active()
+    _atomic_write(path, args.content)
+    return {
+        "path": os.path.relpath(path, context.workspace.cwd),
+        "bytes": len(args.content.encode("utf-8")),
+        "sha256": _sha256_text(args.content),
+    }
 
+
+def patch_file(args: PatchFileArgs, context: ToolContext) -> dict:
+    context.check_active()
+    root = context.workspace.allowed_root
+    path = _resolve(context, args.path)
+    current = _read_text(path)
+    if (
+        args.expected_sha256 is not None
+        and _sha256_text(current) != args.expected_sha256.lower()
+    ):
+        raise ValueError("file changed since it was read")
+    occurrences = current.count(args.old_text)
+    if occurrences != 1:
+        raise ValueError(
+            f"old_text must occur exactly once; found {occurrences} occurrences"
+        )
+    updated = current.replace(args.old_text, args.new_text, 1)
+    context.check_active()
+    _atomic_write(path, updated)
+    return {
+        "path": os.path.relpath(path, context.workspace.cwd),
+        "bytes": len(updated.encode("utf-8")),
+        "sha256": _sha256_text(updated),
+    }
+
+
+def workspace_available(context) -> bool:
+    return context.workspace.cwd.is_dir()
+
+
+def register_tools(registry: ToolRegistry) -> None:
     read_entries = (
         ("list_directory", "List entries in a workspace directory.", ListDirectoryArgs, list_directory),
         ("read_file", "Read numbered UTF-8 lines from a workspace file.", ReadFileArgs, read_file),
