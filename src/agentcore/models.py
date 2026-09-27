@@ -226,6 +226,7 @@ class Message(StrictModel):
     api_content: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_effects: dict[str, Literal["none", "possible"]] | None = None
+    # Only persisted tool results need a database foreign key.
     reply_to_message_id: int | None = Field(default=None, ge=1)
     tool_call_id: str | None = None
     tool_name: str | None = None
@@ -285,7 +286,6 @@ class Message(StrictModel):
             self.tool_name is None,
             self.effect_disposition is None,
             self.tool_outcome_state is None,
-            self.reply_to_message_id is None,
         )):
             raise ValueError(
                 "tool result requires content, tool_call_id, tool_name, and effect_disposition"
@@ -333,7 +333,7 @@ class Message(StrictModel):
     def tool_result(
         cls, content: str, *, tool_call_id: str, tool_name: str,
         effect_disposition: Literal["none", "not_applied", "confirmed", "unknown"],
-        reply_to_message_id: int,
+        reply_to_message_id: int | None = None,
         tool_outcome_state: Literal["succeeded", "failed", "denied", "not_executed", "unknown"],
         tool_error_type: str | None = None,
         metadata: dict[str, Any] | None = None,

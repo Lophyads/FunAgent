@@ -20,7 +20,6 @@ from agentcore.interfaces import ApprovalDecision
 from agentcore.interaction import ApprovalPayload, InteractionBroker, InteractionUnavailable
 from agentcore.runtime_cwd import SessionWorkspaceConflict
 from tools.config import ToolSystemConfig, WorkspaceConfig
-from tools.context import ToolUse
 from tools.lifecycle import (
     ResourceUnavailableError, SessionResourceKey, SessionResourcesBusyError,
 )
@@ -66,7 +65,7 @@ def test_discovery_failure_leaves_no_partial_runtime(monkeypatch):
     monkeypatch.setattr(runtime, "discover_builtin_tools", fail)
     with pytest.raises(ValueError, match="broken test module"):
         initialize_tool_system(ToolSystemConfig())
-    assert runtime._state == "UNINITIALIZED"
+    assert runtime._state is runtime.ToolSystemState.UNINITIALIZED
     with pytest.raises(ToolSystemNotInitialized):
         get_tool_registry()
     monkeypatch.setattr(runtime, "discover_builtin_tools", original)
@@ -153,7 +152,10 @@ def test_workspace_conflict_and_reset_preserve_history(config_factory, tmp_path,
         services._providers["test"] = resource
         services._sessions[key].resources.add("test")
         with pytest.raises(SessionWorkspaceConflict):
-            services.begin_turn(key, "other", "new", two)
+            services.begin_execution(
+                namespace=key.namespace, profile=key.profile, task_id=key.session_id,
+                owner_id="other", turn_id="new", workspace_request=two,
+            )
         assert host.reset_session_resources("s1").completed
         assert resource.closed and not services.grants.allowed(key, "write")
         assert host.agent._store.load_messages("s1")
@@ -301,8 +303,11 @@ def test_cleanup_failure_reports_other_resources_and_retries(config_factory):
     configure_tools(config_factory())
     services = get_tool_services()
     key = SessionResourceKey("db", "profile", "s")
-    services.begin_turn(key, "owner", "turn")
-    services.end_turn("owner", "turn")
+    services.begin_execution(
+        namespace=key.namespace, profile=key.profile, task_id=key.session_id,
+        owner_id="owner", turn_id="turn",
+    )
+    services.end_execution("owner", "turn")
     calls = []
 
     class Resource:
@@ -322,7 +327,10 @@ def test_cleanup_failure_reports_other_resources_and_retries(config_factory):
     assert not report.completed and set(calls) == {"first", "second"}
     assert report.issues[0].error_code == "OSError" and "private" not in repr(report)
     with pytest.raises(ResourceUnavailableError):
-        services.begin_turn(key, "owner", "another")
+        services.begin_execution(
+            namespace=key.namespace, profile=key.profile, task_id=key.session_id,
+            owner_id="owner", turn_id="another",
+        )
     assert services.reset_session_resources(key).completed
     assert calls.count("first") == 2 and calls.count("second") == 1
 
@@ -392,7 +400,10 @@ def test_idle_reaping_skips_active_turn_and_preserves_grants(config_factory):
     configure_tools(config_factory())
     services = get_tool_services()
     key = SessionResourceKey("db", "profile", "idle")
-    workspace, _ = services.begin_turn(key, "owner", "turn")
+    workspace = services.begin_execution(
+        namespace=key.namespace, profile=key.profile, task_id=key.session_id,
+        owner_id="owner", turn_id="turn",
+    )
     calls = []
     class Resource:
         def close_session(self, key, *, deadline):
@@ -404,7 +415,7 @@ def test_idle_reaping_skips_active_turn_and_preserves_grants(config_factory):
     services.grants.grant(key, "write", "session")
     assert services.reap_idle(now=time.monotonic() + 2000).completed
     assert calls == []
-    services.end_turn("owner", "turn")
+    services.end_execution("owner", "turn")
     assert services.reap_idle(now=time.monotonic() + 2000).completed
     assert calls == [key]
     assert services.grants.allowed(key, "write")
@@ -555,7 +566,7 @@ def test_tools_doctor_and_logs_do_not_start_agent(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.gateway.GatewayRuntime", lambda *a, **kw: pytest.fail("doctor constructed Gateway"))
     assert run_cli(["tools", "doctor", "--config", str(config)]) == 0
     assert run_cli(["logs", "list", "--config", str(config)]) == 0
-    assert runtime._state == "UNINITIALIZED"
+    assert runtime._state is runtime.ToolSystemState.UNINITIALIZED
 
 
 def test_relative_workspace_config_uses_toml_directory(tmp_path):

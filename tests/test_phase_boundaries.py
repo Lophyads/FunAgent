@@ -13,6 +13,7 @@ from agentcore import (
     ToolExecutor,
 )
 from agentcore.conversation_loop import ConversationLoop
+from agentcore.lease import LeaseScope
 from agentcore.session_context import RecoverySessionMissing, SessionContextFactory
 from agentcore.turn_phase import (
     FunctionPhase, PhaseAction, PhaseResult, ProviderExhausted,
@@ -40,13 +41,7 @@ def test_turn_setup_phases_follow_their_responsibilities(
         result = agent.run_turn_blocking("hello", session_id="phase-order")
 
     assert result.status == "completed"
-    assert phases[:5] == [
-        "acquire_lease",
-        "recover_history",
-        "resolve_session_context",
-        "establish_turn",
-        "load_messages",
-    ]
+    assert phases[:2] == ["acquire_execution", "prepare_conversation"]
     assert "admission" not in phases
 
 
@@ -104,7 +99,7 @@ def test_phase_actions_and_missing_prerequisites_are_explicit():
         assert not hasattr(PhaseAction, removed)
 
     state = LoopState("session", "turn", "trace")
-    for name in ("lease", "context", "request", "response"):
+    for name in ("context", "request", "response"):
         with pytest.raises(RuntimeError, match=f"sample_phase requires {name}"):
             getattr(state, f"require_{name}")("sample_phase")
 
@@ -138,7 +133,7 @@ def test_tool_round_validation_ignores_matching_ids_in_older_history():
     phase.validate_postconditions(state, verdict)
 
 
-def test_missing_tool_lease_fails_before_operation_submission():
+def test_lost_execution_ownership_fails_before_operation_submission():
     executor = object.__new__(ToolExecutor)
     state = LoopState("session", "turn", "trace")
     state.context = object()
@@ -148,12 +143,14 @@ def test_missing_tool_lease_fails_before_operation_submission():
         submitted.append(True)
         raise AssertionError("operation must not be submitted")
 
-    runtime = SimpleNamespace(call_operation=submit)
-    with pytest.raises(RuntimeError, match="execute_tool requires lease"):
+    def check_active():
+        raise LeaseLostError("execution ownership was lost")
+
+    runtime = SimpleNamespace(call_operation=submit, check_active=check_active)
+    with pytest.raises(LeaseLostError, match="execution ownership was lost"):
         executor.execute(
             runtime, state,
             ToolCall(id="call", name="example", arguments="{}"),
-            parent_message_id=1,
         )
     assert not submitted
 
@@ -161,7 +158,7 @@ def test_missing_tool_lease_fails_before_operation_submission():
 def test_missing_request_and_response_fail_in_their_phases():
     loop = object.__new__(TurnPhases)
     state = LoopState("session", "turn", "trace")
-    runtime = SimpleNamespace(check_active=lambda state: None)
+    runtime = SimpleNamespace(check_active=lambda: None)
     with pytest.raises(RuntimeError, match="provider_attempts requires request"):
         loop._run_provider_attempts(None, state)
     with pytest.raises(RuntimeError, match="assemble_request requires context"):
@@ -169,9 +166,6 @@ def test_missing_request_and_response_fail_in_their_phases():
     with pytest.raises(RuntimeError, match="tool_round requires response"):
         loop._tool_round_phase()(runtime, state)
     with pytest.raises(RuntimeError, match="finish_text requires response"):
-        loop._finish_text_phase()(runtime, state)
-    state.response = NormalizedModelResponse(content="done", finish_reason="stop")
-    with pytest.raises(RuntimeError, match="finish_text requires lease"):
         loop._finish_text_phase()(runtime, state)
 
 
@@ -283,9 +277,9 @@ def test_admission_break_requires_structured_terminal_state(
     config_factory, agent_factory, final_response, monkeypatch,
 ):
     monkeypatch.setattr(
-        TurnPhases, "_acquire_lease_phase",
+        TurnPhases, "_acquire_execution_phase",
         lambda self: FunctionPhase(
-            "acquire_lease",
+            "acquire_execution",
             lambda runtime, state: PhaseResult(PhaseAction.BREAK),
             check_active=False,
         ),
@@ -422,7 +416,7 @@ def test_expected_provider_phase_errors_break_without_outer_handler(
     assert result.error is not None and result.error.code == error_code
     assert not outer_errors
     assert ("provider_attempts", "break") in finished
-    assert ("release_lease", "fallthrough") in finished
+    assert ("release_execution", "fallthrough") in finished
     assert lease == (None,)
     if isinstance(failure, ProviderExhausted):
         assert result.error.details["failures"] == failure.failures
@@ -435,11 +429,11 @@ def test_expected_provider_phase_errors_break_without_outer_handler(
     ("failure", "method_name", "reason"),
     [
         (
-            LeaseAcquireTimeout("busy"), "_acquire_lease",
+            LeaseAcquireTimeout("busy"), "acquire",
             "lease_timeout",
         ),
         (
-            SessionSnapshotConflict("changed"), "create_or_load",
+            SessionSnapshotConflict("changed"), "build",
             "session_snapshot_conflict",
         ),
     ],
@@ -464,7 +458,7 @@ def test_expected_setup_error_breaks_and_cleans_up(
                 finished.append((event.phase, event.payload["action"]))
 
     target = (
-        TurnPhases if method_name == "_acquire_lease"
+        LeaseScope if method_name == "acquire"
         else SessionContextFactory
     )
     monkeypatch.setattr(target, method_name, raise_failure)
@@ -481,7 +475,7 @@ def test_expected_setup_error_breaks_and_cleans_up(
     assert result.error is not None and result.error.code == reason
     assert not outer_errors and not transport.requests
     assert any(action == "break" for _, action in finished)
-    assert ("release_lease", "fallthrough") in finished
+    assert ("release_execution", "fallthrough") in finished
 
 
 def test_recovery_not_eligible_is_a_phase_break(
@@ -517,14 +511,14 @@ def test_recovery_session_missing_is_a_phase_break(
         outer_errors.append(exc)
         return original(self, runtime, state, exc)
 
-    def missing_session(self, session_id, lease, host_context):
+    def missing_session(*args, **kwargs):
         raise RecoverySessionMissing("recovery session is absent")
 
     monkeypatch.setattr(TurnPhases, "handle_outer_loop_error", outer)
     monkeypatch.setattr(
         SQLiteStore, "claim_recovery", lambda self, *args, **kwargs: True
     )
-    monkeypatch.setattr(SessionContextFactory, "load_existing", missing_session)
+    monkeypatch.setattr(SessionContextFactory, "build", missing_session)
     with agent_factory(
         config_factory(), transports={"primary": ScriptedTransport()},
     ) as agent:

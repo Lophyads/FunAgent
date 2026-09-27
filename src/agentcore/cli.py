@@ -56,6 +56,8 @@ def _print_result(result: TurnResult) -> None:
 def _pump(
     gateway: GatewayRuntime, submission: TurnSubmission[TurnResult], session_id: str,
 ) -> None:
+    # 同步 CLI 的主线程既等结果也处理人工交互，不能直接阻塞在 future.result()。
+    # next_interaction 内部用 Condition 等待，不是网络轮询；只消费当前 Session 的通知。
     try:
         while not submission.future.done():
             request = gateway.next_interaction(session_id=session_id, timeout=0.1)
@@ -81,6 +83,7 @@ def _cleanup_step(name, action, deadline: float) -> None:
 
 
 def _chat(args) -> int:
+    # 外层进程入口拥有生命周期；_chat_loop 只借用 Gateway，不负责关闭共享服务。
     config = load_config(args.config)
     logging_handle = configure_logging(config)
     gateway = None
@@ -94,6 +97,7 @@ def _chat(args) -> int:
         gateway.start_blocking()
         return _chat_loop(gateway, args.session)
     finally:
+        # 先收尾 Agent/投递，再关闭共享工具服务，最后关闭日志；不能给每步重置完整预算。
         deadline = time.monotonic() + config.timeouts.finalize_seconds
         if gateway is not None:
             _cleanup_step("gateway", gateway.close_blocking, deadline)
@@ -109,6 +113,7 @@ def _chat_loop(gateway: GatewayRuntime, requested_session: str | None) -> int:
     try:
         recovery = gateway.attach_session(session_id)
         if recovery is not None:
+            # 恢复也可能触发 clarify/审批，必须复用消息泵，不能直接等恢复 Future。
             _pump(gateway, recovery, session_id)
         while True:
             line = input("you> ")
@@ -167,6 +172,7 @@ def _read_answer(question: Question) -> str | list[str]:
 
 
 def _answer_interaction(gateway: GatewayRuntime, request: InteractionRequest) -> None:
+    # input() 期间原请求可能超时或被其他线程取消；后续问题和迟到答案都要重新检查有效性。
     def pending() -> bool:
         return any(
             r.request_id == request.request_id

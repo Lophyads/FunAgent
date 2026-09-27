@@ -544,8 +544,8 @@ class SQLiteStore:
     def append_tool_result(
         self, session_id: str, message: Message, *, fence: LeaseFence
     ) -> int:
-        if message.role != "tool":
-            raise StorageError("append_tool_result requires a tool message")
+        if message.role != "tool" or message.reply_to_message_id is None:
+            raise StorageError("append_tool_result requires a tool message with a database parent ID")
         with self._transaction() as connection:
             self._assert_fence(connection, fence, session_id=session_id)
             return self._insert_message(connection, session_id, message)

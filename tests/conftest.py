@@ -32,7 +32,6 @@ from agentcore.provider_runtime import normalize_provider_exception
 from agentcore.interfaces import CancellationToken, ToolContext, TurnHostContext, HostCapabilities
 from tools.config import ToolSystemConfig, WorkspaceConfig
 from tools.context import ToolAvailabilityContext, BackendProbes, ToolUse, ToolInteractions, ToolResources
-from tools.lifecycle import SessionResourceKey
 from tools.model_tools import discover_builtin_tools
 from tools import runtime as tool_runtime
 from tools.runtime import initialize_tool_system, get_tool_registry, get_tool_services, shutdown_tool_system
@@ -46,7 +45,7 @@ def builtin_registry():
 
 def configure_tools(config, *, entries=None, approver=None):
     system_config = replace(ToolSystemConfig.from_agent_config(config), approver=approver)
-    if tool_runtime._state == "UNINITIALIZED":
+    if tool_runtime._state is tool_runtime.ToolSystemState.UNINITIALIZED:
         initialize_tool_system(system_config)
     else:
         tool_runtime.validate_tool_config(system_config)
@@ -67,7 +66,7 @@ def isolated_tool_runtime(monkeypatch):
     report = shutdown_tool_system(timeout=3)
     assert report.completed, report
     with tool_runtime._lock:
-        tool_runtime._state = "UNINITIALIZED"
+        tool_runtime._state = tool_runtime.ToolSystemState.UNINITIALIZED
         tool_runtime._startup_cwd = None
         tool_runtime._config = tool_runtime._registry = tool_runtime._services = None
 
@@ -85,12 +84,14 @@ def availability(tmp_path):
 def context_factory(tmp_path):
     @contextmanager
     def factory(session_id="s1", turn_id="t1", call_id="c1", *, host=None, check_active=lambda: None):
-        if tool_runtime._state == "UNINITIALIZED":
+        if tool_runtime._state is tool_runtime.ToolSystemState.UNINITIALIZED:
             initialize_tool_system(ToolSystemConfig(workspace=WorkspaceConfig(default_cwd=tmp_path, allowed_root=tmp_path)))
         services = get_tool_services()
-        key = SessionResourceKey("test", "test", session_id)
-        workspace, generation = services.begin_turn(key, "test-owner", turn_id)
-        use = ToolUse(services, key, generation, "test-owner", turn_id, call_id, check_active)
+        workspace = services.begin_execution(
+            namespace="test", profile="test", task_id=session_id,
+            owner_id="test-owner", turn_id=turn_id,
+        )
+        use = services.create_use("test-owner", turn_id, call_id, check_active)
         try:
             with services.tool_use(use):
                 yield ToolContext(
@@ -99,7 +100,7 @@ def context_factory(tmp_path):
                     ToolResources(use), CancellationToken(threading.Event()), use.check,
                 )
         finally:
-            services.end_turn("test-owner", turn_id)
+            services.end_execution("test-owner", turn_id)
     return factory
 
 

@@ -38,6 +38,7 @@ class ToolUse:
     services: ToolServices
     key: SessionResourceKey
     generation: int
+    workspace: ResolvedWorkspace
     owner_id: str
     turn_id: str
     call_id: str

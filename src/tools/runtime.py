@@ -7,6 +7,7 @@ import inspect
 import logging
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,14 @@ if TYPE_CHECKING:
     from .services import ToolServices
 
 
+class ToolSystemState(Enum):
+    UNINITIALIZED = "uninitialized"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    CLOSING = "closing"
+    CLOSED = "closed"
+
+
 class ToolSystemNotInitialized(RuntimeError):
     pass
 
@@ -29,7 +38,7 @@ class ToolSystemConfigConflict(ValueError):
 
 _lock = threading.RLock()
 _shutdown_lock = threading.Lock()
-_state = "UNINITIALIZED"
+_state: ToolSystemState = ToolSystemState.UNINITIALIZED
 _config: ToolSystemConfig | None = None
 _registry: ToolRegistry | None = None
 _services: ToolServices | None = None
@@ -42,13 +51,13 @@ def initialize_tool_system(config: ToolSystemConfig) -> None:
     with _lock:
         startup = _startup_cwd or Path.cwd().resolve()
         normalized = config.normalized(startup_cwd=startup)
-        if _state == "READY":
+        if _state is ToolSystemState.READY:
             if normalized != _config:
                 raise ToolSystemConfigConflict("tool system already uses a different configuration")
             return
-        if _state != "UNINITIALIZED":
-            raise ToolSystemNotInitialized(f"tool system is {_state.lower()}")
-        _state = "INITIALIZING"
+        if _state is not ToolSystemState.UNINITIALIZED:
+            raise ToolSystemNotInitialized(f"tool system is {_state.value}")
+        _state = ToolSystemState.INITIALIZING
         try:
             if config.approver is not None:
                 callback = config.approver.approve
@@ -59,11 +68,11 @@ def initialize_tool_system(config: ToolSystemConfig) -> None:
             from .services import ToolServices
             services = ToolServices(normalized)
         except BaseException:
-            _state = "UNINITIALIZED"
+            _state = ToolSystemState.UNINITIALIZED
             raise
         _config, _registry, _services = normalized, registry, services
         _startup_cwd = startup
-        _state = "READY"
+        _state = ToolSystemState.READY
         if not _exit_registered:
             atexit.register(_shutdown_at_exit)
             _exit_registered = True
@@ -71,14 +80,14 @@ def initialize_tool_system(config: ToolSystemConfig) -> None:
 
 def get_tool_registry() -> ToolRegistry:
     with _lock:
-        if _state != "READY" or _registry is None:
+        if _state is not ToolSystemState.READY or _registry is None:
             raise ToolSystemNotInitialized("initialize_tool_system() must run before AgentCore")
         return _registry
 
 
 def get_tool_services() -> ToolServices:
     with _lock:
-        if _state != "READY" or _services is None:
+        if _state is not ToolSystemState.READY or _services is None:
             raise ToolSystemNotInitialized("initialize_tool_system() must run before AgentCore")
         return _services
 
@@ -86,7 +95,7 @@ def get_tool_services() -> ToolServices:
 def validate_tool_config(config: ToolSystemConfig) -> None:
     with _lock:
         actual = config.normalized(startup_cwd=_startup_cwd)
-        if _state != "READY":
+        if _state is not ToolSystemState.READY:
             raise ToolSystemNotInitialized("initialize_tool_system() must run before AgentCore")
         # The decision maker is owned by process initialization, not AgentConfig.
         if _config is None or (actual.tools, actual.workspace, actual.approval_store_path) != (
@@ -102,14 +111,14 @@ def shutdown_tool_system(*, timeout: float) -> CleanupReport:
         return CleanupReport((CleanupIssue("runtime", "process", "close", "close_busy", True),))
     try:
         with _lock:
-            if _state in {"UNINITIALIZED", "CLOSED"}:
+            if _state in {ToolSystemState.UNINITIALIZED, ToolSystemState.CLOSED}:
                 return CleanupReport()
-            _state = "CLOSING"
+            _state = ToolSystemState.CLOSING
             services = _services
         report = services.close(timeout=remaining(deadline))
         with _lock:
             if report.completed:
-                _state = "CLOSED"
+                _state = ToolSystemState.CLOSED
         return report
     finally:
         _shutdown_lock.release()

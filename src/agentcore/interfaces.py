@@ -61,12 +61,20 @@ class HumanApprovalRequired:
 
 @dataclass(frozen=True, slots=True)
 class HostCapabilities:
+    """本轮宿主能否接收人工交互；approval=True 表示能请求审批，不表示已经授权。"""
+
     clarify: bool = False
     approval: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class TurnHostContext:
+    """提交时固定的宿主能力和通知出口，不保存历史、不拥有共享工具资源。
+
+    同一 Session 的不同 Turn 可以来自不同宿主，因此不把交互出口绑定为 Session 永久属性。
+    Gateway 通常提供可撤销的本轮端口；直接调用 AgentCore 时默认没有人工交互能力。
+    """
+
     capabilities: HostCapabilities = HostCapabilities()
     interaction_port: InteractionPort | None = None
 
@@ -78,6 +86,12 @@ class TurnHostContext:
 
 @dataclass(frozen=True, slots=True)
 class ToolContext:
+    """单次工具调用借用的能力；Handler 使用这些接口，不需要持有 Agent 或 Gateway。
+
+    interactions 从本轮 TurnHostContext 接线，resources 访问按 Session 复用的后端；
+    取消/超时后应检查 check_active，不能把本次上下文留给后续调用继续使用。
+    """
+
     session_id: str
     turn_id: str
     tool_call_id: str

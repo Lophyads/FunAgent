@@ -1,3 +1,9 @@
+"""进程内应用协调层：管理接入、交互路由、恢复调度和可选投递。
+
+CLI/平台负责展示与用户身份认证；AgentCore 负责模型循环和工具执行。
+Gateway 拥有自建的 Agent/投递组件，只借用进程共享 ToolServices，不负责全局关闭。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -41,7 +47,7 @@ def _call_sync(callback):
 
 
 class GatewayRuntime:
-    """Session admission, scoped interactions, recovery, and optional delivery."""
+    """组织 Agent 的应用生命周期，而不是网络服务器或另一套模型循环。"""
 
     def __init__(
         self, config: AgentConfig, adapter: DeliveryAdapter | None = None, *,
@@ -52,6 +58,20 @@ class GatewayRuntime:
         owned_sessions: frozenset[str] | None = None,
         max_recovery_attempts: int = 3, **agent_options: Any,
     ):
+        """配置当前接入端的交互方式和主动恢复范围。
+
+        interaction_mode: none 不提供人工交互；poll 由宿主读取内部通知队列；
+            push 调用宿主的 interaction_port.present(request)。
+        interaction_port: 仅 push 模式传入的同步、快速返回的通知对象，不是 TCP 端口；
+            它只展示/转交通知，答案稍后通过 resolve_interaction 提交。
+        recovery_policy: attached 只扫描已接入 Session；owned 扫描显式声明的管理范围。
+            恢复会提交内部 Turn，可能调用模型，不只是读取历史。
+        owns_database: 允许 owned 模式扫描全库；不代表文件所有权或跨进程排他锁。
+        owned_sessions: 替代全库声明的 Session 集合，同时限制 attach/submit 的接入范围；
+            与 owns_database=True 互斥。未指定集合时，attached 仍只扫描已接入会话。
+        max_recovery_attempts: 内部恢复尝试上限，不是 Provider HTTP 重试次数。
+        adapter: 可选的最终回复投递适配器，与人工交互通知出口的职责不同。
+        """
         if interaction_mode not in {"none", "poll", "push"}:
             raise ValueError("invalid interaction mode")
         if (interaction_mode == "push") != (interaction_port is not None):
@@ -81,12 +101,14 @@ class GatewayRuntime:
             raise TypeError("delivery_destination is owned by GatewayRuntime")
         self._config = config
         self.adapter = adapter
+        # 借用已初始化的进程服务；关闭本 Gateway 不能使其他使用者的资源失效。
         self._services = get_tool_services()
         self._interactions = _InteractionRoutes(
             self._services.interactions, mode=interaction_mode,
             endpoint=interaction_port, capacity=config.tools.interaction_capacity,
         )
         self._recovery_policy = recovery_policy
+        # None 与空集合不同：owned 模式下 None 表示已声明全库，空集合表示不接管任何会话。
         self._owned_sessions = owned_sessions
         self._max_recovery_attempts = max_recovery_attempts
         self._condition = threading.Condition(threading.RLock())
@@ -94,9 +116,11 @@ class GatewayRuntime:
         self._start_lock = threading.Lock()
         self._started = False
         self._closed = False
+        # attached 是当前接入范围；detached 阻止隐式重新提交；resetting 阻止清理期间的新任务。
         self._attached: set[str] = set()
         self._detached: set[str] = set()
         self._resetting: set[str] = set()
+        # 只跟踪尚未收尾的提交，完成回调会移除；恢复任务也复用同一份 submission。
         self._submissions: dict[Future[TurnResult], tuple[str, TurnSubmission[TurnResult]]] = {}
         self._recoveries: dict[str, TurnSubmission[TurnResult]] = {}
         self._delivery_waiters: dict[Future[TurnResult], Future[None]] = {}
@@ -160,6 +184,7 @@ class GatewayRuntime:
                     if self._monitor_stop.is_set():
                         raise RuntimeError("GatewayRuntime is closing")
                     self._started = True
+                    # 监控线程只发现并提交恢复任务；模型循环仍由 AgentCore 的 worker 执行。
                     self._monitor = threading.Thread(
                         target=self._monitor_recovery, name="gateway-recovery", daemon=True,
                     )
@@ -193,6 +218,7 @@ class GatewayRuntime:
             raise RuntimeError("GatewayRuntime is not accepting turns")
 
     def attach_session(self, session_id: str) -> TurnSubmission[TurnResult] | None:
+        """登记接入并检查恢复；返回恢复提交或 None，poll 宿主也要为恢复任务处理交互。"""
         if not session_id.strip():
             raise ValueError("session_id must not be blank")
         self.start_blocking()
@@ -200,7 +226,7 @@ class GatewayRuntime:
             return self._attach_session(session_id)
 
     def _attach_session(self, session_id: str) -> TurnSubmission[TurnResult] | None:
-        """Called under the admission lock so recovery reserves FIFO first."""
+        """在接入锁内先预留恢复任务的位置，保证后续用户输入不会越过同 Session 的恢复。"""
         self._check_open()
         if session_id in self._resetting:
             raise SessionResourcesBusyError("session resources are being reset")
@@ -216,6 +242,7 @@ class GatewayRuntime:
         return self._recoveries.get(session_id)
 
     def detach_session(self, session_id: str) -> None:
+        """取消本接入范围内该 Session 的任务和交互，不删除历史，也不重置共享后端。"""
         with self._condition:
             self._attached.discard(session_id)
             self._detached.add(session_id)
@@ -233,6 +260,7 @@ class GatewayRuntime:
         return self._interactions.next(session_id=session_id, timeout=timeout)
 
     def resolve_interaction(self, session_id: str, request_id: str, response: Any) -> bool:
+        # 答复直接完成原请求；不能排进同 Session FIFO，否则会排在正等待它的 Turn 后面。
         return self._interactions.resolve(session_id, request_id, response)
 
     def _track(
@@ -275,6 +303,7 @@ class GatewayRuntime:
 
     def submit_turn(self, user_input: UserInput | str, session_id: str | None = None, *,
                     session_request: SessionBuildRequest | None = None) -> TurnSubmission[TurnResult]:
+        """准备接入和交互上下文后提交；实际排队、执行与取消令牌由 AgentCore 管理。"""
         self.start_blocking()
         sid = str(uuid.uuid4()) if session_id is None else session_id
         with self._condition:
@@ -284,6 +313,7 @@ class GatewayRuntime:
             if not sid.strip():
                 raise ValueError("session_id must not be blank")
             self._attach_session(sid)
+            # 同一宿主的每个 Turn 都绑定独立端口，取消一轮不会关闭其他轮的通知出口。
             host, port = self._interactions.bind(sid)
             try:
                 submission = self.agent.submit_turn(
@@ -295,6 +325,7 @@ class GatewayRuntime:
             return self._track(sid, submission, port)
 
     def run_turn_blocking(self, user_input, session_id=None, **kwargs) -> TurnResult:
+        """阻塞等结果；poll CLI 应用 submit_turn + 消息泵，避免无人读取待答问题。"""
         submission = self.submit_turn(user_input, session_id, **kwargs)
         try:
             result = submission.future.result()
@@ -325,6 +356,7 @@ class GatewayRuntime:
             if session_id in self._recoveries:
                 return self._recoveries[session_id]
             self._check_open()
+            # 预留 FIFO 位置不占用执行 worker；后续装配失败必须释放预留和交互端口。
             reservation = self.agent.reserve_recovery(session_id)
             port = None
             try:
@@ -346,6 +378,8 @@ class GatewayRuntime:
         with self._condition:
             if self._monitor_stop.is_set():
                 return
+            # Store 把 None 解释为全库。只有 owned + 显式所有权声明才能走该范围；
+            # 默认 attached 防止打开一个 CLI 就自动继续数据库里其他宿主的未完成任务。
             scope = self._owned_sessions if self._recovery_policy == "owned" else frozenset(self._attached)
             self.agent._store.mark_stale_leases(scope)
             pending = self.agent._store.list_pending_recoveries(self._max_recovery_attempts, scope)
@@ -368,6 +402,7 @@ class GatewayRuntime:
                 logger.error("recovery.monitor_failed error_type=%s", type(exc).__name__)
 
     def reset_session_resources(self, session_id: str) -> CleanupReport:
+        """重置已接入且无在途提交的会话资源；不删除消息或永久授权。"""
         with self._condition:
             self._check_open()
             if session_id not in self._attached:
@@ -377,6 +412,7 @@ class GatewayRuntime:
             ):
                 raise SessionResourcesBusyError("session still has queued or running turns")
             self._resetting.add(session_id)
+        # 后端关闭可能阻塞：释放接入锁再清理，resetting 标记负责拒绝同 Session 新提交。
         try:
             return self._services.reset_session_resources(self.agent.session_resource_key(session_id))
         finally:
@@ -385,6 +421,7 @@ class GatewayRuntime:
                 self._condition.notify_all()
 
     def close_blocking(self, *, timeout: float | None = None) -> CleanupReport:
+        """有界关闭自有组件；各步骤共享总 deadline，超时通过报告保留未完成状态。"""
         deadline = time.monotonic() + (
             self._config.timeouts.finalize_seconds if timeout is None else max(0, timeout)
         )
@@ -450,7 +487,8 @@ class GatewayRuntime:
         )
         if delivery_stopped:
             clean("adapter", lambda: self._close_adapter(deadline))
-        # Keep borrowed Store/observers alive until every user has left.
+        # Delivery 和恢复线程借用 Agent 的 Store/观测组件，先让使用者退出再释放依赖。
+        # 此处不调用 shutdown_tool_system：共享工具服务由最外层进程入口统一关闭。
         adapter_running = self._adapter_close is not None and not self._adapter_close.done()
         if monitor_stopped and turns_stopped and delivery_stopped and not adapter_running:
             clean("agent", lambda: self.agent.close_blocking(remaining(deadline)))

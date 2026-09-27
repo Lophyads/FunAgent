@@ -110,7 +110,10 @@ class InteractionRequest:
 
 
 class InteractionPort(Protocol):
-    """Nonblocking notification endpoint, bound to one trusted access scope."""
+    """同步且快速返回的通知接口，不是 TCP 端口；present 只通知，答案由宿主另行 resolve。
+
+    可以把请求交给 UI 事件队列或平台发送队列，但不能在通知 worker 中等待用户输入。
+    """
     def present(self, request: InteractionRequest) -> None: ...
 
 
@@ -132,6 +135,7 @@ class InteractionBroker:
         self._pending: dict[str, _Pending] = {}
         self._closed = False
         self._capacity = capacity
+        # 把宿主展示/转发与 Turn 的等待分开，并限制通知并发和队列，避免无限创建线程。
         self._notifications = DaemonWorkerPool(2, capacity, name="tool-notification")
 
     def pending(self, *, port: InteractionPort | None = None,
@@ -159,6 +163,7 @@ class InteractionBroker:
                 answer = self._validate_response(pending.request, response)
             except (ValueError, TypeError, ValidationError):
                 return False
+            # 答案属于原请求，设置事件唤醒原 Turn；不能为人工答复再创建一个排队中的 Turn。
             pending.response = answer
             self._finish(pending, "resolved")
             return True
@@ -231,6 +236,7 @@ class InteractionBroker:
             self._pending[request.request_id] = pending
         try:
             try:
+                # 后台通知调用 port.present；其返回值不是用户答案，不结束这个 pending 请求。
                 self._notifications.submit(lambda: self._present(pending))
             except (RuntimeError, WorkerQueueFullError):
                 with self._lock:
@@ -249,6 +255,7 @@ class InteractionBroker:
                         raise TurnCancelled("interaction was cancelled")
                     if status == "unavailable":
                         raise InteractionUnavailable("notification endpoint is unavailable")
+                # 等待发生在发起请求的执行线程，不占用通知 worker；定时醒来检查取消/lease。
                 pending.event.wait(0.05)
         finally:
             with self._lock:

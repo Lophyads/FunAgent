@@ -347,12 +347,14 @@ def test_url_policy_rejects_metadata_and_credentials():
 
 def test_search_cancellation_kills_child(monkeypatch, context_factory):
     killed = []
+    spawned = threading.Event()
 
     class Child:
         def __init__(self):
             from io import BytesIO
             self.stdin = BytesIO()
             self.returncode = None
+            spawned.set()
 
         def poll(self):
             return self.returncode
@@ -365,11 +367,8 @@ def test_search_cancellation_kills_child(monkeypatch, context_factory):
             return self.returncode
 
     monkeypatch.setattr("tools.web_tool.subprocess.Popen", lambda *a, **kw: Child())
-    checks = 0
     def cancel_after_spawn():
-        nonlocal checks
-        checks += 1
-        if checks > 1:
+        if spawned.is_set():
             raise TurnCancelled("cancel")
     with context_factory(check_active=cancel_after_spawn) as context:
         with pytest.raises(TurnCancelled):
