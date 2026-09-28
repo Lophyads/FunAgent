@@ -16,7 +16,7 @@ from .models import LeaseFence, LeaseHandle, Message, ToolCall, ToolOutcome
 from tools.results import encode_tool_error
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _SCHEMA = """
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
@@ -24,6 +24,7 @@ CREATE TABLE sessions (
     surface TEXT NOT NULL,
     platform TEXT NOT NULL,
     system_prompt_bytes BLOB NOT NULL,
+    workspace TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     resume_pending INTEGER NOT NULL DEFAULT 0 CHECK(resume_pending IN (0,1)),
@@ -108,6 +109,7 @@ class PersistedSession:
     platform: str
     system_prompt_bytes: bytes
     created_at: float
+    workspace: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +123,7 @@ def _json(value: Any) -> str:
 
 
 class SQLiteStore:
-    """Four-table, message-tail store. Schema v8 intentionally has no data migration."""
+    """Four-table, message-tail store. Schema v9 adds the session workspace to v8."""
 
     def __init__(self, path: str | Path, *, tool_result_max_chars: int = 32_768) -> None:
         self.path = str(path)
@@ -171,15 +173,18 @@ class SQLiteStore:
                     expected = {
                         "sessions", "messages", "session_leases", "delivery_obligations"
                     }
-                    if version not in {0, SCHEMA_VERSION} or (tables and tables != expected):
+                    if version not in {0, 8, SCHEMA_VERSION} or (tables and tables != expected):
                         raise StorageError(
                             "incompatible SQLite schema; stop all runtimes and delete the "
-                            "old database explicitly before using schema v8"
+                            "old database explicitly before using this schema"
                         )
                     if not tables:
                         for statement in _SCHEMA.split(";"):
                             if statement.strip():
                                 connection.execute(statement)
+                        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    elif version == 8:
+                        connection.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
                         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     connection.commit()
                 except BaseException:
@@ -340,6 +345,7 @@ class SQLiteStore:
     def create_session(
         self, session_id: str, *, profile: str, surface: str, platform: str,
         system_prompt_bytes: bytes, user_message: Message, fence: LeaseFence,
+        workspace: str | None = None,
     ) -> PersistedSession:
         if user_message.role != "user" or user_message.kind != "normal":
             raise StorageError("new session requires a normal user message")
@@ -348,25 +354,25 @@ class SQLiteStore:
             self._assert_fence(connection, fence, session_id=session_id)
             connection.execute(
                 "INSERT INTO sessions(id,profile,surface,platform,system_prompt_bytes,"
-                "created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (session_id, profile, surface, platform, system_prompt_bytes, now, now),
+                "created_at,updated_at,workspace) VALUES(?,?,?,?,?,?,?,?)",
+                (session_id, profile, surface, platform, system_prompt_bytes, now, now, workspace),
             )
             self._insert_message(connection, session_id, user_message)
         return PersistedSession(
-            session_id, profile, surface, platform, system_prompt_bytes, now
+            session_id, profile, surface, platform, system_prompt_bytes, now, workspace
         )
 
     def load_session(self, session_id: str) -> PersistedSession | None:
         connection = self._connection()
         try:
             row = connection.execute(
-                "SELECT id,profile,surface,platform,system_prompt_bytes,created_at "
+                "SELECT id,profile,surface,platform,system_prompt_bytes,created_at,workspace "
                 "FROM sessions WHERE id=?", (session_id,),
             ).fetchone()
             return None if row is None else PersistedSession(
                 str(row["id"]), str(row["profile"]), str(row["surface"]),
                 str(row["platform"]), bytes(row["system_prompt_bytes"]),
-                float(row["created_at"]),
+                float(row["created_at"]), row["workspace"],
             )
         finally:
             connection.close()
@@ -518,7 +524,8 @@ class SQLiteStore:
             )
 
     def append_user_message(
-        self, session_id: str, message: Message, *, fence: LeaseFence
+        self, session_id: str, message: Message, *, fence: LeaseFence,
+        workspace: str | None = None,
     ) -> int:
         if message.role != "user" or message.kind != "normal":
             raise StorageError("append_user_message requires a normal user message")
@@ -527,6 +534,8 @@ class SQLiteStore:
             batch = self._unresolved_batch(connection, session_id)
             if batch is not None and batch[1]:
                 raise StorageError("cannot append user before repairing tool replies")
+            if workspace is not None:
+                connection.execute("UPDATE sessions SET workspace=? WHERE id=?", (workspace, session_id))
             return self._insert_message(connection, session_id, message)
 
     def append_tool_calls(

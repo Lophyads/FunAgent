@@ -3,16 +3,14 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
-from .interfaces import MemoryProvider, TurnHostContext
-from .runtime_cwd import ResolvedWorkspace
-from tools.context import BackendProbes, ToolAvailabilityContext
-from tools.lifecycle import SessionResourceKey
-from tools.services import ToolServices
-from .models import LeaseHandle, Message, SessionDefaults, UserInput
+from .interfaces import MemoryProvider
+from tools.context import ToolAvailabilityContext
+from .models import SessionDefaults, UserInput
 from .prompt_builder import PromptBuildRequest, SystemPromptBuilder, SystemPromptSnapshot
-from .storage import PersistedSession, SQLiteStore
+from .storage import PersistedSession
 from tools.model_tools import load_tools
 from tools.registry import ToolEntry, ToolRegistry
 from tools.toolsets import ToolsetRequest, ToolsetResolver
@@ -61,14 +59,14 @@ class SessionBuildRequest:
 
 @dataclass(frozen=True, slots=True)
 class SessionRuntimeSnapshot:
-    """Immutable prompt, tools, and resource binding used by one turn."""
+    """Frozen model context, reusable independently of any tool execution."""
 
     prompt: SystemPromptSnapshot
     entries_by_name: Mapping[str, ToolEntry[Any]]
     tool_schema_bytes: bytes
-    workspace: ResolvedWorkspace
-    resource_key: SessionResourceKey
-    resource_generation: int
+
+    def copy(self) -> "SessionRuntimeSnapshot":
+        return replace(self, entries_by_name=MappingProxyType(dict(self.entries_by_name)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,48 +74,46 @@ class SessionContextResolution:
     snapshot: SessionRuntimeSnapshot
     created: bool
     warnings: tuple[str, ...] = ()
+    request: SessionBuildRequest | None = None
 
 
 class SessionContextFactory:
     """Freeze the prompt and load one consistent tool view for each turn."""
 
     def __init__(
-        self, *, store: SQLiteStore, prompt_builder: SystemPromptBuilder,
+        self, *, prompt_builder: SystemPromptBuilder,
         toolset_resolver: ToolsetResolver, registry: ToolRegistry,
         memory: MemoryProvider, defaults: SessionBuildRequest,
-        memory_max_chars: int, services: ToolServices,
+        memory_max_chars: int,
     ) -> None:
-        self._store = store
         self._prompt_builder = prompt_builder
         self._toolset_resolver = toolset_resolver
         self._registry = registry
         self._memory = memory
         self._defaults = defaults
         self._memory_max_chars = memory_max_chars
-        self._services = services
 
-    def create_or_load(
+    def build(
         self, session_id: str, user_input: UserInput,
-        request: SessionBuildRequest | None, lease: LeaseHandle,
-        host_context: TurnHostContext = TurnHostContext(),
+        request: SessionBuildRequest | None, *,
+        persisted: PersistedSession | None, availability: ToolAvailabilityContext,
+        recovery: bool = False,
     ) -> SessionContextResolution:
-        persisted = self._store.load_session(session_id)
+        """Build from supplied data and availability; do not bind runtime resources."""
         if persisted is None:
-            return self._create(session_id, user_input, request or self._defaults, lease, host_context)
-        return self._load(persisted, request, lease, host_context)
-
-    def load_existing(
-        self, session_id: str, lease: LeaseHandle,
-        host_context: TurnHostContext = TurnHostContext(),
-    ) -> SessionContextResolution:
-        persisted = self._store.load_session(session_id)
-        if persisted is None:
-            raise RecoverySessionMissing("cannot recover a missing session")
-        return self._load(persisted, None, lease, host_context)
+            if recovery:
+                raise RecoverySessionMissing("cannot recover a missing session")
+            return self._create(
+                session_id, user_input, request or self._defaults,
+                availability,
+            )
+        return self._load(
+            persisted, request, availability,
+        )
 
     def _create(
         self, session_id: str, user_input: UserInput,
-        request: SessionBuildRequest, lease: LeaseHandle, host_context: TurnHostContext,
+        request: SessionBuildRequest, availability: ToolAvailabilityContext,
     ) -> SessionContextResolution:
         warnings: list[str] = []
         try:
@@ -146,20 +142,16 @@ class SessionContextFactory:
         if (prompt.content_bytes != prompt.text.encode("utf-8") or
             hashlib.sha256(prompt.content_bytes).hexdigest() != prompt.fingerprint):
             raise SessionContextError("prompt builder returned inconsistent bytes")
-        snapshot = self._runtime_snapshot(session_id, request, prompt, lease, host_context)
-        self._store.create_session(
-            session_id, profile=request.profile, surface=request.surface,
-            platform=request.platform, system_prompt_bytes=prompt.content_bytes,
-            user_message=Message.user(user_input.text, metadata=user_input.metadata),
-            fence=lease.fence,
+        snapshot = self._runtime_snapshot(
+            request, prompt, availability,
         )
         return SessionContextResolution(
-            snapshot, True, tuple(warnings),
+            snapshot, True, tuple(warnings), request,
         )
 
     def _load(
         self, persisted: PersistedSession, request: SessionBuildRequest | None,
-        lease: LeaseHandle, host_context: TurnHostContext,
+        availability: ToolAvailabilityContext,
     ) -> SessionContextResolution:
         current = request or self._defaults
         identity = (persisted.profile, persisted.surface, persisted.platform)
@@ -180,32 +172,22 @@ class SessionContextFactory:
         )
         return SessionContextResolution(
             self._runtime_snapshot(
-                persisted.session_id, effective, prompt, lease, host_context,
+                effective, prompt, availability,
             ),
-            False,
+            False, request=effective,
         )
 
     def _runtime_snapshot(
         self,
-        session_id: str,
         request: SessionBuildRequest,
         prompt: SystemPromptSnapshot,
-        lease: LeaseHandle, host_context: TurnHostContext,
+        availability: ToolAvailabilityContext,
     ) -> SessionRuntimeSnapshot:
-        key = SessionResourceKey(self._store.resource_namespace, request.profile, session_id)
-        workspace, generation = self._services.begin_turn(
-            key, lease.owner_id, lease.turn_id, request.workspace,
-        )
-        availability = ToolAvailabilityContext(
-            self._services.config.tools, workspace, host_context.capabilities,
-            BackendProbes(self._services.available),
-        )
         entries, schema_bytes = self._load_tools(request, availability)
         return SessionRuntimeSnapshot(
             prompt=prompt,
             entries_by_name=entries,
             tool_schema_bytes=schema_bytes,
-            workspace=workspace, resource_key=key, resource_generation=generation,
         )
 
     def _load_tools(

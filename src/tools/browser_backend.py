@@ -11,13 +11,14 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from agentcore.interfaces import ToolContext
 from .network_safety import validate_url
 from .web_tool import _minimal_env
-from .lifecycle import SessionResourceKey, remaining
+from .lifecycle import ResourceUnavailableError, SessionResourcesBusyError, SessionResourceKey, remaining
 
 
 @dataclass(slots=True)
@@ -27,6 +28,7 @@ class _BrowserSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     navigated: bool = False
     last_used: float = field(default_factory=time.monotonic)
+    closing: bool = False
 
 
 class AgentBrowserBackend:
@@ -56,10 +58,13 @@ class AgentBrowserBackend:
                 "agent-browser is not installed; install it explicitly and make it available on PATH"
             )
         self._lock = threading.RLock()
+        self._closing = False
         self._sessions: dict[SessionResourceKey, _BrowserSession] = {}
 
     def _session(self, session_id: SessionResourceKey) -> _BrowserSession:
         with self._lock:
+            if self._closing:
+                raise ResourceUnavailableError("backend is stopping")
             session = self._sessions.get(session_id)
             if session is None:
                 session = _BrowserSession(
@@ -67,8 +72,31 @@ class AgentBrowserBackend:
                     temp=tempfile.TemporaryDirectory(prefix="funagent-browser-"),
                 )
                 self._sessions[session_id] = session
-            session.last_used = time.monotonic()
             return session
+
+    @contextmanager
+    def _locked_session(self, key: SessionResourceKey, check_active):
+        # A cleanup may remove a cached instance while we wait for its lock.
+        # Re-check identity after locking so we never operate on a closed instance.
+        while True:
+            check_active()
+            session = self._session(key)
+            while not session.lock.acquire(timeout=0.05):
+                check_active()
+            try:
+                with self._lock:
+                    if self._sessions.get(key) is not session:
+                        continue
+                    if self._closing or session.closing:
+                        raise ResourceUnavailableError("session resources are closing")
+                check_active()
+                try:
+                    yield session
+                finally:
+                    session.last_used = time.monotonic()
+                return
+            finally:
+                session.lock.release()
 
     def _command(
         self, session: _BrowserSession, command: str, args: list[str],
@@ -88,7 +116,7 @@ class AgentBrowserBackend:
             try:
                 deadline = time.monotonic() + timeout
                 while process.poll() is None:
-                    if context is not None and context.check_active is not None:
+                    if context is not None:
                         context.check_active()
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"browser {command} timed out")
@@ -132,8 +160,7 @@ class AgentBrowserBackend:
         snapshot: bool = False,
     ) -> dict[str, Any]:
         context.check_active()
-        session = self._session(session_id)
-        with session.lock:
+        with self._locked_session(session_id, context.check_active) as session:
             try:
                 if navigation_url is not None:
                     validate_url(
@@ -153,7 +180,6 @@ class AgentBrowserBackend:
                 self.close_session(session_id, deadline=time.monotonic() + 5)
                 raise
             session.navigated = True
-            session.last_used = time.monotonic()
             payload: dict[str, Any] = {
                 "success": True, "url": final_url,
                 "data": result.get("data"),
@@ -163,35 +189,58 @@ class AgentBrowserBackend:
                 payload["snapshot"] = view.get("data")
             return _bound_browser_payload(payload)
 
-    def close_session(self, session_id: SessionResourceKey, *, deadline: float) -> None:
+    def close_session(self, session_id: SessionResourceKey, *, deadline: float,
+                      idle_before: float | None = None) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
         if session is None:
             return
-        if not session.lock.acquire(timeout=remaining(deadline)):
-            raise TimeoutError("session is still in use")
+        # Reaping is opportunistic; explicit reset/close waits only within budget.
+        if not session.lock.acquire(timeout=0 if idle_before is not None else remaining(deadline)):
+            if idle_before is not None:
+                return
+            raise SessionResourcesBusyError("session is still in use")
         try:
-            if remaining(deadline) <= 0:
-                raise TimeoutError("cleanup deadline expired")
+            with self._lock:
+                if self._sessions.get(session_id) is not session:
+                    return
+                if idle_before is not None and not session.closing and session.last_used > idle_before:
+                    return
+                if remaining(deadline) <= 0:
+                    raise TimeoutError("cleanup deadline expired")
+                session.closing = True
             self._command(session, "close", [], None, timeout=remaining(deadline))
             session.temp.cleanup()
             with self._lock:
-                self._sessions.pop(session_id, None)
+                self._sessions.pop(session_id)
         finally:
             session.lock.release()
 
     def reap_idle(self, *, now: float, deadline: float) -> None:
         with self._lock:
-            candidates = tuple(self._sessions.items())
-        for sid, session in candidates:
-            if now - session.last_used >= self.idle_seconds:
-                self.close_session(sid, deadline=deadline)
+            candidates = tuple(self._sessions)
+        failure = None
+        for sid in candidates:
+            try:
+                self.close_session(sid, deadline=deadline, idle_before=now - self.idle_seconds)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
 
     def close(self, *, deadline: float) -> None:
         with self._lock:
+            self._closing = True
             sessions = tuple(self._sessions)
+        failure = None
         for sid in sessions:
-            self.close_session(sid, deadline=deadline)
+            try:
+                self.close_session(sid, deadline=deadline)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
+
 
 
 

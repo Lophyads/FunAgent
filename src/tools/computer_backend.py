@@ -11,12 +11,13 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from agentcore.interfaces import ToolContext
 from .web_tool import _minimal_env
-from .lifecycle import SessionResourceKey, remaining
+from .lifecycle import ResourceUnavailableError, SessionResourcesBusyError, SessionResourceKey, remaining
 
 
 @dataclass(slots=True)
@@ -25,6 +26,7 @@ class _DesktopSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     target: dict[str, Any] | None = None
     last_used: float = field(default_factory=time.monotonic)
+    closing: bool = False
     started: bool = False
     elements: dict[int, dict[str, Any]] = field(default_factory=dict)
 
@@ -81,19 +83,45 @@ class CuaCliBackend:
                 "cua-driver is not installed or not on PATH; install and start it explicitly"
             )
         self._lock = threading.RLock()
+        self._closing = False
         self._sessions: dict[SessionResourceKey, _DesktopSession] = {}
         self.idle_seconds = idle_seconds
 
     def _session(self, session_id: SessionResourceKey) -> _DesktopSession:
         with self._lock:
+            if self._closing:
+                raise ResourceUnavailableError("backend is stopping")
             session = self._sessions.get(session_id)
             if session is None:
                 session = _DesktopSession(
                     driver_session="funagent-" + uuid.uuid4().hex[:20]
                 )
                 self._sessions[session_id] = session
-            session.last_used = time.monotonic()
             return session
+
+    @contextmanager
+    def _locked_session(self, key: SessionResourceKey, check_active):
+        # A cleanup may remove a cached instance while we wait for its lock.
+        # Re-check identity after locking so we never operate on a closed instance.
+        while True:
+            check_active()
+            session = self._session(key)
+            while not session.lock.acquire(timeout=0.05):
+                check_active()
+            try:
+                with self._lock:
+                    if self._sessions.get(key) is not session:
+                        continue
+                    if self._closing or session.closing:
+                        raise ResourceUnavailableError("session resources are closing")
+                check_active()
+                try:
+                    yield session
+                finally:
+                    session.last_used = time.monotonic()
+                return
+            finally:
+                session.lock.release()
 
     def _call(
         self, name: str, args: dict[str, Any], context: ToolContext | None,
@@ -116,7 +144,7 @@ class CuaCliBackend:
                 process.stdin.close()
                 deadline = time.monotonic() + timeout
                 while process.poll() is None:
-                    if context is not None and context.check_active is not None:
+                    if context is not None:
                         context.check_active()
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"cua-driver {name} timed out")
@@ -157,34 +185,23 @@ class CuaCliBackend:
         self, session_id: SessionResourceKey, args: Any, context: ToolContext,
     ) -> dict[str, Any]:
         context.check_active()
-        session = self._session(session_id)
         action = args.action
-        with session.lock:
+        with self._locked_session(session_id, context.check_active) as session:
             sid = session.driver_session
             if not session.started:
                 self._call("start_session", {"session": sid}, context)
                 session.started = True
             if action == "list_apps":
                 result = self._call("list_apps", {"session": sid}, context)
-                return self._finish(session, self._bounded(self._structured(result)))
+                return self._bounded(self._structured(result))
             if action == "list_windows":
-                return self._finish(
-                    session, self._bounded({
-                        "windows": self._windows(session, context)
-                    }),
-                )
+                return self._bounded({"windows": self._windows(session, context)})
             if action == "wait":
                 deadline = time.monotonic() + args.seconds
                 while time.monotonic() < deadline:
-                    if context.check_active is not None:
-                        context.check_active()
+                    context.check_active()
                     time.sleep(min(0.05, deadline - time.monotonic()))
-                return self._finish(
-                    session, {
-                        "waited_seconds": args.seconds,
-                        "verdict": "completed",
-                    },
-                )
+                return {"waited_seconds": args.seconds, "verdict": "completed"}
             if action in {"capture", "focus_app"}:
                 target = self._resolve_target(session, args, context)
                 if action == "focus_app":
@@ -197,14 +214,12 @@ class CuaCliBackend:
                                 "session": sid,
                             }, context,
                         )
-                        return self._finish(session, self._bounded({
+                        return self._bounded({
                             "target": target,
                             "result": self._structured(result),
                             "verdict": "verify_with_capture",
-                        }))
-                    return self._finish(
-                        session, {"target": target, "verdict": "selected"}
-                    )
+                        })
+                    return {"target": target, "verdict": "selected"}
                 result = self._call(
                     "get_window_state", {
                         "pid": target["pid"],
@@ -223,13 +238,13 @@ class CuaCliBackend:
                     if isinstance(item, dict)
                     and isinstance(item.get("element_index"), int)
                 }
-                return self._finish(session, self._bounded({
+                return self._bounded({
                     "target": target,
                     "ax_tree": content.get("tree_markdown"),
                     "elements": content.get("elements"),
                     "snapshot_id": content.get("snapshot_id"),
                     "verdict": "use_element_indices_or_re_capture",
-                }))
+                })
             target = session.target
             if target is None:
                 raise ValueError("capture or focus_app must select a target first")
@@ -323,21 +338,14 @@ class CuaCliBackend:
                     "delivery_mode", "success",
                 ) if key in safe
             }
-            return self._finish(session, self._bounded({
+            return self._bounded({
                 "action": action, "target": target,
                 "result": public_result,
                 "verdict": (
                     safe.get("verdict") or safe.get("escalation")
                     or ("verify_with_capture" if action != "set_value" else "check_value")
                 ),
-            }))
-
-    @staticmethod
-    def _finish(
-        session: _DesktopSession, payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        session.last_used = time.monotonic()
-        return payload
+            })
 
     @staticmethod
     def _element_center(
@@ -390,34 +398,58 @@ class CuaCliBackend:
             return payload
         return {"truncated": True, "preview": rendered[:20_000]}
 
-    def close_session(self, session_id: SessionResourceKey, *, deadline: float) -> None:
+    def close_session(self, session_id: SessionResourceKey, *, deadline: float,
+                      idle_before: float | None = None) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
         if session is None:
             return
-        if not session.lock.acquire(timeout=remaining(deadline)):
-            raise TimeoutError("session is still in use")
+        # Reaping is opportunistic; explicit reset/close waits only within budget.
+        if not session.lock.acquire(timeout=0 if idle_before is not None else remaining(deadline)):
+            if idle_before is not None:
+                return
+            raise SessionResourcesBusyError("session is still in use")
         try:
-            if remaining(deadline) <= 0:
-                raise TimeoutError("cleanup deadline expired")
-            self._call("end_session", {"session": session.driver_session}, None, timeout=remaining(deadline))
             with self._lock:
-                self._sessions.pop(session_id, None)
+                if self._sessions.get(session_id) is not session:
+                    return
+                if idle_before is not None and not session.closing and session.last_used > idle_before:
+                    return
+                if remaining(deadline) <= 0:
+                    raise TimeoutError("cleanup deadline expired")
+                session.closing = True
+            if session.started:
+                self._call("end_session", {"session": session.driver_session}, None, timeout=remaining(deadline))
+            with self._lock:
+                self._sessions.pop(session_id)
         finally:
             session.lock.release()
 
     def reap_idle(self, *, now: float, deadline: float) -> None:
         with self._lock:
-            candidates = tuple(self._sessions.items())
-        for sid, session in candidates:
-            if now - session.last_used >= self.idle_seconds:
-                self.close_session(sid, deadline=deadline)
+            candidates = tuple(self._sessions)
+        failure = None
+        for sid in candidates:
+            try:
+                self.close_session(sid, deadline=deadline, idle_before=now - self.idle_seconds)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
 
     def close(self, *, deadline: float) -> None:
         with self._lock:
+            self._closing = True
             sessions = tuple(self._sessions)
+        failure = None
         for sid in sessions:
-            self.close_session(sid, deadline=deadline)
+            try:
+                self.close_session(sid, deadline=deadline)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
+
 
 
 

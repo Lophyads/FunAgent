@@ -110,7 +110,7 @@ def available(context) -> bool:
 
 
 def computer_use(args: ComputerUseArgs, context: ToolContext) -> dict:
-    return context.resources.computer().execute(args, context)
+    return context.services.computer().execute(context.resource_key, args, context)
 
 
 def register_tools(registry: ToolRegistry) -> None:

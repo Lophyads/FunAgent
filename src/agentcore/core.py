@@ -9,16 +9,19 @@ import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
 from contextvars import copy_context
+from functools import partial
 from typing import Any, Callable, Sequence, TypeVar
 
 from .conversation_loop import ConversationLoop
-from .turn_phase import RouteState
+from .turn_persistence import TurnPersistence
+from .turn_preparation import prepare_stored_turn
+from .provider_runner import RouteState
 from .interfaces import (
     AllowAllGuard, TurnHostContext, MemoryProvider, MemoryUpdater,
     NoopMemoryProvider, NoopMemoryUpdater, NoopReviewScheduler,
     ReviewScheduler, ToolGuard, TurnCancelled,
 )
-from .lease import LeaseHeartbeatService, SQLiteTurnLeaseStore, TurnLeaseStore
+from .lease import LeaseScope, LeaseHeartbeatService, SQLiteTurnLeaseStore, TurnLeaseStore
 from log.logging_system import log_context
 from .models import AgentConfig, LeaseHandle, MemoryItem, TurnResult, TurnTrigger, UserInput
 from .observability import EventSink, LifecycleObserver, ObservabilityHub
@@ -147,12 +150,12 @@ class AgentCore:
             )
             rollback.callback(lambda: self._observability.close(remaining(cleanup_deadline)))
             self._session_contexts = SessionContextFactory(
-                store=self._store, prompt_builder=self._prompt_builder,
+                prompt_builder=self._prompt_builder,
                 toolset_resolver=self._toolset_resolver,
                 registry=self._tool_registry,
                 memory=_BoundedMemoryProvider(self, self._memory),
                 defaults=SessionBuildRequest.from_defaults(config.session_defaults),
-                memory_max_chars=config.memory_max_chars, services=self._tool_services,
+                memory_max_chars=config.memory_max_chars,
             )
             self._owner_id = str(uuid.uuid4())
 
@@ -273,7 +276,6 @@ class AgentCore:
         """Reject new work and cancel this owner's turns, retaining the Store."""
         with self._lifecycle_lock:
             self._closing = True
-        self._tool_services.cancel_owner(self._owner_id)
         drained = self._dispatcher.close(
             timeout=self._config.timeouts.finalize_seconds if timeout is None else timeout,
         )
@@ -434,27 +436,32 @@ class AgentCore:
         host_context: TurnHostContext = TurnHostContext(),
     ) -> TurnResult:
         self.start_blocking()
-        try:
-            return ConversationLoop(
-                config=self._config, user_input=user_input,
-                session_id=session_id, turn_id=turn_id,
-                owner_id=self._owner_id, session_request=session_request,
-                cancel_event=cancel_event, store=self._store,
-                session_contexts=self._session_contexts,
-                lease_store=self._lease_store, heartbeat=self._heartbeat,
-                provider_resolver=self._provider_resolver,
-                api_modes=self._api_modes, route_states=self._route_states,
-                guard=self._guard, host_context=host_context,
-                memory_updater=self._memory_updater,
-                review_scheduler=self._review_scheduler,
-                observability=self._observability,
-                call_operation=self.call_operation,
-                recovery=recovery,
-                delivery_destination=self._delivery_destination,
-                max_recovery_attempts=self._max_recovery_attempts,
-            ).run()
-        finally:
-            self._tool_services.end_turn(self._owner_id, turn_id)
+        persistence = TurnPersistence(session_id, self._store)
+        lease_scope = LeaseScope(
+            store=self._lease_store, heartbeat=self._heartbeat,
+            session_id=session_id, owner_id=self._owner_id, turn_id=turn_id,
+            policy=self._config.lease,
+        )
+        prepare = partial(
+            prepare_stored_turn, store=self._store, contexts=self._session_contexts,
+            persistence=persistence, user_input=user_input, request=session_request,
+            host_context=host_context, recovery=recovery,
+        )
+        return ConversationLoop(
+            config=self._config, user_input=user_input,
+            session_id=session_id, turn_id=turn_id,
+            owner_id=self._owner_id, services=self._tool_services, cancel_event=cancel_event,
+            persistence=persistence, lease_scope=lease_scope, prepare=prepare,
+            recovery=recovery, delivery_destination=self._delivery_destination,
+            max_recovery_attempts=self._max_recovery_attempts,
+            provider_resolver=self._provider_resolver,
+            api_modes=self._api_modes, route_states=self._route_states,
+            guard=self._guard, host_context=host_context,
+            memory_updater=self._memory_updater,
+            review_scheduler=self._review_scheduler,
+            observability=self._observability,
+            call_operation=self.call_operation,
+        ).run()
 
     def call_operation(
         self, function: Callable[[], T], *, timeout: float,

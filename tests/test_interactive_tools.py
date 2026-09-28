@@ -11,10 +11,10 @@ import pytest
 
 from agentcore import (
     AgentCore, GatewayRuntime, InteractionBroker, NormalizedModelResponse, ToolCall,
-    HostCapabilities, TurnHostContext, ToolInvocation,
+    HostCapabilities, TurnHostContext,
 )
 from agentcore.approval import ApprovalGrantStore
-from agentcore.interaction import ClarifyPayload, Question, InteractionUnavailable
+from agentcore.interaction import ClarifyPayload, Question
 from tools.computer_use_tool import ComputerUseArgs, _policy
 from tools.browser_backend import AgentBrowserBackend
 from tools.clarify_tool import ClarifyArgs

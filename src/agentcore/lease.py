@@ -6,7 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .models import LeaseHandle
+from .models import LeaseFence, LeaseHandle, LeasePolicy
+from .interfaces import TurnCancelled
 from .storage import LeaseLostError, SQLiteStore
 
 
@@ -162,8 +163,70 @@ class LeaseHeartbeatService:
                 self._entries.pop(value, None)
 
 
+class LeaseScope:
+    """One turn's lease lifecycle, separate from history and persistence."""
+
+    def __init__(
+        self, *, store: TurnLeaseStore, heartbeat: LeaseHeartbeatService,
+        session_id: str, owner_id: str, turn_id: str, policy: LeasePolicy,
+    ) -> None:
+        self._store, self._heartbeat, self._policy = store, heartbeat, policy
+        self.session_id, self.owner_id, self.turn_id = session_id, owner_id, turn_id
+        self._lease: LeaseHandle | None = None
+        self._lost = threading.Event()
+        self._closed = False
+        self._started = False
+
+    @property
+    def fence(self) -> LeaseFence:
+        if self._closed or self._lease is None:
+            raise RuntimeError("lease scope has no write fence")
+        return self._lease.fence
+
+    def acquire(self, check_active: Callable[[], None]) -> None:
+        if self._started or self._closed:
+            raise RuntimeError("lease scope can only be acquired once")
+        self._started = True
+        deadline = time.monotonic() + self._policy.wait_timeout_seconds
+        first_attempt = True
+        while True:
+            check_active()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 and not first_attempt:
+                raise LeaseAcquireTimeout(f"timed out waiting for session lease: {self.session_id}")
+            try:
+                self._lease = self._store.acquire(
+                    self.session_id, self.owner_id, self.turn_id,
+                    self._policy.ttl_seconds, max(0.0, min(0.1, remaining)),
+                )
+                break
+            except LeaseAcquireTimeout:
+                first_attempt = False
+        self._heartbeat.register(self._lease, self._lost)
+
+    def assert_current(self) -> None:
+        if self._closed:
+            raise TurnCancelled("lease scope is closed")
+        if self._lost.is_set():
+            raise LeaseLostError("session lease heartbeat was lost")
+        if self._lease is not None:
+            # Renewal changes the stored expiry; the original handle is only
+            # an identity/fence, never authoritative evidence of validity.
+            self._store.assert_current(self._lease)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._lease is not None:
+            try:
+                self._heartbeat.unregister(self._lease)
+            finally:
+                self._store.release(self._lease)
+
+
 __all__ = [
-    "LeaseAcquireTimeout",
+    "LeaseAcquireTimeout", "LeaseScope",
     "LeaseHeartbeatService",
     "LeaseLostError",
     "SQLiteTurnLeaseStore",

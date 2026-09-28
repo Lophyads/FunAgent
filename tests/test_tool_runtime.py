@@ -16,13 +16,9 @@ from agentcore import (
     ToolCall, ToolEntry, ToolRegistry, TurnHostContext, WorkerPolicy,
 )
 from agentcore.approval import ApprovalGrantStore
-from agentcore.interfaces import ApprovalDecision
 from agentcore.interaction import ApprovalPayload, InteractionBroker, InteractionUnavailable
-from agentcore.runtime_cwd import SessionWorkspaceConflict
 from tools.config import ToolSystemConfig, WorkspaceConfig
-from tools.lifecycle import (
-    ResourceUnavailableError, SessionResourceKey, SessionResourcesBusyError,
-)
+from tools.lifecycle import ResourceUnavailableError, SessionResourceKey
 from tools.runtime import (
     ToolSystemConfigConflict, ToolSystemNotInitialized, get_tool_registry,
     get_tool_services, initialize_tool_system, shutdown_tool_system,
@@ -128,7 +124,8 @@ def test_turn_workspace_isolation_without_chdir(config_factory, tmp_path):
     assert Path.cwd() == before
 
 
-def test_workspace_conflict_and_reset_preserve_history(config_factory, tmp_path, final_response):
+def test_workspace_change_and_reset_preserve_history(config_factory, tmp_path, final_response):
+    from test_tool_execution_resources import StatefulBrowser
     one, two = tmp_path / "one", tmp_path / "two"
     one.mkdir()
     two.mkdir()
@@ -140,42 +137,29 @@ def test_workspace_conflict_and_reset_preserve_history(config_factory, tmp_path,
         services = get_tool_services()
         key = host.agent.session_resource_key("s1")
         services.grants.grant(key, "write", "session")
-
-        class Resource:
-            closed = False
-            def close_session(self, key, *, deadline):
-                self.closed = True
-            def close(self, *, deadline):
-                pass
-
-        resource = Resource()
-        services._providers["test"] = resource
-        services._sessions[key].resources.add("test")
-        with pytest.raises(SessionWorkspaceConflict):
-            services.begin_execution(
-                namespace=key.namespace, profile=key.profile, task_id=key.session_id,
-                owner_id="other", turn_id="new", workspace_request=two,
-            )
-        assert host.reset_session_resources("s1").completed
-        assert resource.closed and not services.grants.allowed(key, "write")
-        assert host.agent._store.load_messages("s1")
+        browser = StatefulBrowser()
+        services._providers["browser"] = browser
+        browser._session(key)
         request = replace(SessionBuildRequest.from_defaults(config.session_defaults), workspace=two)
         assert host.run_turn_blocking("again", "s1", session_request=request).status == "completed"
-        assert services._sessions[key].workspace.cwd == two
+        assert key in browser._sessions and not browser.closed
+        assert Path(host.agent._store.load_session("s1").workspace) == two
+        assert host.reset_session_resources("s1").completed
+        assert browser.closed == [key] and not services.grants.allowed(key, "write")
+        assert host.agent._store.load_messages("s1")
+        assert Path(host.agent._store.load_session("s1").workspace) == two
 
 
-def test_replacement_agent_reuses_session_resources(config_factory, final_response):
+def test_replacement_agent_keeps_session_grants(config_factory, final_response):
     config = config_factory()
     with gateway(config, final_response) as first:
         first.run_turn_blocking("one", "stable")
         key = first.agent.session_resource_key("stable")
         services = get_tool_services()
-        state = services._sessions[key]
         services.grants.grant(key, "write", "session")
     with gateway(config, final_response) as replacement:
         replacement.run_turn_blocking("two", "stable")
         assert replacement.agent.session_resource_key("stable") == key
-        assert services._sessions[key] is state
         assert services.grants.allowed(key, "write")
 
 
@@ -251,19 +235,21 @@ def test_payload_is_defensively_copied_and_serializable():
     assert json.loads(json.dumps(request.to_dict()))["payload"]["arguments"] == {"items": [{"name": "original"}]}
 
 
-def test_timed_out_handler_remains_busy_until_real_exit(config_factory, agent_factory, final_response):
+def test_timed_out_stateless_handler_is_revoked_and_agent_waits_for_exit(config_factory, agent_factory, final_response):
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
     stale_checks = []
+    borrowed = []
 
     class Args(BaseModel):
         pass
 
     def handler(args, context):
+        borrowed.append(context)
         entered.set()
         try:
             assert release.wait(3)
             with pytest.raises(ResourceUnavailableError):
-                context.resources.browser()
+                context.check_active()
             stale_checks.append(True)
             return {}
         finally:
@@ -276,7 +262,13 @@ def test_timed_out_handler_remains_busy_until_real_exit(config_factory, agent_fa
     ))
     response = NormalizedModelResponse(tool_calls=[ToolCall(id="slow", name="slow", arguments="{}")], finish_reason="tool_calls")
     config = config_factory()
-    agent = agent_factory(config, tool_registry=registry, transports={"primary": ScriptedTransport(response, final_response)})
+    def next_response(request, context):
+        # This turn is still running: expiry must be per call, not just Turn cancellation.
+        with pytest.raises(ResourceUnavailableError):
+            borrowed[0].check_active()
+        return final_response
+
+    agent = agent_factory(config, tool_registry=registry, transports={"primary": ScriptedTransport(response, next_response)})
     try:
         submission = agent.submit_turn("go", "busy")
         assert entered.wait(2)
@@ -284,9 +276,9 @@ def test_timed_out_handler_remains_busy_until_real_exit(config_factory, agent_fa
         assert result.tool_outcomes[0].state == "unknown"
         key, services = agent.session_resource_key("busy"), get_tool_services()
         services.grants.grant(key, "write", "session")
-        with pytest.raises(SessionResourcesBusyError):
-            services.reset_session_resources(key)
-        assert services.grants.allowed(key, "write")
+        # No backend operation is running, so there is no resource occupancy to track.
+        assert services.reset_session_resources(key).completed
+        assert not services.grants.allowed(key, "write")
         report = agent.close_blocking(timeout=0.02)
         assert not report.completed and agent._store._opened
         release.set()
@@ -303,11 +295,6 @@ def test_cleanup_failure_reports_other_resources_and_retries(config_factory):
     configure_tools(config_factory())
     services = get_tool_services()
     key = SessionResourceKey("db", "profile", "s")
-    services.begin_execution(
-        namespace=key.namespace, profile=key.profile, task_id=key.session_id,
-        owner_id="owner", turn_id="turn",
-    )
-    services.end_execution("owner", "turn")
     calls = []
 
     class Resource:
@@ -322,17 +309,11 @@ def test_cleanup_failure_reports_other_resources_and_retries(config_factory):
             pass
 
     services._providers.update(first=Resource("first"), second=Resource("second"))
-    services._sessions[key].resources.update(("first", "second"))
     report = services.reset_session_resources(key)
     assert not report.completed and set(calls) == {"first", "second"}
     assert report.issues[0].error_code == "OSError" and "private" not in repr(report)
-    with pytest.raises(ResourceUnavailableError):
-        services.begin_execution(
-            namespace=key.namespace, profile=key.profile, task_id=key.session_id,
-            owner_id="owner", turn_id="another",
-        )
     assert services.reset_session_resources(key).completed
-    assert calls.count("first") == 2 and calls.count("second") == 1
+    assert calls.count("first") == 2 and calls.count("second") == 2
 
 
 def test_cleanup_timeout_joins_original_call(config_factory):
@@ -396,30 +377,21 @@ def test_custom_approver_can_request_human_without_blocking_operation_pool(confi
         assert get_tool_services().grants.allowed(host.agent.session_resource_key("approval"), "action")
 
 
-def test_idle_reaping_skips_active_turn_and_preserves_grants(config_factory):
+def test_idle_reaping_preserves_session_grants(config_factory, context_factory):
+    from test_tool_execution_resources import StatefulBrowser, visit
     configure_tools(config_factory())
     services = get_tool_services()
-    key = SessionResourceKey("db", "profile", "idle")
-    workspace = services.begin_execution(
-        namespace=key.namespace, profile=key.profile, task_id=key.session_id,
-        owner_id="owner", turn_id="turn",
-    )
-    calls = []
-    class Resource:
-        def close_session(self, key, *, deadline):
-            calls.append(key)
-        def close(self, *, deadline):
-            pass
-    services._providers["fake"] = Resource()
-    services._sessions[key].resources.add("fake")
-    services.grants.grant(key, "write", "session")
-    assert services.reap_idle(now=time.monotonic() + 2000).completed
-    assert calls == []
-    services.end_execution("owner", "turn")
-    assert services.reap_idle(now=time.monotonic() + 2000).completed
-    assert calls == [key]
-    assert services.grants.allowed(key, "write")
-    assert services._sessions[key].workspace == workspace
+    browser = StatefulBrowser()
+    services._provider_factories["browser"] = lambda: browser
+    with context_factory() as context:
+        key = context.resource_key
+        assert visit(context) == 1
+        services.grants.grant(key, "write", "session")
+        assert services.reap_idle(now=time.monotonic() + 2000).completed
+        assert browser.closed == [key]
+        # Activity means backend operations, not the lifetime of an entire turn.
+        assert visit(context) == 1
+        assert services.grants.allowed(key, "write")
 
 
 def test_invalid_workspace_does_not_create_session(config_factory, tmp_path):

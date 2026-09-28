@@ -15,7 +15,7 @@ from agentcore.storage import LeaseLostError, SCHEMA_VERSION
 from conftest import ScriptedTransport
 
 
-def test_schema_v8_has_exactly_four_business_tables(tmp_path):
+def test_schema_has_exactly_four_business_tables(tmp_path):
     path = tmp_path / "new.db"
     store = SQLiteStore(path)
     store.open()

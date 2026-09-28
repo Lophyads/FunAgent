@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, Sequence
 
 if TYPE_CHECKING:
     from .interaction import InteractionPort
     from .runtime_cwd import ResolvedWorkspace
-    from tools.context import ToolInteractions, ToolResources
+    from .session_context import SessionRuntimeSnapshot
+    from tools.context import ToolInteractions
+    from tools.services import ToolServices
+    from tools.lifecycle import SessionResourceKey
 
 from .models import MemoryItem, TurnResult, UserInput
 
@@ -21,6 +25,8 @@ class MemoryUpdater(Protocol):
 
 
 class ReviewScheduler(Protocol):
+    """Accept a detached turn for review; background schedulers only enqueue here."""
+
     def schedule(self, snapshot: "TurnSnapshot") -> None: ...
 
 
@@ -88,7 +94,7 @@ class TurnHostContext:
 class ToolContext:
     """单次工具调用借用的能力；Handler 使用这些接口，不需要持有 Agent 或 Gateway。
 
-    interactions 从本轮 TurnHostContext 接线，resources 访问按 Session 复用的后端；
+    interactions 从本轮 TurnHostContext 接线，后端按 resource_key 自行复用状态；
     取消/超时后应检查 check_active，不能把本次上下文留给后续调用继续使用。
     """
 
@@ -97,7 +103,8 @@ class ToolContext:
     tool_call_id: str
     workspace: ResolvedWorkspace
     interactions: ToolInteractions
-    resources: ToolResources
+    services: ToolServices
+    resource_key: SessionResourceKey
     cancellation: CancellationToken
     check_active: Callable[[], None]
 
@@ -125,6 +132,17 @@ class Approver(Protocol):
 class TurnSnapshot:
     result: TurnResult
     messages: tuple[dict[str, Any], ...]
+    context: SessionRuntimeSnapshot | None = None
+    workspace: ResolvedWorkspace | None = None
+    trace_id: str = ""
+
+    def copy(self) -> "TurnSnapshot":
+        """Detach mutable turn data while retaining the exact prompt/tool view."""
+        return TurnSnapshot(
+            result=self.result.model_copy(deep=True), messages=deepcopy(self.messages),
+            context=self.context.copy() if self.context is not None else None,
+            workspace=self.workspace, trace_id=self.trace_id,
+        )
 
 
 class NoopMemoryProvider:

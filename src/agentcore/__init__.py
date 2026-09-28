@@ -102,12 +102,15 @@ from tools.toolsets import (
 )
 
 __all__ = [
+    "PreparedConversation", "ProviderRunner",
+    "BackgroundReviewScheduler", "ReviewTask",
     "ApprovalGate", "ApprovalPayload", "ApprovalResponse", "ClarifyPayload", "ClarifyResponse",
     "Question", "CleanupIssue", "CleanupReport", "SessionResourceKey", "SessionResourcesBusyError",
     "ApprovalGrantStore", "InteractionBroker",
     "InteractionPort", "InteractionRequest", "ToolExecutionPolicy",
     "ToolServices",
     "AgentConfig", "AgentCore", "AgentEvent", "AllowAllGuard",
+    "ConversationLoop", "TurnPersistence", "LeaseScope",
     "ApiModeAdapter", "ApiModeRegistry", "ApprovalDecision", "Approver",
     "AttemptContext", "CancellationToken",
     "CanonicalModelRequest", "ChatCompletionsAdapter",
@@ -115,7 +118,7 @@ __all__ = [
     "DeliveryRuntime", "EnvironmentCredentialResolver", "GatewayRuntime",
     "EventEnvelope", "EventSink", "GuardDecision", "LeaseAcquireTimeout",
     "LeaseFence", "LeaseHandle", "LeaseHeartbeatService", "LeaseLostError",
-    "LeasePolicy", "LifecycleObserver", "LoopState", "MemoryItem",
+    "LeasePolicy", "LifecycleObserver", "LoggingConfig", "LoggingHandle", "LoopState", "MemoryItem",
     "MemoryProvider", "MemoryUpdater", "Message", "ModelRoute",
     "NoopMemoryProvider", "NoopMemoryUpdater", "NoopReviewScheduler",
     "NormalizedModelResponse", "NormalizedProviderError", "NullEventSink",
@@ -137,13 +140,20 @@ __all__ = [
     "TurnPhase", "TurnQueueFullError", "TurnResult", "TurnRuntime",
     "TurnSnapshot", "TurnTrigger", "UserInput", "WireRequest", "WireResponse", "WorkerPolicy",
     "WorkerQueueFullError", "default_api_mode_registry",
-    "load_config", "ToolSystemConfig", "WorkspaceConfig",
+    "load_config", "configure_logging", "ToolSystemConfig", "WorkspaceConfig",
     "initialize_tool_system", "get_tool_registry", "get_tool_services", "shutdown_tool_system",
     "HostCapabilities", "TurnHostContext", "HumanApprovalRequired",
 ]
 
 
 _LAZY_EXPORTS = {
+    "PreparedConversation": ".turn_preparation",
+    "ProviderRunner": ".provider_runner",
+    "BackgroundReviewScheduler": ".background_review",
+    "ReviewTask": ".background_review",
+    "ConversationLoop": ".conversation_loop",
+    "TurnPersistence": ".turn_persistence",
+    "LeaseScope": ".lease",
     "DeliveryAdapter": "gateway.delivery",
     "DeliveryBatch": "gateway.delivery",
     "DeliveryRuntime": "gateway.delivery",

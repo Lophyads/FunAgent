@@ -3,19 +3,25 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .interfaces import TurnCancelled
 from .models import (
     AgentConfig,
     CanonicalModelRequest,
-    LeaseHandle,
     Message,
     NormalizedModelResponse,
     ToolOutcome,
     TurnError,
 )
 from .session_context import SessionRuntimeSnapshot
+
+if TYPE_CHECKING:
+    from .lease import LeaseScope
+    from .turn_preparation import PreparedConversation
+    from tools.services import ToolServices
+    from tools.lifecycle import SessionResourceKey
+    from .runtime_cwd import ResolvedWorkspace
 
 
 class OperationTimeoutError(TimeoutError):
@@ -32,8 +38,9 @@ class LoopState:
     turn_id: str
     trace_id: str
     started_at_monotonic: float = field(default_factory=time.monotonic)
-    lease: LeaseHandle | None = None
     context: SessionRuntimeSnapshot | None = None
+    workspace: ResolvedWorkspace | None = None
+    resource_key: SessionResourceKey | None = None
     messages: list[Message] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     iteration: int = 0
@@ -51,19 +58,23 @@ class LoopState:
     provider_attempts: int = 0
     route_attempts: dict[str, int] = field(default_factory=dict)
     admitted: bool = False
-    session_created: bool = False
-    history_recovered: bool = False
     submitted_message: Message | None = None
     recovery_claimed: bool = False
     user_driven_recovery: bool = False
     finalized: bool = False
     released: bool = False
 
-    def require_lease(self, phase: str) -> LeaseHandle:
-        lease = self.lease
-        if lease is None:
-            raise RuntimeError(f"{phase} requires lease")
-        return lease
+    def accept(self, prepared: PreparedConversation) -> None:
+        if self.admitted:
+            raise RuntimeError("turn has already been admitted")
+        self.context = prepared.context.copy()
+        self.workspace = prepared.workspace
+        self.resource_key = prepared.resource_key
+        self.messages = [m.model_copy(deep=True) for m in prepared.messages]
+        self.submitted_message = self.messages[-1]
+        self.user_driven_recovery = prepared.user_driven_recovery
+        self.warnings.extend(prepared.warnings)
+        self.admitted = True
 
     def require_context(self, phase: str) -> SessionRuntimeSnapshot:
         context = self.context
@@ -87,13 +98,15 @@ class LoopState:
 @dataclass(slots=True)
 class TurnRuntime:
     config: AgentConfig
-    store: Any
-    lease_store: Any
+    owner_id: str
+    turn_id: str
+    services: ToolServices
     observability: Any
     cancel_event: threading.Event
-    lease_lost_event: threading.Event
     deadline: float | None
     call_operation: Callable[..., Any]
+    lease_scope: LeaseScope | None = None
+    _closed: threading.Event = field(default_factory=threading.Event)
     _budget_lock: threading.RLock = field(default_factory=threading.RLock)
     _paused_at: float | None = None
 
@@ -111,18 +124,21 @@ class TurnRuntime:
                 self.deadline += time.monotonic() - self._paused_at
             self._paused_at = None
 
-    def check_active(self, state: LoopState) -> None:
+    def check_active(self) -> None:
+        if self._closed.is_set():
+            raise TurnCancelled("turn execution is closed")
         if self.cancel_event.is_set():
             raise TurnCancelled("turn was cancelled")
-        if self.lease_lost_event.is_set():
-            raise TurnCancelled("session lease was lost")
         with self._budget_lock:
             if self._paused_at is None and (
                 self.deadline is not None and time.monotonic() >= self.deadline
             ):
                 raise RunBudgetExceeded("turn run budget was exhausted")
-        if state.lease is not None:
-            self.lease_store.assert_current(state.lease)
+        if self.lease_scope is not None:
+            self.lease_scope.assert_current()
+
+    def close(self) -> None:
+        self._closed.set()
 
 
 __all__ = [

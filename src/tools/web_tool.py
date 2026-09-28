@@ -92,8 +92,7 @@ def _search_subprocess(
             process.stdin.close()
             deadline = time.monotonic() + timeout
             while process.poll() is None:
-                if context.check_active is not None:
-                    context.check_active()
+                context.check_active()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("search timed out")
                 time.sleep(0.05)
@@ -221,23 +220,22 @@ def search_available(context) -> bool:
 
 def web_search(args: WebSearchArgs, context: ToolContext) -> dict:
     return _bound_search(
-        context.resources.search(args.query, args.limit, context), args.limit,
+        context.services.search(args.query, args.limit, context), args.limit,
     )
 
 
 def web_extract(args: WebExtractArgs, context: ToolContext) -> dict:
-    config = context.resources.config
+    config = context.services.config.tools
     root = context.workspace.cwd
     max_bytes = config.artifact_max_bytes
     allow_private = config.allow_private_web_addresses
     page_budget = min(args.char_limit, max(1000, 23_000 // len(args.urls)))
     pages = []
     for url in args.urls:
-        if context.check_active is not None:
-            context.check_active()
+        context.check_active()
         try:
             validate_url(url, allow_private=allow_private)
-            final_url, content_type, data = context.resources.fetch(url)
+            final_url, content_type, data = context.services.fetch(url, context)
             validate_url(final_url, allow_private=allow_private)
             context.check_active()
             text = _decode_content(content_type, data)

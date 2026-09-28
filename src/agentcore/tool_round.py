@@ -8,8 +8,8 @@ from pydantic import ValidationError
 
 from .interfaces import TurnCancelled
 from .models import Message, NormalizedModelResponse
-from .storage import SQLiteStore
 from .tool_execution import ToolExecutor
+from .turn_persistence import TurnPersistence
 from .turn_state import LoopState, RunBudgetExceeded, TurnRuntime
 
 
@@ -17,18 +17,17 @@ logger = logging.getLogger(__name__)
 
 
 class ToolRoundRunner:
-    """Persist and execute one complete assistant tool-call round."""
+    """Stage and execute a tool-call round with optional durable writes."""
 
-    def __init__(self, *, store: SQLiteStore, executor: ToolExecutor) -> None:
-        self._store = store
+    def __init__(self, *, executor: ToolExecutor, persistence: TurnPersistence) -> None:
         self._executor = executor
+        self._persistence = persistence
 
     def run(
         self, runtime: TurnRuntime, state: LoopState,
         response: NormalizedModelResponse,
     ) -> None:
         context = state.require_context("tool_round")
-        lease = state.require_lease("tool_round")
         call_ids = [call.id for call in response.tool_calls]
         logger.info(
             "tool.round_preparing phase=%s iteration=%s tool_call_count=%s "
@@ -65,9 +64,7 @@ class ToolRoundRunner:
             raise
 
         try:
-            parent_message_id = self._store.append_tool_calls(
-                state.session_id, assistant, fence=lease.fence,
-            )
+            self._persistence.save_tool_calls(assistant)
         except BaseException as exc:
             logger.error(
                 "tool.stage_failed phase=%s iteration=%s tool_call_count=%s "
@@ -77,6 +74,8 @@ class ToolRoundRunner:
             )
             raise
 
+        state.messages.append(assistant)
+        state.assistant_message = assistant
         round_started = time.monotonic()
         outcome_start = len(state.tool_outcomes)
         logger.info(
@@ -89,11 +88,8 @@ class ToolRoundRunner:
                 session_id=state.session_id, turn_id=state.turn_id,
                 phase="tool_round", payload={"tool_name": call.name},
             )
-        state.messages.append(assistant)
-        state.assistant_message = assistant
-
         for tool_call in response.tool_calls:
-            runtime.check_active(state)
+            runtime.check_active()
             logger.debug(
                 "tool.arguments_preview tool_name=%s preview=%s",
                 tool_call.name,
@@ -102,12 +98,9 @@ class ToolRoundRunner:
             tool_started = time.monotonic()
             executed = self._executor.execute(
                 runtime, state, tool_call,
-                parent_message_id=parent_message_id,
             )
             tool_duration_ms = int((time.monotonic() - tool_started) * 1000)
-            self._store.append_tool_result(
-                state.session_id, executed.message, fence=lease.fence,
-            )
+            self._persistence.save_tool_result(executed.message)
             state.messages.append(executed.message)
             state.tool_outcomes.append(executed.outcome)
             tool_event = f"tool.{executed.outcome.state}"

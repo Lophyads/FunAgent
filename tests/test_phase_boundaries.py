@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agentcore.provider_runner import ProviderRunner
+
 import sqlite3
 from types import SimpleNamespace
 import inspect
@@ -160,7 +162,7 @@ def test_missing_request_and_response_fail_in_their_phases():
     state = LoopState("session", "turn", "trace")
     runtime = SimpleNamespace(check_active=lambda: None)
     with pytest.raises(RuntimeError, match="provider_attempts requires request"):
-        loop._run_provider_attempts(None, state)
+        ProviderRunner.run(None, None, state)
     with pytest.raises(RuntimeError, match="assemble_request requires context"):
         loop._assemble_phase()(runtime, state)
     with pytest.raises(RuntimeError, match="tool_round requires response"):
@@ -331,7 +333,7 @@ def test_cleanup_failure_preserves_original_error_and_releases_lease(
     def fail_repair(self, runtime, state):
         raise RuntimeError("repair unavailable")
 
-    monkeypatch.setattr(TurnPhases, "_run_provider_attempts", fail_provider)
+    monkeypatch.setattr(ProviderRunner, "run", fail_provider)
     monkeypatch.setattr(TurnPhases, "_repair", fail_repair)
     config = config_factory()
     with agent_factory(
@@ -397,7 +399,7 @@ def test_expected_provider_phase_errors_break_without_outer_handler(
     def fail_provider(self, runtime, state):
         raise failure
 
-    monkeypatch.setattr(TurnPhases, "_run_provider_attempts", fail_provider)
+    monkeypatch.setattr(ProviderRunner, "run", fail_provider)
     monkeypatch.setattr(TurnPhases, "handle_outer_loop_error", outer)
     config = config_factory()
     with agent_factory(

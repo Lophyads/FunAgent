@@ -37,8 +37,10 @@ def tool_response(*ids):
 
 def memory_loop(config, transport, *, handler=lambda args, context: args.text,
                 history=(), guard=None, cancel=None, persistence=None, prepare=None,
-                workspace=None, model_context=None, turn_id="review-turn"):
-    resolver, adapters, adapter = scripted_provider_stack(config, {"primary": transport})
+                workspace=None, model_context=None, turn_id="review-turn", services=None, resource_key=None):
+    resolver, adapters, adapter = scripted_provider_stack(
+        config, {"primary": transport}, initialize_tools=services is None,
+    )
     entry = ToolEntry(
         tool_id="test.echo", implementation_version="1", name="echo",
         description="Echo text", args_model=EchoArgs, handler=handler,
@@ -58,7 +60,8 @@ def memory_loop(config, transport, *, handler=lambda args, context: args.text,
 
     loop = ConversationLoop(
         config=config, user_input=UserInput(text="review"),
-        session_id="parent-session", turn_id=turn_id, owner_id="review-owner",
+        session_id="parent-session", turn_id=turn_id,
+        owner_id="review-owner", services=services or get_tool_services(), resource_key=resource_key,
         cancel_event=cancel or threading.Event(), persistence=persistence, workspace=workspace,
         **({"context": context, "history": history} if prepare is None else {"prepare": prepare}),
         provider_resolver=resolver, api_modes=adapters,
@@ -101,8 +104,7 @@ def test_same_loop_runs_tools_without_opening_database_or_acquiring_lease(config
     assert not config.database_path.exists()
     assert loop._state.context == source
     assert seen[0].workspace.cwd == get_tool_services().config.workspace.default_cwd
-    assert not get_tool_services()._executions
-    assert not get_tool_services()._sessions
+    assert not get_tool_services()._providers
     assert seen[0].session_id == "parent-session"
     with pytest.raises(Exception, match="no longer active|closed"):
         seen[0].check_active()
@@ -310,7 +312,7 @@ def test_disabled_loop_can_read_existing_history_without_writing(
         prepare = partial(
             prepare_stored_turn, store=store, contexts=agent._session_contexts,
             persistence=writer, user_input=UserInput(text="review"), request=None,
-            host_context=TurnHostContext(), recovery=False, max_recovery_attempts=3,
+            host_context=TurnHostContext(), recovery=False,
         )
         loop, _, adapter, events = memory_loop(
             config, ScriptedTransport(NormalizedModelResponse(content="review answer")),

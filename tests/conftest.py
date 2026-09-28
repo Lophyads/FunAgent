@@ -5,7 +5,6 @@ import json
 import threading
 from dataclasses import replace
 from contextlib import contextmanager
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -31,7 +30,7 @@ from agentcore.provider_runtime import normalize_provider_exception
 
 from agentcore.interfaces import CancellationToken, ToolContext, TurnHostContext, HostCapabilities
 from tools.config import ToolSystemConfig, WorkspaceConfig
-from tools.context import ToolAvailabilityContext, BackendProbes, ToolUse, ToolInteractions, ToolResources
+from tools.context import ToolAvailabilityContext, BackendProbes, ToolInteractions
 from tools.model_tools import discover_builtin_tools
 from tools import runtime as tool_runtime
 from tools.runtime import initialize_tool_system, get_tool_registry, get_tool_services, shutdown_tool_system
@@ -87,20 +86,31 @@ def context_factory(tmp_path):
         if tool_runtime._state is tool_runtime.ToolSystemState.UNINITIALIZED:
             initialize_tool_system(ToolSystemConfig(workspace=WorkspaceConfig(default_cwd=tmp_path, allowed_root=tmp_path)))
         services = get_tool_services()
-        workspace = services.begin_execution(
-            namespace="test", profile="test", task_id=session_id,
-            owner_id="test-owner", turn_id=turn_id,
+        from agentcore.runtime_cwd import resolve_workspace
+        from tools.lifecycle import ResourceUnavailableError, SessionResourceKey
+        key = SessionResourceKey("test", "test", session_id)
+        closed = threading.Event()
+
+        def check():
+            if closed.is_set():
+                raise ResourceUnavailableError("tool call is no longer active")
+            check_active()
+            services.check_open()
+
+        interactions = ToolInteractions(
+            services, host or TurnHostContext(), key, "test-owner", turn_id, call_id,
+            check, lambda: None, lambda: None,
         )
-        use = services.create_use("test-owner", turn_id, call_id, check_active)
         try:
-            with services.tool_use(use):
-                yield ToolContext(
-                    session_id, turn_id, call_id, workspace,
-                    ToolInteractions(use, host or TurnHostContext(), lambda: None, lambda: None),
-                    ToolResources(use), CancellationToken(threading.Event()), use.check,
-                )
+            yield ToolContext(
+                session_id=session_id, turn_id=turn_id, tool_call_id=call_id,
+                workspace=resolve_workspace(None, None, services.config.workspace),
+                interactions=interactions, services=services, resource_key=key,
+                cancellation=CancellationToken(threading.Event()), check_active=check,
+            )
         finally:
-            services.end_execution("test-owner", turn_id)
+            closed.set()
+            services.interactions.cancel(owner_id="test-owner", turn_id=turn_id)
     return factory
 
 
@@ -165,9 +175,11 @@ class ScriptedApiModeAdapter:
 
 
 def scripted_provider_stack(
-    config: AgentConfig, transports: Mapping[str, ScriptedTransport],
+    config: AgentConfig, transports: Mapping[str, ScriptedTransport], *,
+    initialize_tools: bool = True,
 ) -> tuple[StaticProviderResolver, ApiModeRegistry, ScriptedApiModeAdapter]:
-    configure_tools(config)
+    if initialize_tools:
+        configure_tools(config)
     adapter = ScriptedApiModeAdapter()
     api_modes = ApiModeRegistry()
     api_modes.register(adapter)

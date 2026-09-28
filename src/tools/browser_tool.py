@@ -44,27 +44,27 @@ class ConsoleArgs(BaseModel):
 
 
 def navigate(args: NavigateArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "open", [args.url], context,
         navigation_url=args.url, snapshot=True,
     )
 
 
 def snapshot(args: SnapshotArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "snapshot", [] if args.full else ["-c"],
         context,
     )
 
 
 def click(args: RefArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "click", [_ref(args.ref)], context
     )
 
 
 def type_text(args: TypeArgs, context: ToolContext) -> dict:
-    result = context.resources.browser().action(
+    result = context.services.browser().action(context.resource_key,
         "fill", [_ref(args.ref), args.text], context
     )
     return {
@@ -76,18 +76,18 @@ def type_text(args: TypeArgs, context: ToolContext) -> dict:
 
 
 def scroll(args: ScrollArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "scroll",
         [args.direction, str(args.pixels)], context,
     )
 
 
 def back(args: EmptyArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action("back", [], context)
+    return context.services.browser().action(context.resource_key,"back", [], context)
 
 
 def press(args: PressArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "press", [args.key], context,
     )
 
@@ -97,13 +97,13 @@ def get_images(args: EmptyArgs, context: ToolContext) -> dict:
         "JSON.stringify(Array.from(document.images).slice(0,100)"
         ".map(i=>({url:i.currentSrc||i.src,alt:i.alt})))"
     )
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "eval", [expression], context,
     )
 
 
 def console(args: ConsoleArgs, context: ToolContext) -> dict:
-    return context.resources.browser().action(
+    return context.services.browser().action(context.resource_key,
         "console",
         ["--clear"] if args.clear else [], context,
     )

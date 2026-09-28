@@ -9,7 +9,7 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - Session 仅冻结 Prompt；工具定义在每个 Turn 开始时重新解析，Memory recall 只在新 Session bootstrap 时执行。
 - Provider Resolver、API Mode Adapter 与单次请求 Transport 三层解耦。
 - 显式 Phase orchestrator，Provider retry 不增加 Agent iteration。
-- SQLite schema v8：Session、消息、Session Lease 和投递义务四张业务表。
+- SQLite schema v9：Session、消息、Session Lease 和投递义务四张业务表。
 - 单调 fencing token、独立 heartbeat 线程和 stale-owner 写入拒绝。
 - 顺序工具执行、Pydantic 参数校验、guard、approval 与未知副作用恢复语义。
 - GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
@@ -153,18 +153,20 @@ def register_tools(registry: ToolRegistry) -> None:
 ```
 
 注册代码只声明固定元数据，不捕获 Agent、目录或服务实例。
-Handler 从 `context.workspace`、`context.interactions` 和 `context.resources`
-获取本次调用的能力；`check_fn` 接收只读 `ToolAvailabilityContext`。
+Handler 从 `context.workspace`、`context.interactions` 和 `context.services`
+获取本次调用的依赖；有状态后端通过 `context.resource_key` 复用实例。
+`check_fn` 接收只读 `ToolAvailabilityContext`。
 候选工具依次经过 toolset、权限、宿主能力和后端可用性检查。
 
 显式管理更新调用 `get_tool_registry().replace_all(entries)`，
 整批校验成功后才发布。进行中的 Turn 使用已加载的 ToolEntry。
 异步 Handler 被拒绝；工具超时只表示 Core 停止等待。
-真实 Handler 退出前保留资源使用记录；未完成工具永不自动重放。
+调用结束或超时后，`context.check_active()` 会拒绝继续使用该上下文。
+后端操作持有实例锁直到操作退出；未完成工具永不自动重放。
 
 工作区通过 `[workspace] default_cwd/allowed_root` 配置，相对路径相对 TOML 文件目录解析。
 可信宿主可通过 `SessionBuildRequest.workspace` 指定目录，不能越过 allowed_root。
-不切换进程 cwd；已有资源时变更目录返回 `SessionWorkspaceConflict`，须先重置资源。
+不切换进程 cwd；目录随会话保存并跨 Turn 继承，变更目录无需重置浏览器。
 
 ## Provider 扩展
 
@@ -177,10 +179,14 @@ cooldown、fallback 和当前 Turn route 粘滞由 ConversationLoop 统一控制
 `TurnResult.status == "completed"` 仅表示模型正常结束本轮。业务工具是否成功需结合
 `completion_reason`、`tool_outcomes`、`provider_attempts` 和 `route_attempts` 判断。
 
-SQLite v8 仅包含 `sessions`、`messages`、`session_leases` 和
+SQLite v9 仍包含 `sessions`、`messages`、`session_leases` 和
 `delivery_obligations` 四张业务表。历史顺序由 `messages.id` 决定；崩溃恢复从
-Session 尾消息和过期 lease 判断。v8 不迁移旧库，升级前须停止旧进程并显式删除旧
-SQLite 文件及其 WAL/SHM sidecar；旧会话数据不可恢复。
+Session 尾消息和过期 lease 判断。升级前停止旧进程；现有 v8 数据库会自动增加
+`sessions.workspace` 字段并保留数据，更早的非兼容 schema 仍会被拒绝。
+
+工具后端自行按稳定的资源键复用浏览器/桌面，不再为每个 Turn 登记工具资源。
+workspace 随会话配置保存，切换目录不清空浏览器。闲置回收按后端实际操作时间计算；
+运行中的操作受后端锁保护。接口与复盘接入见[执行与工具边界](docs/conversation-loop-session-boundary.md)。
 
 ## 配置
 
