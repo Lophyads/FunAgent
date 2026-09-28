@@ -34,9 +34,6 @@ TOOLSETS: dict[str, dict[str, tuple[str, ...]]] = {
 
 @dataclass(frozen=True, slots=True)
 class ToolsetRequest:
-    profile: str
-    surface: str
-    platform: str
     enabled_toolsets: tuple[str, ...]
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()

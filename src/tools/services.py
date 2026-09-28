@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from agentcore.approval import ApprovalGate, ApprovalGrantStore
@@ -35,6 +36,7 @@ class ToolServices:
         self.approvals = ApprovalGate(self.grants, config.approver)
         self._lock = threading.RLock()
         self._providers: dict[str, Any] = {}
+        self._protected_paths: set[Path] = set()
         self._provider_factories = {
             "browser": self._new_browser,
             "computer": self._new_computer,
@@ -87,6 +89,21 @@ class ToolServices:
         with self._lock:
             if self._closing:
                 raise ResourceUnavailableError("tool runtime is stopping")
+
+    def protect_path(self, path: Path) -> None:
+        with self._lock:
+            self.check_open()
+            self._protected_paths.add(Path(path).resolve())
+
+    def unprotect_path(self, path: Path) -> None:
+        with self._lock:
+            self._protected_paths.discard(Path(path).resolve())
+
+    def is_protected_path(self, path: Path) -> bool:
+        candidate = Path(path).resolve()
+        with self._lock:
+            return any(candidate == root or candidate.is_relative_to(root)
+                       for root in self._protected_paths)
 
     def _provider(self, name: str):
         with self._lock:
@@ -146,7 +163,7 @@ class ToolServices:
         """Close this key in initialized backends; caller quiesces session submissions."""
         deadline = time.monotonic() + max(0, timeout)
         if not self._session_cleanup_lock.acquire(timeout=remaining(deadline)):
-            return CleanupReport((CleanupIssue("session", key.backend_id, "close", "cleanup_busy", True),))
+            return CleanupReport((CleanupIssue("session", key.session_id, "close", "cleanup_busy", True),))
         try:
             with self._lock:
                 self.check_open()
@@ -155,7 +172,7 @@ class ToolServices:
             issues = []
             for name, provider in providers:
                 issue = self._cleanup(
-                    (name, key.backend_id, "close_session"),
+                    (name, key.session_id, "close_session"),
                     lambda p=provider: p.close_session(key, deadline=deadline), deadline,
                 )
                 if issue:

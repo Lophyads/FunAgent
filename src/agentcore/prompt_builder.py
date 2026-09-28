@@ -7,11 +7,6 @@ from typing import Protocol
 
 @dataclass(frozen=True, slots=True)
 class PromptBuildRequest:
-    profile: str
-    surface: str
-    platform: str
-    config_version: str
-    enabled_skills: tuple[str, ...]
     bootstrap_memory: tuple[str, ...]
 
 

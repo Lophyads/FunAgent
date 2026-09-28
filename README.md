@@ -9,7 +9,7 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - Session 仅冻结 Prompt；工具定义在每个 Turn 开始时重新解析，Memory recall 只在新 Session bootstrap 时执行。
 - Provider Resolver、API Mode Adapter 与单次请求 Transport 三层解耦。
 - 显式 Phase orchestrator，Provider retry 不增加 Agent iteration。
-- SQLite schema v9：Session、消息、Session Lease 和投递义务四张业务表。
+- SQLite schema v10：Session、消息、Session Lease 和投递义务四张业务表。
 - 单调 fencing token、独立 heartbeat 线程和 stale-owner 写入拒绝。
 - 顺序工具执行、Pydantic 参数校验、guard、approval 与未知副作用恢复语义。
 - GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
@@ -46,6 +46,18 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 
 可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
 ；该命令不下载或升级程序。
+
+## 文件记忆
+
+示例配置启用 `[file_memory]` 与 `memory` toolset。配置文件旁的
+`memories/MEMORY.md` 和 `memories/USER.md` 保存长期笔记与稳定用户事实；
+不适合直接作为指令。`memory` 工具支持 `list/add/replace/remove`，其中
+`replace/remove` 走现有人工审批。新会话读取文件并冻结提示词，当前会话写入后仍
+使用原提示词。每 `review_every_turns` 个完成的普通用户轮次会排入后台复盘；设为
+`0` 可关闭。后台复盘仅可 `list/add`，且不写入主会话历史。进程退出时尚未完成的
+复盘不会补跑。旧版按子目录保存的记忆不会自动合并；升级前如已写入记忆，
+请先将需要保留的条目整理到记忆目录下的两个文件中。直接嵌入 `AgentCore` 时可使用 `file_memory.FileMemoryFeature`
+安装工具并传入 `prompt_builder`、`review_scheduler`，在关闭 Agent 后关闭 Feature。
 
 ## 诊断日志
 
@@ -97,8 +109,8 @@ finally:
 异步宿主可使用 `async with AgentCore(config)` 和 `await agent.run_turn(...)`，
 初始化与全局关闭仍由进程入口负责。Agent 不接受工具注册表或服务注入，也不会关闭共享服务。
 
-通过 `session_request` 指定 Session 身份、权限和可信工作区请求。
-既有 Session 的 profile/surface/platform 不允许改变，Prompt 保持原样；
+通过 `session_request` 指定本轮工具集、权限和可信工作区请求。
+既有 Session 的 Prompt 保持原样；
 Registry 更新只影响后续 Turn。直接调用默认没有人工交互能力；需要交互时传入
 `TurnHostContext(HostCapabilities(...), interaction_port)`。
 
@@ -119,7 +131,7 @@ GatewayRuntime 负责 Session 接入、交互路由、恢复和可选投递，�
 示例见 [examples/interaction_host.py](examples/interaction_host.py)，完整契约见
 [CLI 经 Gateway 接入设计](docs/funagent-cli-gateway-development-design.md)。
 
-Registry 和 ToolServices 在同一进程内共享，资源按数据库命名空间/profile/session_id 隔离。
+Registry 和 ToolServices 在同一进程内共享，浏览器和桌面资源按 session_id 区分。
 替换 Agent 不释放 Session 资源；关闭 Gateway 不关闭其他使用者借用的进程服务。
 全局 shutdown 由最外层进程入口负责，不由借用 Gateway 的界面负责。
 
@@ -179,10 +191,11 @@ cooldown、fallback 和当前 Turn route 粘滞由 ConversationLoop 统一控制
 `TurnResult.status == "completed"` 仅表示模型正常结束本轮。业务工具是否成功需结合
 `completion_reason`、`tool_outcomes`、`provider_attempts` 和 `route_attempts` 判断。
 
-SQLite v9 仍包含 `sessions`、`messages`、`session_leases` 和
+SQLite v10 仍包含 `sessions`、`messages`、`session_leases` 和
 `delivery_obligations` 四张业务表。历史顺序由 `messages.id` 决定；崩溃恢复从
 Session 尾消息和过期 lease 判断。升级前停止旧进程；现有 v8 数据库会自动增加
-`sessions.workspace` 字段并保留数据，更早的非兼容 schema 仍会被拒绝。
+`sessions.workspace` 字段，v8/v9 的历史会话身份列保留原值但不再使用；新数据库
+不创建这些列。更早的非兼容 schema 仍会被拒绝。
 
 工具后端自行按稳定的资源键复用浏览器/桌面，不再为每个 Turn 登记工具资源。
 workspace 随会话配置保存，切换目录不清空浏览器。闲置回收按后端实际操作时间计算；
@@ -193,7 +206,7 @@ workspace 随会话配置保存，切换目录不清空浏览器。闲置回收�
 新增 tools 配置控制 Web/browser 私有地址策略、artifact 大小和交互等待时限；
 approvals.always 仅在人工选择永久授权后原子写入。
 
-- `[session]`：新 Session 的 profile、surface、skills、toolsets 与 permissions。
+- `[session]`：新 Session 的 toolsets 与 permissions。
 - `[lease]`：TTL、heartbeat 周期和跨进程等待上限。
 - `[workers]`：turn/operation daemon worker 数量及有界队列。
 - `[timeouts]`：总预算和工具、策略、memory、observer、review、finalize 上限。

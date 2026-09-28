@@ -262,7 +262,6 @@ def test_disabled_writer_skips_all_writes_even_with_a_store(config_factory, monk
         monkeypatch.setattr(store, "_transaction", forbidden)
         writer = TurnPersistence("branch", store, persist_disabled=True)
         writer.save_new_session(
-            profile="default", surface="cli", platform="local",
             system_prompt_bytes=b"prompt", user_message=Message.user("question"),
         )
         writer.save_user_message(Message.user("next"))
@@ -340,7 +339,6 @@ def test_persistence_maps_reused_tool_ids_per_batch_without_mutating_messages(co
     writer = TurnPersistence("session", store, fence=scope.fence)
     try:
         writer.save_new_session(
-            profile="default", surface="cli", platform="local",
             system_prompt_bytes=b"prompt", user_message=Message.user("question"),
         )
         message = Message.tool_result(

@@ -12,7 +12,7 @@ build/
 *.db-shm
 *.db-wal
 .env
-
+docs/
 logs/
 .correlation-key
 .funagent/

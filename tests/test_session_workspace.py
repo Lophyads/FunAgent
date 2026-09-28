@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agentcore import Message, NormalizedModelResponse, SessionBuildRequest, SQLiteStore, ToolCall
-from agentcore.storage import LeaseLostError, SCHEMA_VERSION, _SCHEMA
+from agentcore.storage import LeaseLostError, SCHEMA_VERSION, StorageError, _SCHEMA
 from tools.config import WorkspaceConfig
 from tools.runtime import get_tool_services
 from conftest import ScriptedTransport
@@ -57,7 +57,13 @@ def test_v8_workspace_upgrade_preserves_data_and_fences_updates(tmp_path):
     path = tmp_path / "v8.db"
     # Reconstruct the previous schema, including a real existing session and history.
     with sqlite3.connect(path) as connection:
-        connection.executescript(_SCHEMA.replace("    workspace TEXT,\n", ""))
+        legacy_schema = _SCHEMA.replace(
+            "    id TEXT PRIMARY KEY,\n    system_prompt_bytes",
+            "    id TEXT PRIMARY KEY,\n    profile TEXT NOT NULL,\n"
+            "    surface TEXT NOT NULL,\n    platform TEXT NOT NULL,\n"
+            "    system_prompt_bytes", 1,
+        ).replace("    workspace TEXT,\n", "", 1)
+        connection.executescript(legacy_schema)
         connection.execute("PRAGMA user_version = 8")
         connection.execute(
             "INSERT INTO sessions(id,profile,surface,platform,system_prompt_bytes,created_at,updated_at) "
@@ -79,10 +85,84 @@ def test_v8_workspace_upgrade_preserves_data_and_fences_updates(tmp_path):
         assert store.load_session("legacy").workspace == str(tmp_path)
         assert [m.content for m in store.load_messages("legacy")] == ["keep me", "next"]
         store.release_lease(successor)
+        fresh = store.acquire_lease(session_id="new", owner_id="new", turn_id="new", ttl_seconds=30)
+        store.create_session(
+            "new", system_prompt_bytes=b"new prompt",
+            user_message=Message.user("new question"), fence=fresh.fence,
+        )
+        store.release_lease(fresh)
     finally:
         store.close()
     store.open()  # Upgrade is idempotent.
     store.close()
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        assert [row[1] for row in connection.execute("PRAGMA table_info(sessions)")].count("workspace") == 1
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(sessions)")]
+        assert columns.count("workspace") == 1
+        assert {"profile", "surface", "platform"}.issubset(columns)
+        assert connection.execute(
+            "SELECT profile,surface,platform FROM sessions WHERE id='legacy'"
+        ).fetchone() == ("default", "cli", "local")
+        assert connection.execute(
+            "SELECT profile,surface,platform FROM sessions WHERE id='new'"
+        ).fetchone() == ("", "", "")
+
+
+def test_new_database_has_no_session_identity_columns(tmp_path):
+    path = tmp_path / "new.db"
+    store = SQLiteStore(path)
+    store.open()
+    store.close()
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+    assert {"profile", "surface", "platform"}.isdisjoint(columns)
+
+
+def test_v9_upgrade_preserves_legacy_columns_and_accepts_new_sessions(tmp_path):
+    path = tmp_path / "v9.db"
+    with sqlite3.connect(path) as connection:
+        legacy_schema = _SCHEMA.replace(
+            "    id TEXT PRIMARY KEY,\n    system_prompt_bytes",
+            "    id TEXT PRIMARY KEY,\n    profile TEXT NOT NULL,\n"
+            "    surface TEXT NOT NULL,\n    platform TEXT NOT NULL,\n"
+            "    system_prompt_bytes", 1,
+        )
+        connection.executescript(legacy_schema)
+        connection.execute("PRAGMA user_version = 9")
+        connection.execute(
+            "INSERT INTO sessions(id,profile,surface,platform,system_prompt_bytes,"
+            "created_at,updated_at,workspace) VALUES('old','alice','cli','win',?,1,1,?)",
+            (b"prompt", str(tmp_path)),
+        )
+    store = SQLiteStore(path)
+    store.open()
+    try:
+        assert store.load_session("old").workspace == str(tmp_path)
+        lease = store.acquire_lease(session_id="new", owner_id="new", turn_id="new", ttl_seconds=30)
+        store.create_session("new", system_prompt_bytes=b"new",
+                             user_message=Message.user("hello"), fence=lease.fence)
+        store.release_lease(lease)
+    finally:
+        store.close()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute(
+            "SELECT profile,surface,platform FROM sessions WHERE id='old'"
+        ).fetchone() == ("alice", "cli", "win")
+        assert connection.execute(
+            "SELECT profile,surface,platform FROM sessions WHERE id='new'"
+        ).fetchone() == ("", "", "")
+
+
+def test_partial_legacy_identity_schema_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "partial.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(_SCHEMA.replace(
+            "    id TEXT PRIMARY KEY,\n    system_prompt_bytes",
+            "    id TEXT PRIMARY KEY,\n    profile TEXT NOT NULL,\n    system_prompt_bytes", 1,
+        ))
+        connection.execute("PRAGMA user_version = 9")
+    with pytest.raises(StorageError, match="sessions table layout"):
+        SQLiteStore(path).open()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9

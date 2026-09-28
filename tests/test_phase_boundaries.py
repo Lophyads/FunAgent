@@ -11,7 +11,7 @@ import pytest
 from agentcore import (
     LeaseAcquireTimeout, LeaseLostError, Message, NormalizedModelResponse,
     NormalizedProviderError, RunBudgetExceeded, SQLiteStore,
-    SessionSnapshotConflict, StorageError, ToolCall, TurnCancelled, TurnTrigger,
+    StorageError, ToolCall, TurnCancelled, TurnTrigger,
     ToolExecutor,
 )
 from agentcore.conversation_loop import ConversationLoop
@@ -433,10 +433,6 @@ def test_expected_provider_phase_errors_break_without_outer_handler(
         (
             LeaseAcquireTimeout("busy"), "acquire",
             "lease_timeout",
-        ),
-        (
-            SessionSnapshotConflict("changed"), "build",
-            "session_snapshot_conflict",
         ),
     ],
 )

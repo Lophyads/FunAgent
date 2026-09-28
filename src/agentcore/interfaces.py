@@ -135,6 +135,7 @@ class TurnSnapshot:
     context: SessionRuntimeSnapshot | None = None
     workspace: ResolvedWorkspace | None = None
     trace_id: str = ""
+    trigger_kind: Literal["user", "internal_recovery"] = "user"
 
     def copy(self) -> "TurnSnapshot":
         """Detach mutable turn data while retaining the exact prompt/tool view."""
@@ -142,6 +143,7 @@ class TurnSnapshot:
             result=self.result.model_copy(deep=True), messages=deepcopy(self.messages),
             context=self.context.copy() if self.context is not None else None,
             workspace=self.workspace, trace_id=self.trace_id,
+            trigger_kind=self.trigger_kind,
         )
 
 

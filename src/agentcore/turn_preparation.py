@@ -55,9 +55,7 @@ def prepare_memory_turn(
     resource_key: SessionResourceKey | None = None,
 ) -> PreparedConversation:
     workspace = resolve_workspace(workspace, None, runtime.services.config.workspace)
-    resource_key = resource_key or SessionResourceKey(
-        "private", runtime.config.session_defaults.profile, uuid.uuid4().hex,
-    )
+    resource_key = resource_key or SessionResourceKey(uuid.uuid4().hex)
     message = Message.user(user_input.text, metadata=user_input.metadata)
     return PreparedConversation(context, (*history, message), workspace, resource_key)
 
@@ -98,17 +96,14 @@ def prepare_stored_turn(
         publish("recovery.history_repaired")
 
     persisted = store.load_session(session_id)
-    effective = request or SessionBuildRequest.from_defaults(runtime.config.session_defaults)
     services = runtime.services
     defaults = services.config.workspace
     previous_workspace = (
         ResolvedWorkspace(Path(persisted.workspace), defaults.allowed_root)
         if persisted is not None and persisted.workspace is not None else None
     )
-    workspace = resolve_workspace(effective.workspace, previous_workspace, defaults)
-    resource_key = resource_key or SessionResourceKey(
-        store.resource_namespace, persisted.profile if persisted else effective.profile, session_id,
-    )
+    workspace = resolve_workspace(request.workspace if request else None, previous_workspace, defaults)
+    resource_key = resource_key or SessionResourceKey(session_id)
     availability = ToolAvailabilityContext(
         services.config.tools, workspace, host_context.capabilities,
         BackendProbes(services.available),
@@ -127,11 +122,7 @@ def prepare_stored_turn(
     else:
         message = Message.user(user_input.text, metadata=user_input.metadata)
         if resolution.created:
-            identity = resolution.request
-            if identity is None:
-                raise RuntimeError("new context is missing its session identity")
             persistence.save_new_session(
-                profile=identity.profile, surface=identity.surface, platform=identity.platform,
                 system_prompt_bytes=resolution.snapshot.prompt.content_bytes, user_message=message,
                 workspace=str(workspace.cwd),
             )

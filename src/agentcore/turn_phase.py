@@ -27,10 +27,7 @@ from .provider_runtime import (
 from .provider_runner import (
     ProviderRunner, ProviderExhausted, ProviderRequestAborted, RouteState,
 )
-from .session_context import (
-    RecoverySessionMissing,
-    SessionSnapshotConflict,
-)
+from .session_context import RecoverySessionMissing
 from .runtime_cwd import WorkspaceValidationError
 from .storage import LeaseLostError
 from .tool_execution import ToolExecutor
@@ -296,9 +293,7 @@ class TurnPhases:
     def _expected_break(
         self, runtime: TurnRuntime, state: LoopState, exc: BaseException,
     ) -> PhaseResult:
-        if isinstance(exc, SessionSnapshotConflict):
-            self._set_error(state, "failed", "session_snapshot_conflict", exc, False)
-        elif isinstance(exc, WorkspaceValidationError):
+        if isinstance(exc, WorkspaceValidationError):
             self._set_error(state, "failed", "invalid_workspace", exc, False)
         elif isinstance(exc, LeaseAcquireTimeout):
             self._set_error(state, "failed", "lease_timeout", exc, True)
@@ -409,7 +404,7 @@ class TurnPhases:
         return FunctionPhase(
             "prepare_conversation", prepare, validate,
             expected_errors=_INTERRUPTION_ERRORS + (
-                RecoveryNotEligible, SessionSnapshotConflict, RecoverySessionMissing,
+                RecoveryNotEligible, RecoverySessionMissing,
                 WorkspaceValidationError,
             ),
             on_expected_error=self._expected_break,
@@ -654,6 +649,7 @@ class TurnPhases:
             ),
             context=state.require_context("end_turn"),
             workspace=state.workspace, trace_id=state.trace_id,
+            trigger_kind="internal_recovery" if self.recovery else "user",
         )
         operations = (
             (

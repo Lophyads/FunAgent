@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,14 +9,7 @@ from typing import Protocol
 
 @dataclass(frozen=True, slots=True)
 class SessionResourceKey:
-    namespace: str
-    profile: str
     session_id: str
-
-    @property
-    def backend_id(self) -> str:
-        value = json.dumps((self.namespace, self.profile, self.session_id))
-        return hashlib.sha256(value.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Sequence
 
 from gateway import GatewayRuntime
+from file_memory import FileMemoryFeature, load_file_memory_config
 from log.logging_system import configure_logging
 from tools.config import ToolSystemConfig
 from tools.lifecycle import SessionResourcesBusyError, remaining
-from tools.runtime import initialize_tool_system, shutdown_tool_system
+from tools.runtime import get_tool_registry, initialize_tool_system, shutdown_tool_system
 
 from .config import load_config
 from .interaction import InteractionRequest, Question
@@ -70,16 +71,21 @@ def _pump(
         raise
 
 
-def _cleanup_step(name, action, deadline: float) -> None:
+def _cleanup_step(name, action, deadline: float) -> bool:
     try:
         report = action(timeout=remaining(deadline))
+        if report is False:
+            print(f"warning: {name} cleanup incomplete", file=sys.stderr)
+            return False
         for issue in getattr(report, "issues", ()):
             print(
                 f"warning: {name} cleanup incomplete: {issue.resource}/{issue.error_code}",
                 file=sys.stderr,
             )
+        return getattr(report, "completed", True)
     except Exception as exc:
         print(f"warning: {name} cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        return False
 
 
 def _chat(args) -> int:
@@ -87,12 +93,17 @@ def _chat(args) -> int:
     config = load_config(args.config)
     logging_handle = configure_logging(config)
     gateway = None
+    feature = None
     initialized = False
     try:
         initialize_tool_system(ToolSystemConfig.from_agent_config(config))
         initialized = True
+        feature = FileMemoryFeature(load_file_memory_config(args.config), config)
+        feature.install_tool(get_tool_registry())
         gateway = GatewayRuntime(
             config, interaction_mode="poll", recovery_policy="attached",
+            **({"prompt_builder": feature.prompt_builder,
+                "review_scheduler": feature.review_scheduler} if feature.settings.enabled else {}),
         )
         gateway.start_blocking()
         return _chat_loop(gateway, args.session)
@@ -101,7 +112,8 @@ def _chat(args) -> int:
         deadline = time.monotonic() + config.timeouts.finalize_seconds
         if gateway is not None:
             _cleanup_step("gateway", gateway.close_blocking, deadline)
-        if initialized:
+        memory_stopped = feature is None or _cleanup_step("file memory", feature.close, deadline)
+        if initialized and memory_stopped:
             _cleanup_step("tools", shutdown_tool_system, deadline)
         _cleanup_step("logging", logging_handle.close, deadline)
 

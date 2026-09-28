@@ -48,11 +48,11 @@ class TurnPersistence:
         return operation(self._store, self._fence)
 
     def save_new_session(
-        self, *, profile: str, surface: str, platform: str,
+        self, *,
         system_prompt_bytes: bytes, user_message: Message, workspace: str | None = None,
     ) -> None:
         self._write(lambda db, fence: db.create_session(
-            self.session_id, profile=profile, surface=surface, platform=platform,
+            self.session_id,
             system_prompt_bytes=system_prompt_bytes, user_message=user_message, fence=fence,
             workspace=workspace,
         ))

@@ -42,11 +42,6 @@ timeout_seconds = 60.0
 
 # Add more [[routes]] blocks below the primary route to configure fallbacks.
 [session]
-profile = "default"
-surface = "cli"
-platform = "generic"
-config_version = "1"
-enabled_skills = []
 enabled_toolsets = ["default"]
 disabled_toolsets = []
 permissions = []

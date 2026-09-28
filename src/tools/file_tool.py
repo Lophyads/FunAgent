@@ -54,6 +54,8 @@ def _resolve(context: ToolContext, raw_path: str) -> Path:
     candidate = (context.workspace.cwd / raw_path).resolve()
     if not candidate.is_relative_to(root):
         raise ValueError("path is outside the workspace")
+    if context.services.is_protected_path(candidate):
+        raise ValueError("path is protected")
     relative = candidate.relative_to(root)
     if any(part in _IGNORED_NAMES for part in relative.parts):
         raise ValueError("path is protected")
@@ -99,7 +101,7 @@ def list_directory(args: ListDirectoryArgs, context: ToolContext) -> dict:
         raise ValueError("path is not a directory")
     entries = []
     for child in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
-        if child.name in _IGNORED_NAMES:
+        if child.name in _IGNORED_NAMES or context.services.is_protected_path(child):
             continue
         entries.append({
             "name": child.name,
@@ -138,6 +140,8 @@ def search_files(args: SearchFilesArgs, context: ToolContext) -> dict:
     matches: list[dict[str, object]] = []
     scanned = 0
     for path in sorted(base.rglob(args.glob)):
+        if context.services.is_protected_path(path):
+            continue
         if any(part in _IGNORED_NAMES for part in path.relative_to(root).parts):
             continue
         if path.is_symlink() or not path.is_file():

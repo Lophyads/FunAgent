@@ -83,19 +83,12 @@ def test_registry_replacement_validates_entire_batch(config_factory):
     assert not hasattr(registry, "services") and not hasattr(registry, "workspace_root")
 
 
-def test_session_keys_isolate_database_profile_and_memory(tmp_path):
-    first = SQLiteStore(tmp_path / "db.sqlite")
-    same = SQLiteStore(tmp_path / "." / "db.sqlite")
-    other = SQLiteStore(tmp_path / "other.sqlite")
-    assert first.resource_namespace == same.resource_namespace
-    assert first.resource_namespace != other.resource_namespace
-    assert SQLiteStore(":memory:").resource_namespace != SQLiteStore(":memory:").resource_namespace
+def test_session_keys_isolate_session_grants():
     grants = ApprovalGrantStore()
-    key = SessionResourceKey(first.resource_namespace, "one", "same-id")
+    key = SessionResourceKey("same-id")
     grants.grant(key, "write", "session")
-    assert grants.allowed(SessionResourceKey(same.resource_namespace, "one", "same-id"), "write")
-    assert not grants.allowed(SessionResourceKey(other.resource_namespace, "one", "same-id"), "write")
-    assert not grants.allowed(SessionResourceKey(first.resource_namespace, "two", "same-id"), "write")
+    assert grants.allowed(SessionResourceKey("same-id"), "write")
+    assert not grants.allowed(SessionResourceKey("other-id"), "write")
 
 
 def test_turn_workspace_isolation_without_chdir(config_factory, tmp_path):
@@ -294,7 +287,7 @@ def test_timed_out_stateless_handler_is_revoked_and_agent_waits_for_exit(config_
 def test_cleanup_failure_reports_other_resources_and_retries(config_factory):
     configure_tools(config_factory())
     services = get_tool_services()
-    key = SessionResourceKey("db", "profile", "s")
+    key = SessionResourceKey("s")
     calls = []
 
     class Resource:
@@ -415,7 +408,7 @@ def test_attached_recovery_does_not_touch_other_session_and_can_ask(config_facto
     for sid in ("mine", "other"):
         lease = store.acquire_lease(session_id=sid, owner_id="dead", turn_id=sid, ttl_seconds=60)
         store.create_session(
-            sid, profile=defaults.profile, surface=defaults.surface, platform=defaults.platform,
+            sid,
             system_prompt_bytes=b"system", user_message=Message.user("unfinished"), fence=lease.fence,
         )
     store.close()

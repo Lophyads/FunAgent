@@ -51,7 +51,7 @@ def test_tail_repair_completes_only_missing_siblings_and_never_replays(tmp_path)
     )
     assert lease is not None
     store.create_session(
-        "session", profile="default", surface="cli", platform="test",
+        "session",
         system_prompt_bytes=b"system", user_message=Message.user("run"),
         fence=lease.fence,
     )
@@ -98,7 +98,7 @@ def test_expired_lease_marks_resume_and_fences_old_owner(tmp_path):
     )
     assert old is not None
     store.create_session(
-        "session", profile="default", surface="cli", platform="test",
+        "session",
         system_prompt_bytes=b"system", user_message=Message.user("unfinished"),
         fence=old.fence,
     )

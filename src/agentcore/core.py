@@ -323,9 +323,7 @@ class AgentCore:
             self._close_lock.release()
 
     def session_resource_key(self, session_id: str) -> SessionResourceKey:
-        persisted = self._store.load_session(session_id)
-        profile = persisted.profile if persisted else self._config.session_defaults.profile
-        return SessionResourceKey(self._store.resource_namespace, profile, session_id)
+        return SessionResourceKey(session_id)
 
     async def aclose(self, *, timeout: float | None = None) -> CleanupReport:
         future = submit_daemon_call(

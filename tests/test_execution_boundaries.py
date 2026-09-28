@@ -29,7 +29,7 @@ def test_memory_loop_uses_explicit_services_without_process_initialization(confi
         assert services.available("browser")
         for index in (1, 2):
             turn_id = f"read-only-{index}"
-            key = SessionResourceKey("shared", "default", "chat")
+            key = SessionResourceKey("chat")
             loop, _, _, _ = memory_loop(
                 config, ScriptedTransport(tool_response("browser"), NormalizedModelResponse(content="done")),
                 services=services, resource_key=key, turn_id=turn_id,
@@ -50,7 +50,7 @@ def test_preparation_returns_data_and_loop_detaches_it(config_factory):
     prepared = PreparedConversation(
         context, (Message.user("input", metadata={"nested": [1]}),),
         resolve_workspace(None, None, get_tool_services().config.workspace),
-        SessionResourceKey("test", "default", "chat"),
+        SessionResourceKey("chat"),
     )
 
     def prepare(runtime):

@@ -90,22 +90,9 @@ class ModelRoute(FrozenStrictModel):
 
 
 class SessionDefaults(FrozenStrictModel):
-    profile: str = "default"
-    surface: str = "python"
-    platform: str = "generic"
-    config_version: str = "1"
-    enabled_skills: tuple[str, ...] = ()
     enabled_toolsets: tuple[str, ...] = ("default",)
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
-
-    @field_validator("profile", "surface", "platform", "config_version")
-    @classmethod
-    def _nonblank(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("session default values must not be blank")
-        return value
 
 
 class AgentConfig(FrozenStrictModel):

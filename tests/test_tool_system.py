@@ -21,7 +21,6 @@ def _request(
     permissions: frozenset[str] = frozenset(),
 ) -> ToolsetRequest:
     return ToolsetRequest(
-        profile="test", surface="pytest", platform="windows",
         enabled_toolsets=enabled,
         disabled_toolsets=disabled,
         permissions=permissions,

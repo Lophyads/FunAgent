@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 import time
@@ -16,13 +15,10 @@ from .models import LeaseFence, LeaseHandle, Message, ToolCall, ToolOutcome
 from tools.results import encode_tool_error
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _SCHEMA = """
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
-    profile TEXT NOT NULL,
-    surface TEXT NOT NULL,
-    platform TEXT NOT NULL,
     system_prompt_bytes BLOB NOT NULL,
     workspace TEXT,
     created_at REAL NOT NULL,
@@ -104,9 +100,6 @@ class LeaseLostError(StorageError):
 @dataclass(frozen=True, slots=True)
 class PersistedSession:
     session_id: str
-    profile: str
-    surface: str
-    platform: str
     system_prompt_bytes: bytes
     created_at: float
     workspace: str | None = None
@@ -123,7 +116,7 @@ def _json(value: Any) -> str:
 
 
 class SQLiteStore:
-    """Four-table, message-tail store. Schema v9 adds the session workspace to v8."""
+    """Four-table, message-tail store."""
 
     def __init__(self, path: str | Path, *, tool_result_max_chars: int = 32_768) -> None:
         self.path = str(path)
@@ -135,12 +128,8 @@ class SQLiteStore:
         )
         self._anchor: sqlite3.Connection | None = None
         self._opened = False
+        self._legacy_identity_columns = False
         self._state_lock = threading.RLock()
-
-    @property
-    def resource_namespace(self) -> str:
-        """Stable for a file database; unique for each in-memory store."""
-        return self._database if self._uri else os.path.normcase(str(Path(self.path).resolve()))
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -173,19 +162,29 @@ class SQLiteStore:
                     expected = {
                         "sessions", "messages", "session_leases", "delivery_obligations"
                     }
-                    if version not in {0, 8, SCHEMA_VERSION} or (tables and tables != expected):
+                    if (version not in {0, 8, 9, SCHEMA_VERSION}
+                            or (tables and (tables != expected or version == 0))):
                         raise StorageError(
-                            "incompatible SQLite schema; stop all runtimes and delete the "
-                            "old database explicitly before using this schema"
+                            "incompatible SQLite schema; stop all runtimes and migrate "
+                            "the database before using this schema"
                         )
                     if not tables:
                         for statement in _SCHEMA.split(";"):
                             if statement.strip():
                                 connection.execute(statement)
                         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                    elif version == 8:
-                        connection.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
+                    elif version in {8, 9}:
+                        if version == 8:
+                            connection.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
                         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    columns = {
+                        str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)")
+                    }
+                    legacy = columns & {"profile", "surface", "platform"}
+                    if ("workspace" not in columns or
+                            legacy not in (set(), {"profile", "surface", "platform"})):
+                        raise StorageError("incompatible sessions table layout")
+                    self._legacy_identity_columns = bool(legacy)
                     connection.commit()
                 except BaseException:
                     connection.rollback()
@@ -343,7 +342,7 @@ class SQLiteStore:
             return marked
 
     def create_session(
-        self, session_id: str, *, profile: str, surface: str, platform: str,
+        self, session_id: str, *,
         system_prompt_bytes: bytes, user_message: Message, fence: LeaseFence,
         workspace: str | None = None,
     ) -> PersistedSession:
@@ -352,26 +351,33 @@ class SQLiteStore:
         now = time.time()
         with self._transaction() as connection:
             self._assert_fence(connection, fence, session_id=session_id)
-            connection.execute(
-                "INSERT INTO sessions(id,profile,surface,platform,system_prompt_bytes,"
-                "created_at,updated_at,workspace) VALUES(?,?,?,?,?,?,?,?)",
-                (session_id, profile, surface, platform, system_prompt_bytes, now, now, workspace),
-            )
+            if self._legacy_identity_columns:
+                # Existing databases retain these unused NOT NULL columns to preserve history.
+                connection.execute(
+                    "INSERT INTO sessions(id,profile,surface,platform,system_prompt_bytes,"
+                    "created_at,updated_at,workspace) VALUES(?,?,?,?,?,?,?,?)",
+                    (session_id, "", "", "", system_prompt_bytes, now, now, workspace),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO sessions(id,system_prompt_bytes,created_at,updated_at,workspace) "
+                    "VALUES(?,?,?,?,?)",
+                    (session_id, system_prompt_bytes, now, now, workspace),
+                )
             self._insert_message(connection, session_id, user_message)
         return PersistedSession(
-            session_id, profile, surface, platform, system_prompt_bytes, now, workspace
+            session_id, system_prompt_bytes, now, workspace
         )
 
     def load_session(self, session_id: str) -> PersistedSession | None:
         connection = self._connection()
         try:
             row = connection.execute(
-                "SELECT id,profile,surface,platform,system_prompt_bytes,created_at,workspace "
+                "SELECT id,system_prompt_bytes,created_at,workspace "
                 "FROM sessions WHERE id=?", (session_id,),
             ).fetchone()
             return None if row is None else PersistedSession(
-                str(row["id"]), str(row["profile"]), str(row["surface"]),
-                str(row["platform"]), bytes(row["system_prompt_bytes"]),
+                str(row["id"]), bytes(row["system_prompt_bytes"]),
                 float(row["created_at"]), row["workspace"],
             )
         finally:
@@ -467,10 +473,18 @@ class SQLiteStore:
     def _unresolved_batch(
         cls, connection: sqlite3.Connection, session_id: str
     ) -> tuple[int, list[ToolCall], dict[str, str]] | None:
+        """Find missing replies in the tool-call batch at the session tail.
+
+        A tool reply points back to its assistant message because one assistant
+        message may contain several calls. Compare that full call list with the
+        persisted replies. Return None when the tail is not a tool batch; an
+        empty missing list means the batch exists and all replies are present.
+        This method only reads state; repair_latest_tool_batch writes repairs.
+        """
         tail = cls._tail(connection, session_id)
         if tail is None:
             return None
-        # todo 这里逻辑有点奇怪, tail["role"] == "tool" and tail["reply_to_message_id"] is not None时 为什么要重新取一遍 tool_call_id 和 parent
+
         if tail["role"] == "assistant" and tail["tool_calls_json"]:
             parent = tail
         elif tail["role"] == "tool" and tail["reply_to_message_id"] is not None:

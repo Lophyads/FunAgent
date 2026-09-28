@@ -43,7 +43,7 @@ class QueuePort:
 def ask(broker, port, *, timeout=2):
     return broker.request(
         "clarify", ClarifyPayload((Question(qid="q0", question="Continue?"),)),
-        key=SessionResourceKey("db", "profile", "s1"), owner_id="owner",
+        key=SessionResourceKey("s1"), owner_id="owner",
         turn_id="turn", tool_call_id="call", port=port,
         timeout=timeout, check_active=lambda: None,
     )
@@ -107,9 +107,9 @@ def test_approval_persists_comments_and_observes_revocation(tmp_path):
     config = tmp_path / "agentcore.toml"
     config.write_text("# keep this comment\n[agent]\nmax_iterations = 8\n", encoding="utf-8")
     grants = ApprovalGrantStore(config)
-    key = SessionResourceKey("db1", "profile", "s1")
+    key = SessionResourceKey("s1")
     grants.grant(key, "cua:type:background", "always")
-    assert grants.allowed(SessionResourceKey("db2", "profile", "s2"), "cua:type:background")
+    assert grants.allowed(SessionResourceKey("s2"), "cua:type:background")
     text = config.read_text(encoding="utf-8")
     assert "# keep this comment" in text
     config.write_text(text.replace('"cua:type:background"', ""), encoding="utf-8")
@@ -209,7 +209,7 @@ def test_default_registry_exposes_only_available_text_actions(availability):
     registry = builtin_registry()
     availability = replace(availability, capabilities=HostCapabilities(clarify=True, approval=True),
                            backends=type(availability.backends)(lambda name: True))
-    request = ToolsetRequest(profile="test", surface="pytest", platform="windows", enabled_toolsets=("default",))
+    request = ToolsetRequest(enabled_toolsets=("default",))
     entries, _ = load_tools(request, registry, availability=availability)
     assert {
         "web_search", "web_extract", "clarify", "computer_use",

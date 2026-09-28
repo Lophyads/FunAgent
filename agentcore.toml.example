@@ -68,12 +68,7 @@ timeout_seconds = 60.0
 
 # Add more [[routes]] blocks below the primary route to configure fallbacks.
 [session]
-profile = "default"
-surface = "cli"
-platform = "generic"
-config_version = "1"
-enabled_skills = []
-enabled_toolsets = ["default"]
+enabled_toolsets = ["default", "memory"]
 disabled_toolsets = []
 permissions = []
 
@@ -81,3 +76,11 @@ permissions = []
 [workspace]
 default_cwd = "."
 allowed_root = "."
+
+# Optional durable memory. Relative directory is resolved beside this file.
+[file_memory]
+enabled = true
+directory = "memories"
+memory_char_limit = 2200
+user_char_limit = 1375
+review_every_turns = 10  # 0 disables background review

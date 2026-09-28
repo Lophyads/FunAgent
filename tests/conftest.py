@@ -88,7 +88,7 @@ def context_factory(tmp_path):
         services = get_tool_services()
         from agentcore.runtime_cwd import resolve_workspace
         from tools.lifecycle import ResourceUnavailableError, SessionResourceKey
-        key = SessionResourceKey("test", "test", session_id)
+        key = SessionResourceKey(session_id)
         closed = threading.Event()
 
         def check():

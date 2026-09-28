@@ -20,37 +20,20 @@ class SessionContextError(RuntimeError):
     pass
 
 
-class SessionSnapshotConflict(SessionContextError):
-    pass
-
-
 class RecoverySessionMissing(SessionContextError):
     pass
 
 
 @dataclass(frozen=True, slots=True)
 class SessionBuildRequest:
-    profile: str
-    surface: str
-    platform: str
-    config_version: str
-    enabled_skills: tuple[str, ...] = ()
     enabled_toolsets: tuple[str, ...] = ("default",)
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
     workspace: Path | None = None
 
-    def __post_init__(self) -> None:
-        for name in ("profile", "surface", "platform", "config_version"):
-            if not getattr(self, name).strip():
-                raise ValueError(f"{name} must not be blank")
-
     @classmethod
     def from_defaults(cls, defaults: SessionDefaults) -> "SessionBuildRequest":
         return cls(
-            profile=defaults.profile, surface=defaults.surface,
-            platform=defaults.platform, config_version=defaults.config_version,
-            enabled_skills=defaults.enabled_skills,
             enabled_toolsets=defaults.enabled_toolsets,
             disabled_toolsets=defaults.disabled_toolsets,
             permissions=defaults.permissions,
@@ -74,7 +57,6 @@ class SessionContextResolution:
     snapshot: SessionRuntimeSnapshot
     created: bool
     warnings: tuple[str, ...] = ()
-    request: SessionBuildRequest | None = None
 
 
 class SessionContextFactory:
@@ -134,9 +116,6 @@ class SessionContextFactory:
             bootstrap.clear()
             warnings.append(f"memory bootstrap data was ignored: {type(exc).__name__}: {exc}")
         prompt = self._prompt_builder.build(PromptBuildRequest(
-            profile=request.profile, surface=request.surface,
-            platform=request.platform, config_version=request.config_version,
-            enabled_skills=request.enabled_skills,
             bootstrap_memory=tuple(bootstrap),
         ))
         if (prompt.content_bytes != prompt.text.encode("utf-8") or
@@ -146,7 +125,7 @@ class SessionContextFactory:
             request, prompt, availability,
         )
         return SessionContextResolution(
-            snapshot, True, tuple(warnings), request,
+            snapshot, True, tuple(warnings),
         )
 
     def _load(
@@ -154,17 +133,6 @@ class SessionContextFactory:
         availability: ToolAvailabilityContext,
     ) -> SessionContextResolution:
         current = request or self._defaults
-        identity = (persisted.profile, persisted.surface, persisted.platform)
-        if request is not None and (
-            request.profile, request.surface, request.platform
-        ) != identity:
-            raise SessionSnapshotConflict(
-                "explicit session identity differs from the persisted session"
-            )
-        effective = replace(
-            current, profile=persisted.profile,
-            surface=persisted.surface, platform=persisted.platform,
-        )
         prompt_bytes = persisted.system_prompt_bytes
         prompt = SystemPromptSnapshot(
             text=prompt_bytes.decode("utf-8"), content_bytes=prompt_bytes,
@@ -172,9 +140,9 @@ class SessionContextFactory:
         )
         return SessionContextResolution(
             self._runtime_snapshot(
-                effective, prompt, availability,
+                current, prompt, availability,
             ),
-            False, request=effective,
+            False,
         )
 
     def _runtime_snapshot(
@@ -194,8 +162,6 @@ class SessionContextFactory:
         self, request: SessionBuildRequest, availability: ToolAvailabilityContext,
     ) -> tuple[Mapping[str, ToolEntry[Any]], bytes]:
         return load_tools(ToolsetRequest(
-            profile=request.profile, surface=request.surface,
-            platform=request.platform,
             enabled_toolsets=request.enabled_toolsets,
             disabled_toolsets=request.disabled_toolsets,
             permissions=request.permissions,
@@ -204,6 +170,6 @@ class SessionContextFactory:
 
 __all__ = [
     "SessionBuildRequest", "SessionContextError", "SessionContextFactory",
-    "SessionContextResolution", "SessionRuntimeSnapshot", "SessionSnapshotConflict",
+    "SessionContextResolution", "SessionRuntimeSnapshot",
     "RecoverySessionMissing",
 ]
