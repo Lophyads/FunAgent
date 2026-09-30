@@ -40,6 +40,24 @@ browser_idle_seconds = 900.0
 clarify_timeout_seconds = 3600.0
 approval_timeout_seconds = 300.0
 
+# Optional MCP: install with uv sync --extra mcp and add "mcp" to session.enabled_toolsets.
+# [tools.mcp_servers.local]
+# command = "python"
+# args = ["E:/mcp_servers/server.py"]
+# required = false
+# connect_timeout_seconds = 15
+# tool_timeout_seconds = 60
+# requires_approval = true
+# include = ["search_*", "get_*"]
+# exclude = ["get_secret_*"]
+# [tools.mcp_servers.local.env]
+# API_TOKEN = "env:MCP_LOCAL_TOKEN"
+
+# [tools.mcp_servers.remote]
+# url = "https://example.com/mcp"
+# [tools.mcp_servers.remote.headers]
+# Authorization = "env:MCP_REMOTE_AUTHORIZATION"
+
 # Permanent approval scopes are written here only after explicit human approval.
 # [approvals]
 # always = ["cua:type:background"]

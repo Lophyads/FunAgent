@@ -58,6 +58,7 @@ def initialize_tool_system(config: ToolSystemConfig) -> None:
         if _state is not ToolSystemState.UNINITIALIZED:
             raise ToolSystemNotInitialized(f"tool system is {_state.value}")
         _state = ToolSystemState.INITIALIZING
+        services = None
         try:
             if config.approver is not None:
                 callback = config.approver.approve
@@ -67,8 +68,31 @@ def initialize_tool_system(config: ToolSystemConfig) -> None:
             discover_builtin_tools(registry)
             from .services import ToolServices
             services = ToolServices(normalized)
-        except BaseException:
-            _state = ToolSystemState.UNINITIALIZED
+            if any(server.enabled for server in normalized.tools.mcp_servers.values()):
+                client = services.mcp()
+                from .mcp_adapter import build_mcp_entries
+                entries = build_mcp_entries(
+                    client, normalized.tools.mcp_servers, client.discover(),
+                    existing_entries=registry.entries(),
+                )
+                registry.replace_all((*registry.entries(), *entries))
+        except BaseException as exc:
+            try:
+                report = services.close(timeout=5) if services is not None else CleanupReport()
+            except Exception as cleanup_error:
+                report = CleanupReport((CleanupIssue(
+                    "runtime", "process", "close", type(cleanup_error).__name__,
+                ),))
+            if report.completed:
+                _state = ToolSystemState.UNINITIALIZED
+            else:
+                # Retain the owner of unfinished cleanup; another init must not orphan it.
+                _config, _services, _startup_cwd = normalized, services, startup
+                _state = ToolSystemState.CLOSING
+                exc.add_note(f"tool initialization cleanup incomplete: {report.issues}")
+                if not _exit_registered:
+                    atexit.register(_shutdown_at_exit)
+                    _exit_registered = True
             raise
         _config, _registry, _services = normalized, registry, services
         _startup_cwd = startup

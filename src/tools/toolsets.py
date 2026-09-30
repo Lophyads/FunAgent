@@ -8,6 +8,7 @@ from .registry import ToolEntry
 
 # Named compositions are policy, while ToolEntry.toolset is the tool's base category.
 TOOLSETS: dict[str, dict[str, tuple[str, ...]]] = {
+    "mcp": {"tools": (), "includes": ()},
     "default": {
         "tools": (
             "calculator", "current_time", "list_directory", "read_file",

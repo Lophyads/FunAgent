@@ -15,6 +15,7 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - GatewayRuntime 启动恢复、内部恢复 Turn、Delivery Runtime 和 inbound gate。
 - 隔离的 Observer/EventSink 可观测性路径及集中敏感信息脱敏。
 - Web 搜索/提取、文本 browser、AX-only computer_use 与跨 CLI/Gateway 的 clarify/审批交互。
+- 可选 MCP Client：stdio/Streamable HTTP、多服务工具发现、注册及同步调用。
 
 ## 快速开始
 
@@ -46,6 +47,71 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 
 可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
 ；该命令不下载或升级程序。
+
+## MCP 工具
+
+安装可选依赖并使用 MCP 配置启动：
+
+```powershell
+uv sync --extra mcp
+uv run --extra mcp agentcore chat --config agentcore.toml
+```
+
+在配置中启用 `mcp` 工具集，并配置一个或多个服务：
+
+```toml
+[session]
+enabled_toolsets = ["default", "memory", "mcp"]
+
+[tools.mcp_servers.local]
+command = "python"
+args = ["E:/mcp_servers/server.py"]
+connect_timeout_seconds = 15
+tool_timeout_seconds = 60
+requires_approval = true
+include = ["search_*", "get_*"]
+exclude = ["get_secret_*"]
+
+[tools.mcp_servers.local.env]
+API_TOKEN = "env:MCP_LOCAL_TOKEN"
+
+[tools.mcp_servers.remote]
+url = "https://example.com/mcp"
+required = false
+
+[tools.mcp_servers.remote.headers]
+Authorization = "env:MCP_REMOTE_AUTHORIZATION"
+```
+
+`command`/`url` 恰选其一，分别使用 stdio/Streamable HTTP。`args`/`env` 只用于
+stdio，`headers` 只用于 HTTP；完整值 `env:VAR` 引用环境变量，缺失会在连接前报错。
+Authorization 变量包含完整的 `Bearer ...` 值。stdio cwd 使用初始化的工作区目录。
+
+`enabled` 默认 true，`required` 默认 false；可选服务启动失败不影响其他服务，
+必需服务失败会回滚初始化。工具目录在启动时完整分页发现；修改配置或目录后重启。
+工具名称为 `mcp__服务名__工具名`，长名称会稳定截短。include/exclude 使用原始工具名
+的通配符，排除优先；未配置 include 时纳入所有工具。
+
+MCP 工具默认要求审批，宿主没有审批能力时会隐藏。受信任服务可显式设置
+`requires_approval = false`。调用沿用现有参数校验、Guard、审批和执行结果；
+远端 JSON Schema 支持文档内引用，不读取外部 Schema。文本优先、结构化结果回退，
+二进制内容仅返回类型提示；远端 `is_error` 记录为工具执行失败。
+
+连接由进程级工具服务共享，Session reset 不关闭连接或重置远端状态。
+不同服务可并发等待 I/O，首版同服务串行。同回合工具保持顺序执行。
+超时/取消不保证远端副作用撤销，已提交工具不自动重放；断线后重启恢复。
+SDK Client 在长期连接任务中打开和关闭，退出先等待 RPC/连接清理，再停止后台循环。
+工作区路径限制不会自动限制外部 MCP 服务的访问权限。
+
+当前支持 MCP Python SDK 2.2+；暂不提供 OAuth、旧 SSE、热刷新、自动重连、
+sampling/elicitation、输入续传、远端 resources/prompts 或多模态落盘。
+没有启用 MCP 时无需安装该 extra，也不会导入 SDK 或启动 MCP 线程。
+
+MCP 验收使用本地服务，不访问真实模型：
+
+```powershell
+uv run --extra dev --extra mcp pytest tests/test_mcp_client.py tests/test_mcp_integration.py
+```
 
 ## 文件记忆
 
@@ -213,7 +279,7 @@ approvals.always 仅在人工选择永久授权后原子写入。
 - `[[routes]]`：有序 primary/fallback 路由。
 
 当前版本提供同步 CLI 和可嵌入的 GatewayRuntime；不包含独立网络 Gateway、TUI、Cron、
-Subagent、MCP、上下文压缩、多模态或 exactly-once 工具保证。
+Subagent、上下文压缩、多模态或 exactly-once 工具保证。
 
 ## 验收
 

@@ -40,6 +40,7 @@ class ToolServices:
         self._provider_factories = {
             "browser": self._new_browser,
             "computer": self._new_computer,
+            "mcp": self._new_mcp,
         }
         self._provided_backends = frozenset(provider_factories or ())
         if provider_factories is not None:
@@ -66,6 +67,14 @@ class ToolServices:
     def _new_computer(self):
         from .computer_backend import CuaCliBackend
         return CuaCliBackend(idle_seconds=self.config.tools.browser_idle_seconds)
+
+    def _new_mcp(self):
+        try:
+            from .mcp_client import McpClient
+            import jsonschema  # Validate the complete optional extra before connecting.
+        except ImportError:
+            raise RuntimeError("MCP requires the optional extra: uv sync --extra mcp") from None
+        return McpClient(self.config.tools.mcp_servers, workspace=self.config.workspace)
 
     def available(self, name: str, *, refresh: bool = False) -> bool:
         with self._lock:
@@ -118,6 +127,9 @@ class ToolServices:
 
     def computer(self):
         return self._provider("computer")
+
+    def mcp(self):
+        return self._provider("mcp")
 
     def search(self, query, limit, context):
         context.check_active()

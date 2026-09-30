@@ -21,6 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+  "mcp>=2.2,<3",
+  "httpx2>=2.7,<3",
+  "jsonschema>=4.18,<5",
+]
 dev = [
   "pytest>=8.4,<10",
   "pytest-asyncio>=1.1,<2",
