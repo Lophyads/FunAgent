@@ -133,7 +133,7 @@ def prepare_stored_turn(
     validate_complete_history(messages)
     if not persistence.enabled:
         messages.append(message)
-    elif not messages or messages[-1] != message:
+    elif not messages or messages[-1] != (message if recovery else persistence.persisted_message(message)):
         raise RuntimeError("loaded history does not end with the submitted message")
     return PreparedConversation(
         context=resolution.snapshot, messages=tuple(messages), workspace=workspace,

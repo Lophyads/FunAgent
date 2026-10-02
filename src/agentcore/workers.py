@@ -115,6 +115,8 @@ class DaemonWorkerPool:
 class TurnSubmission(Generic[T]):
     future: Future[T]
     cancel_event: threading.Event
+    session_id: str | None = None
+    turn_id: str | None = None
 
     def cancel(self) -> None:
         self.cancel_event.set()

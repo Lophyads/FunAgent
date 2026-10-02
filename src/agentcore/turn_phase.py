@@ -119,7 +119,7 @@ def run_phase(
             "turn.phase_failed", trace_id=state.trace_id,
             session_id=state.session_id, turn_id=state.turn_id,
             phase=phase.name,
-            payload={"error_type": type(exc).__name__},
+            payload={"error_type": type(exc).__name__, "iteration": state.iteration},
         ))
         if type(exc).__name__ in {
             "StorageError", "DatabaseError", "OperationalError", "IntegrityError",
@@ -136,7 +136,7 @@ def run_phase(
     state.warnings.extend(runtime.observability.publish(
         "turn.phase_finished", trace_id=state.trace_id,
         session_id=state.session_id, turn_id=state.turn_id,
-        phase=phase.name, payload={"action": result.action.value},
+        phase=phase.name, payload={"action": result.action.value, "iteration": state.iteration},
     ))
     return result
 
@@ -161,6 +161,7 @@ class TurnPhases:
         observability: Any, call_operation: Any,
     ) -> None:
         self.config = config
+        self.on_output = host_context.on_output
         self.user_input = user_input
         self.session_id = session_id
         self.turn_id = turn_id
@@ -439,7 +440,10 @@ class TurnPhases:
 
     def _provider_phase(self) -> FunctionPhase:
         def provider(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
-            response, route_index = self.provider_runner.run(runtime, state)
+            if self.on_output is None:
+                response, route_index = self.provider_runner.run(runtime, state)
+            else:
+                response, route_index = self.provider_runner.run(runtime, state, on_output=self.on_output)
             state.response = response
             state.active_route_index = route_index
             state.route_used = self.config.routes[route_index].name

@@ -75,6 +75,7 @@ class McpClient:
         self._workspace = workspace
         self._lock = threading.Lock()
         self._available: set[str] = set()
+        self._statuses: dict[str, str] = {}
         self._closing = False
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -218,6 +219,8 @@ class McpClient:
 
     async def _serve_connection(self, connection: _Connection) -> None:
         started = time.monotonic()
+        with self._lock:
+            self._statuses[connection.server_id] = "connecting"
         try:
             async with AsyncExitStack() as stack:
                 try:
@@ -225,6 +228,8 @@ class McpClient:
                         client = await self._open_client(connection, stack)
                         tools = await self._list_all_tools(client)
                 except BaseException as exc:
+                    with self._lock:
+                        self._statuses[connection.server_id] = "failed"
                     if not connection.ready.done():
                         connection.ready.set_exception(exc)
                     logger.warning("mcp.start_failed server=%s error_type=%s",
@@ -234,6 +239,7 @@ class McpClient:
                 with self._lock:
                     if not self._closing and not connection.stop.is_set():
                         self._available.add(connection.server_id)
+                        self._statuses[connection.server_id] = "available"
                 connection.ready.set_result(tools)
                 logger.info("mcp.ready server=%s tools=%s elapsed_ms=%s", connection.server_id,
                             len(tools), int((time.monotonic() - started) * 1000))
@@ -253,11 +259,18 @@ class McpClient:
     def _disable(self, connection: _Connection) -> None:
         with self._lock:
             self._available.discard(connection.server_id)
+            if self._statuses.get(connection.server_id) != "failed":
+                self._statuses[connection.server_id] = "unavailable"
         connection.stop.set()
 
     def is_available(self, server_id: str) -> bool:
         with self._lock:
             return not self._closing and server_id in self._available
+
+    def status_snapshot(self) -> dict[str, str]:
+        with self._lock:
+            return {name: ("stopping" if self._closing else self._statuses.get(name, "uninitialized"))
+                    for name in self._servers}
 
     def call_tool(self, server_id: str, tool_name: str, arguments: dict[str, Any],
                   *, check_active: Callable[[], None]) -> CallToolResult:

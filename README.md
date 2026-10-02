@@ -48,6 +48,40 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
 ；该命令不下载或升级程序。
 
+## Web 前端
+
+```powershell
+uv run agentcore web --config agentcore.toml --port 7777
+```
+
+打开 `http://127.0.0.1:7777`。WebHost、Gateway 与 AgentCore 在同一个前台进程中运行，
+仅监听本机；原生 HTML/CSS/ES Modules 随 Python 包提供，无需 Node 构建。
+
+- ChatDock：新建/继续会话、真实流式文本、工具结果、澄清、审批和取消。
+- Overview：当前会话的轮次、阶段流程、模型尝试、工具状态、耗时、usage 和事件时间线。
+- Memory：MEMORY / USER 条目新增、替换和删除，保存时检查文件版本；冲突保留草稿。
+- Data：四张 SQLite 业务表的只读分页、筛选、排序、行详情和 JSON 展开。
+- 工具、连接、模型、配置：当前进程的脱敏只读视图，修改配置文件后重启生效。
+
+当前标签页的会话保存在 sessionStorage，主题和面板偏好保存在 localStorage。
+切换页面、刷新或断线不会取消任务；停止按钮只取消指定轮次。
+SSE 断线重连会重放事件或用运行快照校准；服务重启后从数据库读取历史，旧时间线不重建。
+提交去重仅覆盖当前进程的活跃与最近 200 个完成轮次；服务重启后先核对历史再重发。
+自定义 Transport 没有 stream() 时继续使用 send()，CLI 默认行为保持不变。
+
+启用记忆需要 `[file_memory] enabled = true`；网页、工具和后台复盘共享 FileMemoryStore。
+文件更新影响新会话，已有会话继续使用保存的提示词快照。模型正文属于当前用户，
+诊断事件仍经过 ObservabilityHub 脱敏，配置视图不返回密钥及 env / headers 值。
+
+离线演示使用临时数据库、临时记忆与模拟流式模型，不需要 API 密钥：
+
+```powershell
+uv run python examples/web_offline_demo.py --port 7778
+```
+
+发送「计算」「确认」「审批」分别体验工具调用、澄清和审批；其他文本展示流式回复。
+示例退出后删除临时数据。运行 `uv run pytest` 验证后端与现有功能。
+
 ## MCP 工具
 
 安装可选依赖并使用 MCP 配置启动：
@@ -112,6 +146,42 @@ MCP 验收使用本地服务，不访问真实模型：
 ```powershell
 uv run --extra dev --extra mcp pytest tests/test_mcp_client.py tests/test_mcp_integration.py
 ```
+
+### 接入本地 Modular RAG
+
+本机 `agentcore.toml` 已启用 `mcp`，并通过 `[tools.mcp_servers.rag]` 接入
+`E:/MODULAR-RAG-MCP-SERVER-main`。迁移到其他机器时，可复制
+`agentcore.toml.example` 中的 Modular RAG 配置并修改路径。
+
+连接使用 RAG 项目自己的 `.venv/Scripts/python.exe`，启动模块
+`src.mcp_server.server`，通过 `PYTHONPATH` 定位源码。该项目的 `main.py` 和
+`mcp-server` 命令目前只检查配置后退出，不能用于 MCP 连接。
+RAG 服务自行读取其 `config/settings.yaml`、`.env` 和既有 Chroma/BM25 索引；
+FunAgent 不需要复制这些文件或安装 RAG 依赖。
+
+当前只允许以下三个知识库读取工具，无需逐次审批：
+
+- `mcp__rag__list_collections`：查看集合和条目数量。
+- `mcp__rag__query_knowledge_hub`：混合检索，返回片段和来源引用。
+- `mcp__rag__get_document_summary`：按文档 ID 获取摘要。
+
+运行不调用 Agent 模型的连接检查；加上 `--query` 时会调用 RAG 配置的 embedding：
+
+```powershell
+uv run --extra mcp python examples/mcp_smoke.py --config agentcore.toml
+uv run --extra mcp python examples/mcp_smoke.py --config agentcore.toml --query "知识库的核心功能和架构是什么？" --collection knowledge_hub
+uv run --extra mcp agentcore chat --config agentcore.toml
+```
+
+在聊天中可输入：“先列出知识库集合，再在 knowledge_hub 中检索 MCP 和 Agent
+客户端扩展，回答时标注来源。”已运行的进程需要重启以加载新连接配置。
+`required = true` 会使连接失败直接中止初始化，避免悄悄缺少知识库工具。
+
+本机 RAG 使用 MCP SDK 1.30，FunAgent 使用 2.2。SDK 自动协商旧协议时，RAG
+可能输出一次 `server/discover` 校验警告；随后完成 `initialize` 并正常处理调用。
+集合数量统计来自 Chroma 条目数，通常表示切分后的 chunk 数量。
+检索依赖 RAG 现有 embedding 配置；本机指向 `http://127.0.0.1:1234/v1`，
+运行检索前需保持该模型服务可用。
 
 ## 文件记忆
 

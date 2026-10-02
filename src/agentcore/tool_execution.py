@@ -157,7 +157,8 @@ class ToolExecutor:
             runtime.observability.publish(
                 "tool.running", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
-                phase="tool_round", payload={"tool_name": tool_call.name},
+                phase="tool_round", payload={"tool_name": tool_call.name,
+                                             "tool_call_id": tool_call.id, "iteration": state.iteration},
             )
             value = entry.handler(args_model, ToolContext(
                 session_id=state.session_id, turn_id=state.turn_id,

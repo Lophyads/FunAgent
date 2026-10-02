@@ -3,13 +3,15 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Mapping, Protocol
 
-from openai import OpenAI
+from openai import APIError, OpenAI
 
 from .interfaces import CancellationToken
 from .models import (
@@ -166,6 +168,94 @@ class OpenAIHttpTransport:
         context.cancellation.raise_if_cancelled()
         response = self._client.chat.completions.create(**dict(request.body))
         return WireResponse(raw=response)
+
+    def stream(self, request: WireRequest, context: AttemptContext,
+               on_delta: Callable[[str], None]) -> WireResponse:
+        """Aggregate SDK chunks into the same response contract as send()."""
+        from .turn_state import RunBudgetExceeded
+        context.cancellation.raise_if_cancelled()
+        deadline = time.monotonic() + request.timeout_seconds
+        if context.deadline is not None:
+            deadline = min(deadline, context.deadline)
+        body = {**request.body, "stream": True}
+        body.setdefault("stream_options", {"include_usage": True})
+        # The timeout also bounds opening the response, before we can close it.
+        body["timeout"] = max(0.001, deadline - time.monotonic())
+        try:
+            stream = self._client.chat.completions.create(**body)
+        except APIError as exc:
+            # Only an explicit unsupported-stream error permits a second request.
+            detail = str(getattr(exc, "body", "")).lower()
+            if getattr(exc, "status_code", None) in {400, 422} and "stream" in detail and any(
+                word in detail for word in ("unsupported", "not supported", "does not support")
+            ):
+                context.cancellation.raise_if_cancelled()
+                return self.send(request, context)
+            raise
+        done = threading.Event()
+
+        def check() -> None:
+            context.cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                if context.deadline is not None and time.monotonic() >= context.deadline:
+                    raise RunBudgetExceeded("turn run budget was exhausted")
+                raise TimeoutError("stream exceeded request timeout")
+
+        def watch() -> None:
+            while not done.wait(0.05):
+                if context.cancellation.is_cancelled or time.monotonic() >= deadline:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    return
+
+        watcher = threading.Thread(target=watch, name="model-stream-cancel", daemon=True)
+        watcher.start()
+        choices: dict[int, dict[str, Any]] = {}
+        usage = None
+        try:
+            for chunk in stream:
+                check()
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage
+                for choice in chunk.choices:
+                    current = choices.setdefault(choice.index, {"text": "", "tools": {}, "finish": None})
+                    delta = choice.delta
+                    if delta.content:
+                        current["text"] += delta.content
+                        if choice.index == 0:
+                            on_delta(delta.content)
+                    for tool in delta.tool_calls or ():
+                        item = current["tools"].setdefault(tool.index, {"id": "", "name": "", "arguments": ""})
+                        if tool.id:
+                            item["id"] += tool.id
+                        if tool.function:
+                            item["name"] += tool.function.name or ""
+                            item["arguments"] += tool.function.arguments or ""
+                    if choice.finish_reason is not None:
+                        current["finish"] = choice.finish_reason
+            check()
+            if choices and any(value["finish"] is None for value in choices.values()):
+                raise NormalizedProviderError("stream ended before finish_reason", retryable=True,
+                                              allow_fallback=True, error_type="incomplete_stream")
+            result = []
+            for index, value in sorted(choices.items()):
+                tools = [SimpleNamespace(id=item["id"], function=SimpleNamespace(
+                    name=item["name"], arguments=item["arguments"]))
+                    for _, item in sorted(value["tools"].items())]
+                result.append(SimpleNamespace(index=index, finish_reason=value["finish"],
+                    message=SimpleNamespace(content=value["text"] or None, tool_calls=tools)))
+            return WireResponse(raw=SimpleNamespace(choices=result, usage=usage))
+        except BaseException:
+            check()  # Prefer cancellation/budget errors when close interrupts an SDK read.
+            raise
+        finally:
+            done.set()
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         close = getattr(self._client, "close", None)

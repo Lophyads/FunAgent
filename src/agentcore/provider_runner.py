@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import random
 import threading
 import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from openai import APIError
 
-from .interfaces import CancellationToken, TurnCancelled
+from .interfaces import CancellationToken, ModelOutputEvent, TurnCancelled
 from .models import AgentConfig, NormalizedModelResponse
 from .provider_runtime import ApiModeRegistry, AttemptContext, NormalizedProviderError, ProviderResolver
 from .storage import LeaseLostError
@@ -65,6 +66,7 @@ class ProviderRunner:
 
     def run(
         self, runtime: TurnRuntime, state: LoopState,
+        *, on_output: Callable[[ModelOutputEvent], None] | None = None,
     ) -> tuple[NormalizedModelResponse, int]:
         request = state.require_request('provider_attempts')
         failures: list[dict[str, Any]] = []
@@ -109,6 +111,23 @@ class ProviderRunner:
                     },
                 ))
                 attempt_started = time.monotonic()
+                def emit(kind, text="", *, attempt_id=attempt_id, iteration=state.iteration, route_name=route.name):
+                    if on_output is None:
+                        return
+                    if kind in {"model.delta", "model.accepted"}:
+                        runtime.check_active()
+                    try:
+                        callback_result = on_output(ModelOutputEvent(kind, state.session_id, state.turn_id,
+                                                                     iteration, attempt_id, route_name, text))
+                        if inspect.isawaitable(callback_result):
+                            close = getattr(callback_result, "close", None)
+                            if close is not None:
+                                close()
+                            raise TypeError("on_output returned an awaitable")
+                    except Exception:
+                        logger.warning("provider.output_callback_failed", exc_info=True)
+
+                emit("model.started")
                 wire = adapter.encode(request, binding)
                 request_messages = self._provider_request_message_details(
                     wire.body
@@ -143,17 +162,19 @@ class ProviderRunner:
                     request_messages,
                 )
                 try:
-                    raw_response = binding.transport.send(
-                        wire,
-                        AttemptContext(
+                    attempt_context = AttemptContext(
                             attempt_id=attempt_id, session_id=state.session_id,
                             turn_id=state.turn_id, iteration=state.iteration,
                             route_name=route.name,
                             attempt_number=attempt_number,
                             deadline=runtime.deadline,
                             cancellation=CancellationToken(runtime.cancel_event),
-                        ),
                     )
+                    stream = getattr(binding.transport, "stream", None)
+                    if on_output is not None and callable(stream):
+                        raw_response = stream(wire, attempt_context, lambda text: emit("model.delta", text))
+                    else:
+                        raw_response = binding.transport.send(wire, attempt_context)
                     runtime.check_active()
                     logger.debug(
                         'provider.response raw_response=%s',
@@ -161,8 +182,10 @@ class ProviderRunner:
                     )
                     normalized = adapter.decode(raw_response, binding)
                 except (TurnCancelled, RunBudgetExceeded, LeaseLostError):
+                    emit("model.discarded")
                     raise
                 except BaseException as exc:
+                    emit("model.discarded")
                     if not isinstance(
                         exc, (NormalizedProviderError, APIError, OSError, TimeoutError)
                     ):
@@ -244,6 +267,7 @@ class ProviderRunner:
                         break
                     raise ProviderRequestAborted(route.name, error) from exc
                 else:
+                    emit("model.accepted", normalized.content or "")
                     route_state.clear()
                     response_content = normalized.content
                     response_content_preview = None

@@ -382,13 +382,15 @@ class AgentCore:
         effective_session_id = session_id or str(uuid.uuid4())
         turn_id = str(uuid.uuid4())
         try:
-            return self._dispatcher.submit(
+            submission = self._dispatcher.submit(
                 effective_session_id,
                 lambda cancel_event: self._run_submitted_turn(
                     normalized, effective_session_id, turn_id,
                     session_request, cancel_event, host_context=host,
                 ),
             )
+            from dataclasses import replace
+            return replace(submission, session_id=effective_session_id, turn_id=turn_id)
         except TurnQueueFullError:
             with log_context(self._config, effective_session_id):
                 logger.warning('runtime.queue_saturated')
@@ -424,8 +426,11 @@ class AgentCore:
         if reservation is not None:
             if reservation.session_id != session_id:
                 raise ValueError("recovery reservation belongs to another session")
-            return reservation.commit(function)
-        return self._dispatcher.submit(session_id, function)
+            submission = reservation.commit(function)
+        else:
+            submission = self._dispatcher.submit(session_id, function)
+        from dataclasses import replace
+        return replace(submission, session_id=session_id, turn_id=turn_id)
 
     def _run_submitted_turn(
         self, user_input: UserInput, session_id: str, turn_id: str,
@@ -434,7 +439,7 @@ class AgentCore:
         host_context: TurnHostContext = TurnHostContext(),
     ) -> TurnResult:
         self.start_blocking()
-        persistence = TurnPersistence(session_id, self._store)
+        persistence = TurnPersistence(session_id, self._store, turn_id=turn_id)
         lease_scope = LeaseScope(
             store=self._lease_store, heartbeat=self._heartbeat,
             session_id=session_id, owner_id=self._owner_id, turn_id=turn_id,

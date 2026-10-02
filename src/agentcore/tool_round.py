@@ -86,7 +86,8 @@ class ToolRoundRunner:
             runtime.observability.publish(
                 "tool.pending", trace_id=state.trace_id,
                 session_id=state.session_id, turn_id=state.turn_id,
-                phase="tool_round", payload={"tool_name": call.name},
+                phase="tool_round", payload={"tool_name": call.name, "tool_call_id": call.id,
+                                             "iteration": state.iteration},
             )
         for tool_call in response.tool_calls:
             runtime.check_active()
@@ -120,6 +121,7 @@ class ToolRoundRunner:
                 phase="tool_round",
                 payload={
                     "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id, "iteration": state.iteration,
                     "effect": executed.outcome.effect_disposition,
                     "duration_ms": tool_duration_ms,
                     "error_type": executed.outcome.error_type,

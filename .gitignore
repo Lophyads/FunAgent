@@ -17,3 +17,4 @@ logs/
 .correlation-key
 .funagent/
 *.approvals.lock
+examples/

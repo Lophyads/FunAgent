@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import inspect
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, Sequence
@@ -83,11 +84,26 @@ class TurnHostContext:
 
     capabilities: HostCapabilities = HostCapabilities()
     interaction_port: InteractionPort | None = None
+    on_output: Callable[[ModelOutputEvent], None] | None = None
 
     def __post_init__(self) -> None:
         interactive = self.capabilities.clarify or self.capabilities.approval
         if interactive and self.interaction_port is None:
             raise ValueError("interactive capabilities require an InteractionPort")
+        if self.on_output is not None and (not callable(self.on_output) or inspect.iscoroutinefunction(
+            self.on_output) or inspect.iscoroutinefunction(getattr(self.on_output, "__call__", None))):
+            raise TypeError("on_output must be synchronous and callable")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOutputEvent:
+    kind: Literal["model.started", "model.delta", "model.accepted", "model.discarded"]
+    session_id: str
+    turn_id: str
+    iteration: int
+    attempt_id: str
+    route: str
+    text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +184,7 @@ class AllowAllGuard:
 
 
 __all__ = [
+    "ModelOutputEvent",
     "HostCapabilities", "TurnHostContext", "HumanApprovalRequired",
     "AllowAllGuard",
     "ApprovalDecision",

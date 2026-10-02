@@ -12,11 +12,13 @@ import logging
 import threading
 import time
 import uuid
+from dataclasses import replace
 from concurrent.futures import Future
 from typing import Any, Callable, Literal
 
 from agentcore.core import AgentCore
 from agentcore.interaction import InteractionPort, InteractionRequest
+from agentcore.interfaces import ModelOutputEvent
 from agentcore.models import AgentConfig, TurnResult, TurnTrigger, UserInput
 from agentcore.session_context import SessionBuildRequest
 from agentcore.workers import TurnQueueFullError, TurnSubmission, submit_daemon_call
@@ -56,6 +58,8 @@ class GatewayRuntime:
         recovery_policy: Literal["attached", "owned"] = "attached",
         owns_database: bool = False,
         owned_sessions: frozenset[str] | None = None,
+        on_output: Callable[[ModelOutputEvent], None] | None = None,
+        on_submission: Callable[[TurnSubmission[TurnResult]], None] | None = None,
         max_recovery_attempts: int = 3, **agent_options: Any,
     ):
         """配置当前接入端的交互方式和主动恢复范围。
@@ -100,6 +104,11 @@ class GatewayRuntime:
         if "delivery_destination" in agent_options:
             raise TypeError("delivery_destination is owned by GatewayRuntime")
         self._config = config
+        self._on_output = on_output
+        self._on_submission = on_submission
+        for callback, label in ((on_output, "on_output"), (on_submission, "on_submission")):
+            if callback is not None:
+                _require_sync(callback, label)
         self.adapter = adapter
         # 借用已初始化的进程服务；关闭本 Gateway 不能使其他使用者的资源失效。
         self._services = get_tool_services()
@@ -273,6 +282,11 @@ class GatewayRuntime:
         submission.future.add_done_callback(
             lambda future: self._complete_submission(session_id, future, port),
         )
+        if self._on_submission is not None:
+            try:
+                self._on_submission(submission)
+            except Exception:
+                logger.exception("gateway.submission_callback_failed")
         return submission
 
     def _complete_submission(
@@ -315,6 +329,7 @@ class GatewayRuntime:
             self._attach_session(sid)
             # 同一宿主的每个 Turn 都绑定独立端口，取消一轮不会关闭其他轮的通知出口。
             host, port = self._interactions.bind(sid)
+            host = replace(host, on_output=self._on_output)
             try:
                 submission = self.agent.submit_turn(
                     user_input, sid, session_request=session_request, host_context=host,
@@ -361,6 +376,7 @@ class GatewayRuntime:
             port = None
             try:
                 host, port = self._interactions.bind(session_id)
+                host = replace(host, on_output=self._on_output)
                 lifecycle = self.agent._store.get_session_recovery(session_id)
                 submission = self.agent.submit_recovery(
                     TurnTrigger(kind="internal_recovery", session_id=session_id,

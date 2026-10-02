@@ -42,10 +42,32 @@ timeout_seconds = 60.0
 
 # Add more [[routes]] blocks below the primary route to configure fallbacks.
 [session]
-enabled_toolsets = ["default"]
+enabled_toolsets = ["default", "mcp", "memory"]
 disabled_toolsets = []
 permissions = []
 
 
+# Use the RAG server's own virtual environment; keep its MCP 1.x dependencies isolated.
+[tools.mcp_servers.rag]
+command = "E:/MODULAR-RAG-MCP-SERVER-main/.venv/Scripts/python.exe"
+args = ["-m", "src.mcp_server.server"]
+required = true
+connect_timeout_seconds = 60
+tool_timeout_seconds = 60
+# Only expose the three reviewed knowledge-base read tools.
+requires_approval = false
+include = ["query_knowledge_hub", "list_collections", "get_document_summary"]
+
+[tools.mcp_servers.rag.env]
+PYTHONPATH = "E:/MODULAR-RAG-MCP-SERVER-main"
+PYTHONIOENCODING = "utf-8"
+
 [logging]
 level = "DEBUG"
+
+[file_memory]
+enabled = true
+directory = "memories"
+memory_char_limit = 2200
+user_char_limit = 1375
+review_every_turns = 10

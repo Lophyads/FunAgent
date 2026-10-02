@@ -27,6 +27,10 @@ class MemoryCapacityError(MemoryError):
     """The requested write would exceed a document's character limit."""
 
 
+class MemoryVersionConflict(MemoryError):
+    """The editor's base version is no longer current."""
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryDocument:
     target: Target
@@ -116,7 +120,8 @@ class FileMemoryStore:
                     remaining -= len(block)
         return tuple(blocks)
 
-    def apply(self, operation: MemoryOperation) -> MemoryWriteResult:
+    def apply(self, operation: MemoryOperation, *, expected_version: str | None = None,
+              exact_match: bool = False) -> MemoryWriteResult:
         if operation.action not in {"add", "replace", "remove"}:
             raise MemoryError("invalid memory action")
         path = self._path(operation.target)
@@ -128,6 +133,8 @@ class FileMemoryStore:
                 raise MemoryError("memory lock path must not be a symlink")
             with portalocker.Lock(str(path) + ".lock", timeout=5):
                 document = self._read_path(path, operation.target)
+                if expected_version is not None and document.version != expected_version:
+                    raise MemoryVersionConflict("memory changed; reload before saving")
                 entries = list(document.entries)
                 if operation.action == "add":
                     content = self._entry(operation.content)
@@ -136,7 +143,8 @@ class FileMemoryStore:
                     entries.append(content)
                 else:
                     old = self._entry(operation.old_text)
-                    matches = [i for i, item in enumerate(entries) if old in item]
+                    matches = [i for i, item in enumerate(entries)
+                               if (old == item if exact_match else old in item)]
                     if len(matches) != 1:
                         raise MemoryError(f"old_text must match exactly one entry; found {len(matches)}")
                     if operation.action == "replace":

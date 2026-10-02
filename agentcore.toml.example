@@ -58,6 +58,19 @@ approval_timeout_seconds = 300.0
 # [tools.mcp_servers.remote.headers]
 # Authorization = "env:MCP_REMOTE_AUTHORIZATION"
 
+# Local Modular RAG service (uses its existing environment and data/config).
+# [tools.mcp_servers.rag]
+# command = "E:/MODULAR-RAG-MCP-SERVER-main/.venv/Scripts/python.exe"
+# args = ["-m", "src.mcp_server.server"]
+# required = true
+# connect_timeout_seconds = 60
+# tool_timeout_seconds = 60
+# requires_approval = false
+# include = ["query_knowledge_hub", "list_collections", "get_document_summary"]
+# [tools.mcp_servers.rag.env]
+# PYTHONPATH = "E:/MODULAR-RAG-MCP-SERVER-main"
+# PYTHONIOENCODING = "utf-8"
+
 # Permanent approval scopes are written here only after explicit human approval.
 # [approvals]
 # always = ["cua:type:background"]

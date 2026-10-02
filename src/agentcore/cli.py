@@ -41,6 +41,9 @@ def _parser() -> argparse.ArgumentParser:
     tools = subparsers.add_parser("tools", help="diagnose optional tool backends")
     tools.add_argument("action", choices=("doctor",))
     tools.add_argument("--config", type=Path, default=Path("agentcore.toml"))
+    web = subparsers.add_parser("web", help="local Web UI through an in-process Gateway")
+    web.add_argument("--config", type=Path, default=Path("agentcore.toml"))
+    web.add_argument("--port", type=int, default=7777)
     return parser
 
 
@@ -166,6 +169,48 @@ def _new_session(gateway: GatewayRuntime, current_session: str) -> str:
     return session_id
 
 
+def _web(args) -> int:
+    from gateway.web import WebHost, WebServer
+    if not 1 <= args.port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    config = load_config(args.config)
+    logging_handle = configure_logging(config)
+    host = server = feature = None
+    initialized = False
+    try:
+        initialize_tool_system(ToolSystemConfig.from_agent_config(config))
+        initialized = True
+        feature = FileMemoryFeature(load_file_memory_config(args.config), config)
+        feature.install_tool(get_tool_registry())
+        host = WebHost(config, memory=feature.store, memory_settings=feature.settings,
+            **({"prompt_builder": feature.prompt_builder, "review_scheduler": feature.review_scheduler}
+               if feature.settings.enabled else {}))
+        host.start()
+        server = WebServer(host, args.port)
+        print(f"FunAgent Web: http://127.0.0.1:{server.server_port}", flush=True)
+        print("Ctrl+C to stop", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 130
+        return 0
+    finally:
+        deadline = time.monotonic() + config.timeouts.finalize_seconds
+        if host is not None:
+            host.accepting = False
+        # serve_forever has returned here; shutdown() from its own thread would deadlock.
+        if host is not None:
+            _cleanup_step("gateway", host.close, deadline)
+        memory_stopped = feature is None or _cleanup_step("file memory", feature.close, deadline)
+        if initialized and memory_stopped:
+            _cleanup_step("tools", shutdown_tool_system, deadline)
+        if host is not None:
+            host.events.close()
+        if server is not None:
+            server.server_close()
+        _cleanup_step("logging", logging_handle.close, deadline)
+
+
 def _read_answer(question: Question) -> str | list[str]:
     print(f"\nquestion> {question.question}")
     for index, choice in enumerate(question.choices, start=1):
@@ -252,6 +297,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "chat":
             return _chat(args)
+        if args.command == "web":
+            return _web(args)
         if args.command == "logs":
             return _show_logs(args)
         if args.command == "tools":

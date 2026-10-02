@@ -21,8 +21,10 @@ class TurnPersistence:
     def __init__(
         self, session_id: str, store: SQLiteStore | None = None, *,
         persist_disabled: bool = False, fence: LeaseFence | None = None,
+        turn_id: str | None = None,
     ) -> None:
         self.session_id = session_id
+        self.turn_id = turn_id
         self._store = store
         self._enabled = store is not None and not persist_disabled
         self._fence = fence
@@ -53,18 +55,18 @@ class TurnPersistence:
     ) -> None:
         self._write(lambda db, fence: db.create_session(
             self.session_id,
-            system_prompt_bytes=system_prompt_bytes, user_message=user_message, fence=fence,
+            system_prompt_bytes=system_prompt_bytes, user_message=self._tag(user_message), fence=fence,
             workspace=workspace,
         ))
 
     def save_user_message(self, message: Message, *, workspace: str | None = None) -> None:
         self._write(lambda db, fence: db.append_user_message(
-            self.session_id, message, fence=fence, workspace=workspace,
+            self.session_id, self._tag(message), fence=fence, workspace=workspace,
         ))
 
     def save_tool_calls(self, message: Message) -> None:
         row_id = self._write(lambda db, fence: db.append_tool_calls(
-            self.session_id, message, fence=fence,
+            self.session_id, self._tag(message), fence=fence,
         ))
         self._tool_parent_id = row_id
 
@@ -73,7 +75,7 @@ class TurnPersistence:
             if self._tool_parent_id is None:
                 raise StorageError("tool result has no persisted assistant batch")
             # Database linkage is never injected into the live message object.
-            persisted = message.model_copy(update={"reply_to_message_id": self._tool_parent_id})
+            persisted = self._tag(message).model_copy(update={"reply_to_message_id": self._tool_parent_id})
             db.append_tool_result(self.session_id, persisted, fence=fence)
 
         self._write(save)
@@ -83,7 +85,7 @@ class TurnPersistence:
         recovery: bool = False,
     ) -> None:
         self._write(lambda db, fence: db.append_final_assistant(
-            self.session_id, message, fence=fence,
+            self.session_id, self._tag(message), fence=fence,
             delivery_destination=delivery_destination, recovery=recovery,
         ))
 
@@ -91,6 +93,13 @@ class TurnPersistence:
         return bool(self._write(lambda db, fence: db.claim_recovery(
             self.session_id, fence=fence, max_attempts=max_attempts,
         )))
+
+    def persisted_message(self, message: Message) -> Message:
+        if self.turn_id is None:
+            return message
+        return message.model_copy(update={"metadata": {**message.metadata, "turn_id": self.turn_id}})
+
+    _tag = persisted_message
 
     def save_recovery_failure(self, *, max_attempts: int) -> None:
         self._write(lambda db, fence: db.finish_recovery(

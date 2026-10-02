@@ -99,6 +99,21 @@ class ToolServices:
             if self._closing:
                 raise ResourceUnavailableError("tool runtime is stopping")
 
+    def status_snapshot(self) -> dict:
+        """Read initialized state without creating providers or probing binaries."""
+        with self._lock:
+            providers = dict(self._providers)
+            closing = self._closing
+        backends = {name: {"status": "stopping" if closing else (
+            "initialized" if name in providers else "uninitialized")}
+            for name in ("browser", "computer", "mcp")}
+        mcp = providers.get("mcp")
+        statuses = mcp.status_snapshot() if mcp is not None and hasattr(mcp, "status_snapshot") else {}
+        servers = [{"id": name, "config": cfg.model_dump(mode="json"),
+                    "status": "disabled" if not cfg.enabled else statuses.get(name, "uninitialized")}
+                   for name, cfg in self.config.tools.mcp_servers.items()]
+        return {"backends": backends, "mcp_servers": servers}
+
     def protect_path(self, path: Path) -> None:
         with self._lock:
             self.check_open()
