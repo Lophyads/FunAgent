@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -13,7 +14,7 @@ from .prompt_builder import PromptBuildRequest, SystemPromptBuilder, SystemPromp
 from .storage import PersistedSession
 from tools.model_tools import load_tools
 from tools.registry import ToolEntry, ToolRegistry
-from tools.toolsets import ToolsetRequest, ToolsetResolver
+from tools.toolsets import ToolsetRequest, ToolsetResolver, select_tool_names
 
 
 class SessionContextError(RuntimeError):
@@ -30,6 +31,8 @@ class SessionBuildRequest:
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
     workspace: Path | None = None
+    enabled_tools: tuple[str, ...] = ()
+    disabled_tools: tuple[str, ...] = ()
 
     @classmethod
     def from_defaults(cls, defaults: SessionDefaults) -> "SessionBuildRequest":
@@ -37,6 +40,8 @@ class SessionBuildRequest:
             enabled_toolsets=defaults.enabled_toolsets,
             disabled_toolsets=defaults.disabled_toolsets,
             permissions=defaults.permissions,
+            enabled_tools=defaults.enabled_tools,
+            disabled_tools=defaults.disabled_tools,
         )
 
 
@@ -51,12 +56,30 @@ class SessionRuntimeSnapshot:
     def copy(self) -> "SessionRuntimeSnapshot":
         return replace(self, entries_by_name=MappingProxyType(dict(self.entries_by_name)))
 
+    def with_tool_policy(self, request: ToolsetRequest) -> "SessionRuntimeSnapshot":
+        """Apply individual switches within an already prepared, authorized view."""
+        if not request.enabled_tools and not request.disabled_tools:
+            return self
+        names = set(select_tool_names(request, self.entries_by_name))
+        entries = {name: entry for name, entry in self.entries_by_name.items() if name in names}
+        schema = [
+            definition for definition in json.loads(self.tool_schema_bytes)
+            if definition["function"]["name"] in entries
+        ]
+        return replace(
+            self, entries_by_name=MappingProxyType(entries),
+            tool_schema_bytes=json.dumps(
+                schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SessionContextResolution:
     snapshot: SessionRuntimeSnapshot
     created: bool
     warnings: tuple[str, ...] = ()
+    permissions: frozenset[str] = frozenset()
 
 
 class SessionContextFactory:
@@ -125,7 +148,7 @@ class SessionContextFactory:
             request, prompt, availability,
         )
         return SessionContextResolution(
-            snapshot, True, tuple(warnings),
+            snapshot, True, tuple(warnings), request.permissions,
         )
 
     def _load(
@@ -142,7 +165,7 @@ class SessionContextFactory:
             self._runtime_snapshot(
                 current, prompt, availability,
             ),
-            False,
+            False, permissions=current.permissions,
         )
 
     def _runtime_snapshot(
@@ -165,6 +188,8 @@ class SessionContextFactory:
             enabled_toolsets=request.enabled_toolsets,
             disabled_toolsets=request.disabled_toolsets,
             permissions=request.permissions,
+            enabled_tools=request.enabled_tools,
+            disabled_tools=request.disabled_tools,
         ), self._registry, self._toolset_resolver, availability=availability)
 
 

@@ -64,6 +64,9 @@ def load_tools(
     selected: list[ToolEntry[Any]] = []
 
     for name in selected_names:
+        # Keep explicit denies effective even for custom resolvers.
+        if name in request.disabled_tools:
+            continue
         entry = entries_by_name.get(name)
         if entry is None:
             continue

@@ -19,11 +19,15 @@ def _request(
     *enabled: str,
     disabled: tuple[str, ...] = (),
     permissions: frozenset[str] = frozenset(),
+    enabled_tools: tuple[str, ...] = (),
+    disabled_tools: tuple[str, ...] = (),
 ) -> ToolsetRequest:
     return ToolsetRequest(
         enabled_toolsets=enabled,
         disabled_toolsets=disabled,
         permissions=permissions,
+        enabled_tools=enabled_tools,
+        disabled_tools=disabled_tools,
     )
 
 
@@ -53,6 +57,59 @@ def test_builtin_discovery_and_toolset_policy_share_one_entry_view(tmp_path, ava
         registry, availability=availability,
     )
     assert set(coding_entries) == {"calculator", "current_time", "terminal", "web_search", "web_extract"}
+
+
+def test_individual_switches_share_schema_and_handlers_without_mutating_registry(availability):
+    registry = builtin_registry()
+    registry.freeze()
+    original = registry.entries()
+    entries, schema = load_tools(
+        _request(
+            "default", enabled_tools=("write_file", "write_file", "missing_tool"),
+            disabled_tools=("calculator", "read_file"), permissions=frozenset({"file.write"}),
+        ), registry, availability=availability,
+    )
+    assert "write_file" in entries
+    assert not {"calculator", "read_file", "missing_tool"}.intersection(entries)
+    assert {item["function"]["name"] for item in json.loads(schema)} == set(entries)
+    assert entries["write_file"] is registry.get_entry("write_file")
+    assert registry.entries() == original
+
+
+def test_group_and_individual_denies_take_precedence_over_enables(availability):
+    registry = builtin_registry()
+    entries, schema = load_tools(
+        _request(
+            "default", disabled=("file",),
+            enabled_tools=("read_file", "write_file", "calculator"),
+            disabled_tools=("calculator",), permissions=frozenset({"file.write"}),
+        ), registry, availability=availability,
+    )
+    assert not {"read_file", "write_file", "calculator"}.intersection(entries)
+    assert "current_time" in entries
+    assert {item["function"]["name"] for item in json.loads(schema)} == set(entries)
+
+
+def test_individual_enables_still_require_permissions_capabilities_and_availability(availability):
+    entries, schema = load_tools(
+        _request(enabled_tools=("calculator", "write_file", "terminal", "clarify", "browser_navigate")),
+        builtin_registry(), availability=availability,
+    )
+    assert set(entries) == {"calculator"}
+    assert [item["function"]["name"] for item in json.loads(schema)] == ["calculator"]
+
+
+def test_custom_resolver_cannot_ignore_individual_denies(availability):
+    class Resolver:
+        def resolve(self, request, entries):
+            return ("calculator", "current_time")
+
+    entries, schema = load_tools(
+        _request("default", disabled_tools=("calculator",)), builtin_registry(), Resolver(),
+        availability=availability,
+    )
+    assert set(entries) == {"current_time"}
+    assert [item["function"]["name"] for item in json.loads(schema)] == ["current_time"]
 
 
 def test_availability_check_is_memoized_once_per_load(availability):

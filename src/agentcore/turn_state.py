@@ -17,6 +17,7 @@ from .models import (
 from .session_context import SessionRuntimeSnapshot
 
 if TYPE_CHECKING:
+    from knowledge.models import KnowledgeContext
     from .lease import LeaseScope
     from .turn_preparation import PreparedConversation
     from tools.services import ToolServices
@@ -42,6 +43,8 @@ class LoopState:
     workspace: ResolvedWorkspace | None = None
     resource_key: SessionResourceKey | None = None
     messages: list[Message] = field(default_factory=list)
+    knowledge_context: KnowledgeContext | None = None
+    tool_permissions: frozenset[str] = frozenset()
     warnings: list[str] = field(default_factory=list)
     iteration: int = 0
     active_route_index: int = 0
@@ -70,6 +73,7 @@ class LoopState:
         self.context = prepared.context.copy()
         self.workspace = prepared.workspace
         self.resource_key = prepared.resource_key
+        self.tool_permissions = prepared.tool_permissions
         self.messages = [m.model_copy(deep=True) for m in prepared.messages]
         self.submitted_message = self.messages[-1]
         self.user_driven_recovery = prepared.user_driven_recovery

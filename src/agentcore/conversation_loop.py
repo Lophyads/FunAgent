@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from log.logging_system import log_context
+from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider
 
 from .interfaces import TurnHostContext, MemoryUpdater, ReviewScheduler, ToolGuard
 from .lease import LeaseScope
@@ -45,6 +46,8 @@ class ConversationLoop:
         prepare: Callable[[TurnRuntime], PreparedConversation] | None = None,
         recovery: bool = False, delivery_destination: str | None = None,
         max_recovery_attempts: int = 3,
+        knowledge_provider: KnowledgeProvider | None = None,
+        tool_permissions: frozenset[str] = frozenset(),
     ) -> None:
         persistence = persistence if persistence is not None else TurnPersistence(session_id)
         if persistence.session_id != session_id:
@@ -68,6 +71,7 @@ class ConversationLoop:
             prepare = partial(
                 prepare_memory_turn, context=context.copy(), history=tuple(messages),
                 user_input=user_input.model_copy(deep=True), workspace=workspace, resource_key=resource_key,
+                tool_permissions=tool_permissions,
             )
         self._state = LoopState(session_id=session_id, turn_id=turn_id, trace_id=turn_id)
         self._services = services
@@ -85,6 +89,7 @@ class ConversationLoop:
             memory_updater=memory_updater,
             review_scheduler=review_scheduler, observability=observability,
             call_operation=call_operation,
+            knowledge_provider=knowledge_provider if knowledge_provider is not None else NoopKnowledgeProvider(),
         )
 
     @property

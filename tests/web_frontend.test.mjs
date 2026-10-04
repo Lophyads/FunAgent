@@ -103,3 +103,11 @@ test('Overview timeline labels and filters retain the underlying event semantics
   const final=eventInfo({kind:'turn.finished',payload:{status:'interrupted'}});
   assert.equal(final.tone,'interrupted');assert.equal(final.category,'system');
 });
+
+test('Overview shows knowledge preparation as context work before answering',()=>{
+  const view=buildOverview({status:'running',phase:'prepare_knowledge',created_at:100},'connected',102);
+  assert.equal(view.activeNode,'context');assert.equal(view.nodeStates.reply,'idle');
+  assert.equal(view.phaseTitle,'准备知识资料');
+  const info=eventInfo({kind:'knowledge.plan_completed',payload:{status:'failed',error_type:'TimeoutError'}});
+  assert.equal(info.title,'完成知识检索规划');assert.equal(info.tone,'failed');
+});

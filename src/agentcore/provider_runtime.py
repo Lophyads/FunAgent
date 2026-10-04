@@ -116,7 +116,8 @@ class ApiModeRegistry:
             callback = getattr(adapter, method, None)
             if callback is None or not callable(callback):
                 raise TypeError(f"API mode adapter must define {method}()")
-            if inspect.iscoroutinefunction(callback):
+            if (inspect.iscoroutinefunction(callback)
+                    or inspect.iscoroutinefunction(getattr(callback, "__call__", None))):
                 raise TypeError(f"API mode adapter {method}() must be synchronous")
         self._adapters[adapter.name] = adapter
 
@@ -166,7 +167,18 @@ class OpenAIHttpTransport:
 
     def send(self, request: WireRequest, context: AttemptContext) -> WireResponse:
         context.cancellation.raise_if_cancelled()
-        response = self._client.chat.completions.create(**dict(request.body))
+        timeout = request.timeout_seconds
+        if context.deadline is not None:
+            from .turn_state import RunBudgetExceeded
+            remaining = context.deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunBudgetExceeded("turn run budget was exhausted")
+            timeout = min(timeout, remaining)
+        if timeout <= 0:
+            raise TimeoutError("request timeout was exhausted")
+        response = self._client.chat.completions.create(
+            **{**request.body, "timeout": timeout},
+        )
         return WireResponse(raw=response)
 
     def stream(self, request: WireRequest, context: AttemptContext,

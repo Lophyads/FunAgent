@@ -266,6 +266,7 @@ def test_review_runner_adds_without_persisting_or_using_other_tools(
         "workspace": WorkspaceConfig(default_cwd=tmp_path, allowed_root=tmp_path),
     })
     store = FileMemoryStore(tmp_path / "memories")
+    store.apply(MemoryOperation("add", "user", "existing preference"))
     entry = memory_entry(store)
     other = next(item for item in builtin_registry().entries() if item.name != "memory")
     prompt = b"original prompt"
@@ -295,10 +296,28 @@ def test_review_runner_adds_without_persisting_or_using_other_tools(
     runner.api_modes = api_modes
     try:
         runner(ReviewTask("review-id", snapshot, threading.Event()))
-        assert store.read("user").entries == ("prefers tea",)
+        assert store.read("user").entries == ("existing preference", "prefers tea")
         assert len(snapshot.messages) == 2
         assert "Current file memory" in transport.requests[0].body["messages"][-1]["content"]
-        assert transport.requests[0].body["messages"][0]["content"] == "original prompt"
+        assert "existing preference" in transport.requests[0].body["messages"][-1]["content"]
+        review_prompt = transport.requests[0].body["messages"][0]["content"]
+        assert "Review this conversation" in review_prompt and "original prompt" not in review_prompt
+        assert transport.requests[0].body["messages"][1:3] == [message.to_wire() for message in original]
         assert [tool["function"]["name"] for tool in transport.requests[0].body["tools"]] == ["memory"]
+        assert snapshot.context.prompt.text == "original prompt"
+        assert set(snapshot.context.entries_by_name) == {"memory", other.name}
+    finally:
+        assert runner.close(3)
+
+
+def test_review_operation_preserves_completed_callback_timeout(config_factory, tmp_path):
+    runner = MemoryReviewRunner(config_factory(), FileMemoryStore(tmp_path / "memories"))
+    error = TimeoutError("backend request timed out")
+    def fail():
+        raise error
+    try:
+        with pytest.raises(TimeoutError) as raised:
+            runner.call_operation(fail, timeout=0.5, cancel_event=None, deadline=None)
+        assert raised.value is error
     finally:
         assert runner.close(3)

@@ -35,7 +35,7 @@ dev = [
 agentcore = "agentcore.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentcore", "src/gateway", "src/log", "src/tools", "src/file_memory"]
+packages = ["src/agentcore", "src/gateway", "src/log", "src/tools", "src/file_memory", "src/knowledge"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

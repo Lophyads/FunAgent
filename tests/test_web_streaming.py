@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from agentcore.interfaces import CancellationToken, TurnCancelled, TurnHostContext
-from agentcore.provider_runtime import AttemptContext, ChatCompletionsAdapter, NormalizedProviderError, OpenAIHttpTransport, WireRequest
+from agentcore.provider_runtime import AttemptContext, NormalizedProviderError, OpenAIHttpTransport, WireRequest
 from conftest import ScriptedTransport
 
 

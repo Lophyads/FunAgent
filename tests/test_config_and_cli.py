@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentcore import load_config
+from agentcore import SessionBuildRequest, load_config
 from agentcore.cli import run_cli
 
 
@@ -44,6 +44,21 @@ def test_load_config_resolves_database_relative_to_toml(tmp_path):
 
     assert config.database_path == (config_path.parent / "state.db").resolve()
     assert config.routes[0].credential_ref == "env:CLI_TEST_KEY"
+
+
+def test_individual_tool_policy_loads_from_session_config(tmp_path):
+    path = tmp_path / "agentcore.toml"
+    _write_config(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[session]\nenabled_tools = ["write_file"]\n'
+                     'disabled_tools = ["calculator"]\npermissions = ["file.write"]\n')
+
+    config = load_config(path)
+    request = SessionBuildRequest.from_defaults(config.session_defaults)
+    assert request.enabled_toolsets == ("default",)
+    assert request.enabled_tools == ("write_file",)
+    assert request.disabled_tools == ("calculator",)
+    assert request.permissions == frozenset({"file.write"})
 
 
 def test_load_config_reads_dotenv_from_config_directory(tmp_path, monkeypatch):

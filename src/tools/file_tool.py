@@ -95,7 +95,6 @@ def _atomic_write(path: Path, content: str) -> None:
 
 def list_directory(args: ListDirectoryArgs, context: ToolContext) -> dict:
     context.check_active()
-    root = context.workspace.allowed_root
     path = _resolve(context, args.path)
     if not path.is_dir():
         raise ValueError("path is not a directory")
@@ -114,7 +113,6 @@ def list_directory(args: ListDirectoryArgs, context: ToolContext) -> dict:
 
 def read_file(args: ReadFileArgs, context: ToolContext) -> dict:
     context.check_active()
-    root = context.workspace.allowed_root
     path = _resolve(context, args.path)
     lines = _read_text(path).splitlines()
     start = args.start_line - 1
@@ -193,7 +191,6 @@ def write_file(args: WriteFileArgs, context: ToolContext) -> dict:
 
 def patch_file(args: PatchFileArgs, context: ToolContext) -> dict:
     context.check_active()
-    root = context.workspace.allowed_root
     path = _resolve(context, args.path)
     current = _read_text(path)
     if (

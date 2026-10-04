@@ -28,6 +28,7 @@ def load_config(path: str | Path) -> AgentConfig:
         "logging": raw.get("logging", {}),
         "session_defaults": raw.get("session", {}),
         "tools": raw.get("tools", {}),
+        "knowledge": raw.get("knowledge", {}),
         "workspace": raw.get("workspace", {}),
         "routes": raw.get("routes", []),
     }

@@ -4,6 +4,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from agentcore import (
+    ApiModeRegistry,
     CanonicalModelRequest,
     Message,
     NormalizedModelResponse,
@@ -163,6 +164,27 @@ def test_canonical_request_fingerprint_is_stable():
         parameters={"temperature": 0},
     )
     assert first.fingerprint == second.fingerprint
+
+
+@pytest.mark.parametrize("method", ["encode", "decode", "normalize_error"])
+def test_api_mode_registry_rejects_async_callable_objects(method):
+    class AsyncCallback:
+        async def __call__(self, *args):
+            return None
+
+    class Adapter:
+        name = "async-object"
+        def encode(self, *args):
+            return None
+        def decode(self, *args):
+            return None
+        def normalize_error(self, *args):
+            return None
+
+    adapter = Adapter()
+    setattr(adapter, method, AsyncCallback())
+    with pytest.raises(TypeError, match="synchronous"):
+        ApiModeRegistry().register(adapter)
 
 
 def test_tool_registry_freezes_and_uses_versioned_identity():

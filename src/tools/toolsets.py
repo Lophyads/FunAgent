@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Iterable, Protocol, Sequence
 
 from .registry import ToolEntry
 
@@ -38,6 +38,17 @@ class ToolsetRequest:
     enabled_toolsets: tuple[str, ...]
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
+    enabled_tools: tuple[str, ...] = ()
+    disabled_tools: tuple[str, ...] = ()
+
+
+def select_tool_names(
+    request: ToolsetRequest, candidates: Iterable[str], *, disabled_names: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Apply individual switches; all explicit denies take precedence."""
+    enabled = set(candidates).union(request.enabled_tools)
+    disabled = set(disabled_names).union(request.disabled_tools)
+    return tuple(sorted(enabled - disabled))
 
 
 class ToolsetResolver(Protocol):
@@ -66,7 +77,10 @@ class DefaultToolsetResolver:
         for name in request.disabled_toolsets:
             disabled.update(_resolve_toolset(name, by_toolset, set()))
 
-        return tuple(sorted((enabled - disabled).intersection(registered_names)))
+        return tuple(
+            name for name in select_tool_names(request, enabled, disabled_names=disabled)
+            if name in registered_names
+        )
 
 
 def _resolve_toolset(
@@ -91,4 +105,5 @@ def _resolve_toolset(
 
 __all__ = [
     "DefaultToolsetResolver", "TOOLSETS", "ToolsetRequest", "ToolsetResolver",
+    "select_tool_names",
 ]

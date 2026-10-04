@@ -93,6 +93,48 @@ class SessionDefaults(FrozenStrictModel):
     enabled_toolsets: tuple[str, ...] = ("default",)
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
+    enabled_tools: tuple[str, ...] = ()
+    disabled_tools: tuple[str, ...] = ()
+
+
+class KnowledgeMcpConfig(FrozenStrictModel):
+    server: str = Field(min_length=1)
+    tool: str = Field(default="query_knowledge_hub", min_length=1)
+    collection: str = Field(min_length=1)
+    hidden_tools: tuple[str, ...] = (
+        "query_knowledge_hub", "list_collections", "get_document_summary",
+    )
+
+    @field_validator("server", "tool", "collection", "hidden_tools")
+    @classmethod
+    def _nonblank_binding(cls, value):
+        values = value if isinstance(value, tuple) else (value,)
+        if any(not item.strip() for item in values):
+            raise ValueError("knowledge binding names must not be blank")
+        return value
+
+
+class KnowledgeConfig(FrozenStrictModel):
+    enabled: bool = False
+    mode: Literal["auto", "always"] = "auto"
+    source_description: str = ""
+    max_queries: int = Field(default=3, ge=1, le=3)
+    top_k: int = Field(default=5, ge=1, le=20)
+    max_items: int = Field(default=6, ge=1, le=20)
+    history_max_chars: int = Field(default=8000, ge=0, le=32000)
+    context_max_chars: int = Field(default=12000, ge=512, le=64000)
+    timeout_seconds: float = Field(default=20, ge=1, le=120, allow_inf_nan=False)
+    planner_timeout_seconds: float = Field(default=5, ge=1, le=120, allow_inf_nan=False)
+    planner: ModelRoute | None = None
+    mcp: KnowledgeMcpConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_budgets(self):
+        if self.planner_timeout_seconds > self.timeout_seconds:
+            raise ValueError("planner_timeout_seconds must not exceed knowledge timeout_seconds")
+        if self.planner is not None and self.planner.max_attempts not in {None, 1}:
+            raise ValueError("knowledge planner only supports one attempt")
+        return self
 
 
 class AgentConfig(FrozenStrictModel):
@@ -109,6 +151,7 @@ class AgentConfig(FrozenStrictModel):
     session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     tools: ToolServiceConfig = Field(default_factory=ToolServiceConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     approval_store_path: Path | None = Field(default=None, exclude=True)
     routes: tuple[ModelRoute, ...] = Field(min_length=1)
 
@@ -117,6 +160,8 @@ class AgentConfig(FrozenStrictModel):
         names = [route.name for route in self.routes]
         if len(names) != len(set(names)):
             raise ValueError("route names must be unique")
+        if self.knowledge.planner is not None and self.knowledge.planner.name in names:
+            raise ValueError("knowledge planner route name must differ from main route names")
         return self
 
 

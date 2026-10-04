@@ -5,7 +5,6 @@ import json
 import sqlite3
 import threading
 import time
-from dataclasses import replace
 
 import pytest
 

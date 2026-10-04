@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agentcore import Message, NormalizedModelResponse, SessionBuildRequest, SQLiteStore, ToolCall
+from agentcore import Message, NormalizedModelResponse, SessionBuildRequest, SessionDefaults, SQLiteStore, ToolCall
 from agentcore.storage import LeaseLostError, SCHEMA_VERSION, StorageError, _SCHEMA
 from tools.config import WorkspaceConfig
 from tools.runtime import get_tool_services
@@ -36,6 +36,35 @@ def test_workspace_inherits_across_turns_and_agent_replacement(config_factory, a
             assert json.loads(reply.content)["result"]["lines"][0]["text"] == expected.name
             assert Path(agent._store.load_session("chat").workspace) == expected
     assert not get_tool_services()._providers  # Files do not register any backend resources.
+
+
+def test_individual_tool_policy_is_resolved_for_each_turn(config_factory, agent_factory):
+    config = config_factory().model_copy(update={"session_defaults": SessionDefaults(
+        enabled_tools=("write_file",), disabled_tools=("calculator",),
+        permissions=frozenset({"file.write"}),
+    )})
+    transport = ScriptedTransport(
+        NormalizedModelResponse(content="first"),
+        NormalizedModelResponse(tool_calls=[ToolCall(
+            id="calculate", name="calculator", arguments='{"expression":"1 + 2"}',
+        )], finish_reason="tool_calls"),
+        NormalizedModelResponse(content="3"),
+        NormalizedModelResponse(content="third"),
+    )
+    with agent_factory(config, transports={"primary": transport}) as agent:
+        first = agent.run_turn_blocking("first", session_id="policy")
+        second = agent.run_turn_blocking("second", session_id="policy", session_request=SessionBuildRequest(
+            enabled_tools=("calculator",), disabled_tools=("read_file",),
+        ))
+        third = agent.run_turn_blocking("third", session_id="policy")
+        tool_reply = next(message for message in agent._store.load_messages("policy") if message.role == "tool")
+    assert first.status == second.status == third.status == "completed"
+    assert json.loads(tool_reply.content)["ok"] is True
+    names = [{item["function"]["name"] for item in request.body["tools"]} for request in transport.requests]
+    assert "write_file" in names[0] and "calculator" not in names[0]
+    assert "calculator" in names[1] and not {"write_file", "read_file"}.intersection(names[1])
+    assert names[1] == names[2]
+    assert names[3] == names[0]
 
 
 def test_invalid_workspace_does_not_replace_inherited_setting(config_factory, agent_factory, tmp_path):

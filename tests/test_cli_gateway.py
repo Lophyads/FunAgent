@@ -46,7 +46,6 @@ def seed_crashed_sessions(config, *session_ids):
             lease = store.acquire_lease(
                 session_id=sid, owner_id="dead", turn_id=sid, ttl_seconds=30,
             )
-            defaults = config.session_defaults
             store.create_session(
                 sid, system_prompt_bytes=b"system",
                 user_message=Message.user("unfinished"), fence=lease.fence,

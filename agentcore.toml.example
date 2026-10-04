@@ -101,6 +101,8 @@ timeout_seconds = 60.0
 [session]
 enabled_toolsets = ["default", "memory"]
 disabled_toolsets = []
+enabled_tools = []  # Exact registered tool names, including names outside enabled toolsets.
+disabled_tools = []  # Denies take precedence; permissions and availability still apply.
 permissions = []
 
 # Paths are relative to this config file; no process-wide chdir is used.
@@ -115,3 +117,32 @@ directory = "memories"
 memory_char_limit = 2200
 user_char_limit = 1375
 review_every_turns = 10  # 0 disables background review
+
+# Prepare knowledge before the main model. Enable the rag MCP server above first.
+# Omitting [knowledge.planner] reuses routes[0] with a separate planning prompt.
+[knowledge]
+enabled = false
+mode = "auto"
+source_description = "项目内部文档、产品使用说明与业务制度"
+max_queries = 3
+top_k = 5
+max_items = 6
+history_max_chars = 8000
+context_max_chars = 12000
+timeout_seconds = 20
+planner_timeout_seconds = 5
+
+[knowledge.mcp]
+server = "rag"
+tool = "query_knowledge_hub"
+collection = "knowledge_hub"
+hidden_tools = ["query_knowledge_hub", "list_collections", "get_document_summary"]
+
+# Optional separate route; model may also be the same model as the main route.
+# [knowledge.planner]
+# name = "knowledge-planner"
+# provider = "openai_compatible"
+# model = "YOUR_PLANNING_MODEL"
+# api_mode = "chat_completions"
+# base_url = "https://YOUR_MODEL_ENDPOINT/v1"
+# credential_ref = "env:KNOWLEDGE_MODEL_API_KEY"

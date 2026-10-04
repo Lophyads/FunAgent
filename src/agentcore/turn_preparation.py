@@ -40,6 +40,7 @@ class PreparedConversation:
     warnings: tuple[str, ...] = ()
     session_created: bool | None = None
     user_driven_recovery: bool = False
+    tool_permissions: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -53,11 +54,15 @@ def prepare_memory_turn(
     runtime: TurnRuntime, *, context: SessionRuntimeSnapshot,
     history: tuple[Message, ...], user_input: UserInput, workspace=None,
     resource_key: SessionResourceKey | None = None,
+    tool_permissions: frozenset[str] = frozenset(),
 ) -> PreparedConversation:
     workspace = resolve_workspace(workspace, None, runtime.services.config.workspace)
     resource_key = resource_key or SessionResourceKey(uuid.uuid4().hex)
     message = Message.user(user_input.text, metadata=user_input.metadata)
-    return PreparedConversation(context, (*history, message), workspace, resource_key)
+    return PreparedConversation(
+        context, (*history, message), workspace, resource_key,
+        tool_permissions=tool_permissions,
+    )
 
 
 def prepare_stored_turn(
@@ -139,6 +144,7 @@ def prepare_stored_turn(
         context=resolution.snapshot, messages=tuple(messages), workspace=workspace,
         resource_key=resource_key, warnings=tuple(warnings),
         session_created=resolution.created, user_driven_recovery=user_driven_recovery,
+        tool_permissions=resolution.permissions,
     )
 
 

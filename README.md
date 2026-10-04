@@ -16,6 +16,7 @@ Provider、SQLite、策略、工具或生命周期逻辑。
 - 隔离的 Observer/EventSink 可观测性路径及集中敏感信息脱敏。
 - Web 搜索/提取、文本 browser、AX-only computer_use 与跨 CLI/Gateway 的 clarify/审批交互。
 - 可选 MCP Client：stdio/Streamable HTTP、多服务工具发现、注册及同步调用。
+- 可选前置知识检索：独立规划、查询改写和有界扩展；默认复用主模型，主模型接收证据并隐藏知识工具。
 
 ## 快速开始
 
@@ -47,6 +48,47 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 
 可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
 ；该命令不下载或升级程序。
+
+工具组之外，可通过 `[session] enabled_tools` 单独启用工具，通过 `disabled_tools`
+禁用工具；两者使用精确注册名称，MCP 工具例如 `mcp__rag__echo`。工具组和单工具的
+禁用项均优先于启用项，启用后仍需通过权限、宿主能力和可用性检查：
+
+```toml
+[session]
+enabled_toolsets = ["default"]
+enabled_tools = ["write_file"]
+disabled_tools = ["calculator"]
+permissions = ["file.write"]
+```
+
+调用 API 时可通过 `SessionBuildRequest` 覆盖本轮策略；下一轮未传入时使用配置默认值。
+
+## 前置知识检索
+
+在 `agentcore.toml.example` 中配置并启用 `tools.mcp_servers.rag`，安装 MCP 可选依赖
+`uv sync --extra mcp`，再设置 `[knowledge] enabled = true`。后台绑定的查询工具必须
+已发现、已注册，且服务配置为 `requires_approval = false`。
+
+`[knowledge.planner]` 可以省略，规划请求会复用首选主模型路由。规划使用独立的
+Prompt、有限历史、无工具的 JSON 输出和 `planner_timeout_seconds`；也可配置独立
+planner 路由，使用另一个模型或相同型号的不同端点。
+
+每个 Turn 首次回答前只准备一次知识。后台按主要查询、同义表达和原问题检索，
+合并去重后将有来源的证据加入本轮请求；RAG 工具同时从主模型 schema 与 handler
+映射隐藏，复用通用 `disabled_tools` 策略，显式启用 RAG 工具也不会重新暴露。
+规划失败时只用原问题检索一次，证据不写入基础 Prompt 或持久化消息。
+后台记忆复盘默认使用 NoopKnowledgeProvider。
+
+记忆复盘使用专用 System Prompt、完整会话历史、执行时读取的最新记忆及仅含
+`memory` 的工具视图；复盘消息不写回主会话历史。
+
+默认适配器绑定 Modular RAG 的 `query_knowledge_hub`，优先读取 version=1 的
+完整结构化片段；旧引用 JSON 仍可使用，但会标记 `snippet_only`。实际配置默认
+不自动启用此功能；上线前应评估真实知识库的漏检率、引用质量和调用延迟。
+
+自定义接入可向 `AgentCore(..., knowledge_provider=...)` 注入同步 KnowledgeProvider；
+默认 RetrievalKnowledgeProvider 也可组合自定义 KnowledgeRetriever，复用其规划、
+预算、合并和渲染逻辑。
 
 ## Web 前端
 

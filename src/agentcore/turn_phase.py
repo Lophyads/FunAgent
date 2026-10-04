@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Protocol
 
 from pydantic import ValidationError
+from knowledge.models import KnowledgeContext
+from knowledge.planner import request_from_messages
+from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider, render_knowledge
+from tools.toolsets import ToolsetRequest
 
 from .interfaces import (
     TurnHostContext, MemoryUpdater, ReviewScheduler, ToolGuard,
@@ -159,6 +163,7 @@ class TurnPhases:
         guard: ToolGuard, host_context: TurnHostContext,
         memory_updater: MemoryUpdater, review_scheduler: ReviewScheduler,
         observability: Any, call_operation: Any,
+        knowledge_provider: KnowledgeProvider | None = None,
     ) -> None:
         self.config = config
         self.on_output = host_context.on_output
@@ -180,6 +185,8 @@ class TurnPhases:
         self.observability = observability
         self.call_operation = call_operation
         self.recovery = recovery
+        self.knowledge_provider = knowledge_provider if knowledge_provider is not None else NoopKnowledgeProvider()
+        self.host_context = host_context
         self.tool_round_runner = ToolRoundRunner(
             persistence=persistence,
             executor=ToolExecutor(
@@ -206,7 +213,7 @@ class TurnPhases:
         )
 
     def setup_phases(self) -> tuple[FunctionPhase, ...]:
-        return (self._acquire_execution_phase(), self._prepare_conversation_phase())
+        return (self._acquire_execution_phase(), self._prepare_conversation_phase(), self._prepare_knowledge_phase())
 
     def assemble_phase(self) -> FunctionPhase:
         return self._assemble_phase()
@@ -380,6 +387,12 @@ class TurnPhases:
                     session_id=state.session_id, turn_id=state.turn_id,
                 ))
             prepared = self.prepare(runtime)
+            if self.knowledge_provider.hidden_model_tools:
+                policy = ToolsetRequest(
+                    enabled_toolsets=(),
+                    disabled_tools=tuple(sorted(self.knowledge_provider.hidden_model_tools)),
+                )
+                prepared = replace(prepared, context=prepared.context.with_tool_policy(policy))
             state.accept(prepared)
             if prepared.session_created is not None:
                 event = "session.created" if prepared.session_created else "session.loaded"
@@ -411,11 +424,42 @@ class TurnPhases:
             on_expected_error=self._expected_break,
         )
 
+    def _prepare_knowledge_phase(self) -> FunctionPhase:
+        def prepare(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
+            state.require_context("prepare_knowledge")
+            if type(self.knowledge_provider) is NoopKnowledgeProvider:
+                state.knowledge_context = KnowledgeContext()
+                return PhaseResult()
+            request = request_from_messages(
+                tuple(state.messages), session_id=state.session_id, turn_id=state.turn_id,
+                permissions=state.tool_permissions,
+                capabilities=frozenset(name for name in ("clarify", "approval")
+                                       if getattr(self.host_context.capabilities, name)),
+                history_max_chars=self.config.knowledge.history_max_chars,
+            )
+            knowledge = self.knowledge_provider.prepare(request, runtime)
+            runtime.check_active()
+            if not isinstance(knowledge, KnowledgeContext):
+                raise TypeError("KnowledgeProvider.prepare must return KnowledgeContext")
+            state.knowledge_context = knowledge
+            state.warnings.extend(knowledge.warnings)
+            return PhaseResult()
+
+        def validate(state: LoopState, result: PhaseResult) -> None:
+            if state.knowledge_context is None:
+                raise RuntimeError("knowledge preparation produced no context")
+
+        return FunctionPhase(
+            "prepare_knowledge", prepare, validate, expected_errors=_INTERRUPTION_ERRORS,
+            on_expected_error=self._expected_break,
+        )
+
     def _assemble_phase(self) -> FunctionPhase:
         def assemble(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
             context = state.require_context('assemble_request')
+            knowledge_block = render_knowledge(state.knowledge_context)
             state.request = CanonicalModelRequest.build(
-                system_prompt=context.prompt.text,
+                system_prompt="\n\n".join(filter(None, (context.prompt.text, knowledge_block))),
                 messages=tuple(state.messages),
                 tool_schema_bytes=context.tool_schema_bytes,
             )
@@ -658,9 +702,9 @@ class TurnPhases:
         operations = (
             (
                 "memory updater",
-                lambda: self.memory_updater.update(snapshot.copy()),
+                lambda: self.memory_updater.update(snapshot.copy()), # NoopMemoryUpdater 目前没有执行记忆更新
                 self.config.timeouts.memory_seconds,
-            ),
+            ), 
             (
                 "review scheduler",
                 lambda: self.review_scheduler.schedule(snapshot.copy()),

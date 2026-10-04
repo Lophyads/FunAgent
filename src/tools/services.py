@@ -71,7 +71,7 @@ class ToolServices:
     def _new_mcp(self):
         try:
             from .mcp_client import McpClient
-            import jsonschema  # Validate the complete optional extra before connecting.
+            importlib.import_module("jsonschema")  # Validate the complete extra before connecting.
         except ImportError:
             raise RuntimeError("MCP requires the optional extra: uv sync --extra mcp") from None
         return McpClient(self.config.tools.mcp_servers, workspace=self.config.workspace)

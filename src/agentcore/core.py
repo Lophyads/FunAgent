@@ -12,6 +12,8 @@ from contextvars import copy_context
 from functools import partial
 from typing import Any, Callable, Sequence, TypeVar
 
+from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider, RetrievalKnowledgeProvider
+
 from .conversation_loop import ConversationLoop
 from .turn_persistence import TurnPersistence
 from .turn_preparation import prepare_stored_turn
@@ -87,6 +89,7 @@ class AgentCore:
         lease_store: TurnLeaseStore | None = None,
         delivery_destination: str | None = None,
         max_recovery_attempts: int = 3,
+        knowledge_provider: KnowledgeProvider | None = None,
     ) -> None:
         if max_recovery_attempts < 1:
             raise ValueError("max_recovery_attempts must be positive")
@@ -109,6 +112,9 @@ class AgentCore:
         self._memory_updater = memory_updater or NoopMemoryUpdater()
         self._guard = guard or AllowAllGuard()
         self._review_scheduler = review_scheduler or NoopReviewScheduler()
+        self._knowledge_provider = (
+            knowledge_provider if knowledge_provider is not None else NoopKnowledgeProvider()
+        )
         self._store = store or SQLiteStore(
             config.database_path,
             tool_result_max_chars=config.tool_result_max_chars,
@@ -116,6 +122,12 @@ class AgentCore:
         self._lease_store = lease_store or SQLiteTurnLeaseStore(self._store)
         self._validate_sync_extensions()
         self._validate_provider_routes()
+        if knowledge_provider is None and config.knowledge.enabled:
+            try:
+                self._knowledge_provider = self._build_knowledge_provider()
+            except BaseException:
+                self._provider_resolver.close()
+                raise
         self._initialize_workers(observers, event_sinks)
         self._lifecycle_lock = threading.RLock()
         self._started = False
@@ -198,6 +210,9 @@ class AgentCore:
         )
 
     def _validate_sync_extensions(self) -> None:
+        hidden = self._knowledge_provider.hidden_model_tools
+        if not isinstance(hidden, frozenset) or any(not isinstance(name, str) for name in hidden):
+            raise TypeError("KnowledgeProvider.hidden_model_tools must be a frozenset of names")
         targets: list[tuple[Any, str, str]] = [
             (self._prompt_builder, "build", "SystemPromptBuilder"),
             (self._toolset_resolver, "resolve", "ToolsetResolver"),
@@ -205,6 +220,7 @@ class AgentCore:
             (self._memory_updater, "update", "MemoryUpdater"),
             (self._guard, "check", "ToolGuard"),
             (self._review_scheduler, "schedule", "ReviewScheduler"),
+            (self._knowledge_provider, "prepare", "KnowledgeProvider"),
             (self._provider_resolver, "resolve", "ProviderResolver"),
             (self._provider_resolver, "close", "ProviderResolver"),
             (self._lease_store, "acquire", "TurnLeaseStore"),
@@ -244,6 +260,30 @@ class AgentCore:
         except BaseException:
             self._provider_resolver.close()
             raise
+
+    def _build_knowledge_provider(self) -> KnowledgeProvider:
+        from knowledge.mcp import McpKnowledgeRetriever
+        from knowledge.planner import RetrievalPlanner
+
+        config = self._config.knowledge
+        if config.mcp is None or not config.source_description.strip():
+            raise ValueError("enabled knowledge requires mcp binding and nonblank source_description")
+        route = config.planner or self._config.routes[0]
+        adapter = self._api_modes.get(route.api_mode)
+        binding = self._provider_resolver.resolve(route)
+        if route.api_mode not in binding.capabilities:
+            raise ValueError("knowledge planner runtime does not support its API mode")
+        for target, method in ((binding.transport, "send"), (binding.transport, "close")):
+            if not callable(getattr(target, method, None)) or _is_async_callable(getattr(target, method)):
+                raise TypeError(f"knowledge planner Transport.{method} must be synchronous and callable")
+        retriever = McpKnowledgeRetriever(
+            config=config.mcp, registry=self._tool_registry,
+            services=self._tool_services, guard=self._guard,
+        )
+        return RetrievalKnowledgeProvider(
+            planner=RetrievalPlanner(route=route, runtime=binding, adapter=adapter, config=config),
+            retriever=retriever, config=config, hidden_model_tools=retriever.hidden_model_tools,
+        )
 
     def __enter__(self) -> "AgentCore":
         self.start_blocking()
@@ -462,6 +502,7 @@ class AgentCore:
             guard=self._guard, host_context=host_context,
             memory_updater=self._memory_updater,
             review_scheduler=self._review_scheduler,
+            knowledge_provider=self._knowledge_provider,
             observability=self._observability,
             call_operation=self.call_operation,
         ).run()
@@ -469,11 +510,20 @@ class AgentCore:
     def call_operation(
         self, function: Callable[[], T], *, timeout: float,
         cancel_event: threading.Event | None, deadline: float | None,
+        check_active: Callable[[], None] | None = None,
     ) -> T:
+        if check_active is not None:
+            check_active()
         context = copy_context()
         future = self._operation_pool.submit(lambda: context.run(function))
         started = time.monotonic()
         while True:
+            if check_active is not None:
+                try:
+                    check_active()
+                except BaseException:
+                    future.cancel()
+                    raise
             if cancel_event is not None and cancel_event.is_set():
                 future.cancel()
                 raise TurnCancelled("turn was cancelled")
@@ -490,12 +540,16 @@ class AgentCore:
             try:
                 result = future.result(timeout=min(0.05, remaining))
             except FutureTimeoutError:
-                continue
+                if not future.done():
+                    continue
+                result = future.result()
             if inspect.isawaitable(result):
                 close = getattr(result, "close", None)
                 if close is not None:
                     close()
                 raise TypeError("synchronous extension returned an awaitable")
+            if check_active is not None:
+                check_active()
             return result
 
 

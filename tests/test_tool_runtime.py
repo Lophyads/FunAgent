@@ -404,7 +404,6 @@ def test_attached_recovery_does_not_touch_other_session_and_can_ask(config_facto
     config = config_factory()
     store = SQLiteStore(config.database_path)
     store.open()
-    defaults = config.session_defaults
     for sid in ("mine", "other"):
         lease = store.acquire_lease(session_id=sid, owner_id="dead", turn_id=sid, ttl_seconds=60)
         store.create_session(

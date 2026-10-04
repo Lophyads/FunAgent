@@ -1,7 +1,8 @@
 // Presentation derived from the shared SSE snapshot; no synthetic progress.
 export const isTerminal = status => ['completed', 'failed', 'interrupted'].includes(status);
 export const phaseLabels = {
-  acquire_execution:'接入与排队', prepare_conversation:'加载会话上下文', assemble_request:'组装模型请求',
+  acquire_execution:'接入与排队', prepare_conversation:'加载会话上下文', prepare_knowledge:'准备知识资料',
+  assemble_request:'组装模型请求',
   provider_attempts:'模型推理', tool_round:'执行工具', finish_text:'保存最终回复',
   repair_unresolved_tools:'整理工具结果', finalize_turn:'提交轮次结果', record_recovery_failure:'记录恢复状态',
   end_turn:'结束轮次', release_execution:'释放执行权', handle_turn_error:'处理异常',
@@ -13,7 +14,7 @@ export const stateLabels = {idle:'等待执行', active:'执行中', done:'已�
   accepted:'已采纳', discarded:'已丢弃', started:'等待输出', delta:'流式输出',
   succeeded:'成功', running:'执行中', pending:'待执行', denied:'已拒绝', not_executed:'未执行'};
 export const phaseNode = phase => ({acquire_execution:'gateway', prepare_conversation:'context',
-  assemble_request:'context', provider_attempts:'model', tool_round:'tools'}[phase] || 'reply');
+  prepare_knowledge:'context', assemble_request:'context', provider_attempts:'model', tool_round:'tools'}[phase] || 'reply');
 export function duration(seconds) {
   if (!Number.isFinite(seconds)) return '—';
   if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
@@ -46,6 +47,9 @@ export function eventInfo(event) {
     'provider.attempt_started':'请求供应商', 'provider.attempt_failed':'供应商请求失败',
     'provider.response':'收到供应商响应', 'provider.retry_scheduled':'准备重试',
     'provider.fallback':'切换模型路由', 'provider.ambiguous_failure':'供应商结果未确认',
+    'knowledge.prepare_started':'开始准备知识资料', 'knowledge.prepare_completed':'完成知识资料准备',
+    'knowledge.plan_completed':'完成知识检索规划', 'knowledge.planner_fallback':'规划失败，使用原问题检索',
+    'knowledge.query_completed':'完成知识查询', 'knowledge.snippet_only':'知识资料仅含摘要',
     'recovery.started':'开始恢复轮次', 'recovery.completed':'恢复完成', 'recovery.failed':'恢复失败',
     'recovery.incomplete_turn_found':'发现未完成轮次', 'recovery.tool_pair_repaired':'补齐工具结果',
     'recovery.history_repaired':'修复会话历史'}[kind] || kind);
@@ -55,9 +59,9 @@ export function eventInfo(event) {
     if (p.phase === 'tool_round') category = 'tool';
   } else if (kind.startsWith('tool.')) title = `${p.tool_name || '工具'} · ${stateLabels[kind.split('.')[1]] || kind.split('.')[1]}`;
   const detail = [p.iteration > 0 ? `迭代 ${p.iteration}` : '', p.route, p.error_type].filter(Boolean).join(' · ');
-  const tone = /(?:failed|discarded|denied)$/.test(kind) ? 'failed'
+  const tone = p.status === 'failed' || /(?:failed|discarded|denied)$/.test(kind) ? 'failed'
     : kind === 'turn.finished' ? (p.status === 'completed' ? 'done' : p.status)
-    : kind === 'interaction.pending' ? 'waiting' : /(?:finished|accepted|succeeded|resolved)$/.test(kind) ? 'done' : category;
+    : kind === 'interaction.pending' ? 'waiting' : /(?:completed|finished|accepted|succeeded|resolved)$/.test(kind) ? 'done' : category;
   return {title, detail, category, tone};
 }
 export function buildOverview(turn, connection = 'connected', now = Date.now() / 1000) {
