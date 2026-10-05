@@ -10,7 +10,8 @@ import pytest
 
 from agentcore.interfaces import ModelOutputEvent
 from agentcore.observability import EventEnvelope
-from file_memory.store import FileMemoryStore, MemoryOperation, MemoryVersionConflict
+from memory.sqlite import SqliteMemoryStore
+from memory.store import MemoryDraft, MemoryPatch, MemoryVersionConflict
 from gateway.web import WebHost, WebServer
 from gateway.web.events import WebEventHub
 from gateway.web.read_model import WebError, sanitized
@@ -27,7 +28,7 @@ def web_factory(config_factory, tmp_path, final_response):
         config = config or config_factory()
         transport = transport or ScriptedTransport(*(responses or (final_response,)))
         resolver, modes, _ = scripted_provider_stack(config, {"primary": transport})
-        host = WebHost(config, memory=FileMemoryStore(tmp_path / "memories"),
+        host = WebHost(config, memory=SqliteMemoryStore(tmp_path / "memories" / "memory.db"),
                        provider_resolver=resolver, api_modes=modes)
         hosts.append(host)
         host.start()
@@ -36,6 +37,7 @@ def web_factory(config_factory, tmp_path, final_response):
     for host in hosts:
         assert host.close(3).completed
         host.events.close()
+        host.memory.close()
 
 
 def wait_for(predicate, timeout=3):
@@ -118,21 +120,29 @@ def test_clarification_answers_bypass_fifo_and_bind_session(web_factory, final_r
     assert not host.interactions()["interactions"]
 
 
-def test_memory_cas_exact_match_and_capacity(web_factory):
+def test_memory_record_cas_search_and_paging(web_factory):
     host, _ = web_factory()
-    host.memory.apply(MemoryOperation("add", "memory", "alpha"))
-    host.memory.apply(MemoryOperation("add", "memory", "alpha beta"))
-    version = host.memory_document("memory")["version"]
-    host.edit_memory("memory", {"action":"replace", "old_text":"alpha", "content":"gamma", "expected_version":version})
-    assert host.memory.read("memory").entries == ("gamma", "alpha beta")
+    entry = host.memory.add(MemoryDraft("note", "alpha")).entry
+    host.memory.add(MemoryDraft("note", "alpha beta"))
+    host.edit_memory("note", {"action":"replace", "id":entry.id, "content":"gamma", "expected_version":entry.version})
+    assert {row["content"] for row in host.memory_records("note")["entries"]} == {"gamma", "alpha beta"}
     with pytest.raises(WebError) as exc:
-        host.edit_memory("memory", {"action":"add", "content":"stale", "expected_version":version})
+        host.edit_memory("note", {"action":"replace", "id":entry.id, "content":"stale", "expected_version":entry.version})
     assert exc.value.status == 409
-    other = FileMemoryStore(host.memory.directory)
-    version = other.read("memory").version
-    host.memory.apply(MemoryOperation("add", "memory", "external"))
-    with pytest.raises(MemoryVersionConflict):
-        other.apply(MemoryOperation("add", "memory", "lost update"), expected_version=version)
+    assert host.memory_records("note", {"q":"gamma"})["entries"][0]["id"] == entry.id
+    first = host.memory_records("note", {"limit":"1"})
+    assert len(first["entries"]) == 1 and first["next_cursor"]
+    assert len(host.memory_records("note", {"limit":"1", "cursor":first["next_cursor"]})["entries"]) == 1
+    with pytest.raises(WebError) as exc:
+        host.edit_memory("note", {"action":"remove", "id":entry.id, "expected_version":"2"})
+    assert exc.value.status == 422
+    other = SqliteMemoryStore(host.memory.path)
+    try:
+        host.edit_memory("note", {"action":"replace", "id":entry.id, "content":"external", "expected_version":2})
+        with pytest.raises(MemoryVersionConflict):
+            other.update(entry.id, MemoryPatch("lost update"), expected_version=2)
+    finally:
+        other.close()
 
 
 def test_readonly_data_schema_filter_preview_and_config_secrecy(web_factory):
@@ -248,11 +258,11 @@ def test_web_cli_cleans_started_resources_on_interrupt_or_bind_error(config_fact
     from types import SimpleNamespace
     from agentcore import cli
     import gateway.web as web
-    from file_memory.feature import FileMemoryConfig
+    from memory.feature import MemoryConfig
     from tools.lifecycle import CleanupReport
     config=config_factory();calls=[];budgets=[]
     monkeypatch.setattr(cli,"load_config",lambda path:config)
-    monkeypatch.setattr(cli,"load_file_memory_config",lambda path:FileMemoryConfig())
+    monkeypatch.setattr(cli,"load_memory_config",lambda path:MemoryConfig(enabled=False))
     monkeypatch.setattr(cli,"configure_logging",lambda cfg:SimpleNamespace(close=lambda timeout:calls.append("logging")))
     original=cli.shutdown_tool_system
     def close_tools(timeout):

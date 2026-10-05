@@ -55,7 +55,7 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 
 ```toml
 [session]
-enabled_toolsets = ["default"]
+enabled_toolsets = ["default", "memory"]
 enabled_tools = ["write_file"]
 disabled_tools = ["calculator"]
 permissions = ["file.write"]
@@ -111,7 +111,7 @@ SSE 断线重连会重放事件或用运行快照校准；服务重启后从数�
 提交去重仅覆盖当前进程的活跃与最近 200 个完成轮次；服务重启后先核对历史再重发。
 自定义 Transport 没有 stream() 时继续使用 send()，CLI 默认行为保持不变。
 
-启用记忆需要 `[file_memory] enabled = true`；网页、工具和后台复盘共享 FileMemoryStore。
+记忆默认开启，使用本地 SQLite；网页、工具和后台复盘共享统一 MemoryStore。
 文件更新影响新会话，已有会话继续使用保存的提示词快照。模型正文属于当前用户，
 诊断事件仍经过 ObservabilityHub 脱敏，配置视图不返回密钥及 env / headers 值。
 
@@ -225,17 +225,36 @@ uv run --extra mcp agentcore chat --config agentcore.toml
 检索依赖 RAG 现有 embedding 配置；本机指向 `http://127.0.0.1:1234/v1`，
 运行检索前需保持该模型服务可用。
 
-## 文件记忆
+## 数据库记忆
 
-示例配置启用 `[file_memory]` 与 `memory` toolset。配置文件旁的
-`memories/MEMORY.md` 和 `memories/USER.md` 保存长期笔记与稳定用户事实；
-不适合直接作为指令。`memory` 工具支持 `list/add/replace/remove`，其中
-`replace/remove` 走现有人工审批。新会话读取文件并冻结提示词，当前会话写入后仍
-使用原提示词。每 `review_every_turns` 个完成的普通用户轮次会排入后台复盘；设为
-`0` 可关闭。后台复盘仅可 `list/add`，且不写入主会话历史。进程退出时尚未完成的
-复盘不会补跑。旧版按子目录保存的记忆不会自动合并；升级前如已写入记忆，
-请先将需要保留的条目整理到记忆目录下的两个文件中。直接嵌入 `AgentCore` 时可使用 `file_memory.FileMemoryFeature`
-安装工具并传入 `prompt_builder`、`review_scheduler`，在关闭 Agent 后关闭 Feature。
+CLI/Web 默认启用本地 SQLite，存放于配置文件旁的 `memories/memory.db`；
+无需云服务或 embedding。`[memory] enabled = false` 可关闭记忆，
+`review_every_turns = 0` 仅关闭后台复盘。默认 toolset 包含 `memory`；
+自定义 `enabled_toolsets` 时也需包含它。数据库是唯一记忆来源：`user` 保存稳定用户事实，
+`note` 保存长期笔记，`episode` 保存历史事件。原始对话仍由会话数据库保存。
+
+`memory` 工具支持 `list/search/add/replace/remove`，返回字符串 ID 和整数版本。
+`replace/remove` 按记录版本检查冲突并走现有人工审批。关键词检索使用 FTS5/BM25，
+中文等 CJK 词补充子串匹配；这是关键词检索。新会话在 `memory_max_chars` 预算内
+加载 `user/note` 并冻结提示词；历史事件和最新记录通过工具查询。
+
+每 10 个成功完成的普通用户轮次排入独立后台复盘，可用 `review_every_turns` 调整。
+复盘只处理尚未完成复盘的区间，允许 `list/search/add`，不改写主会话历史、不调用知识检索。
+进度持久化，失败或取消不推进；队列仍在进程内，退出时未完成的任务会在后续触发时处理，
+不会在启动时自动补跑。复盘逐条写入，不承诺整个批次原子提交。
+
+文件模式已移除。旧 `[file_memory]` 配置会提示迁移；先显式导入旧目录的 § 分隔条目，
+再将配置替换为示例中的 `[memory]` 和 `[memory.sqlite]`。导入保留原文件，重复执行会去重。
+`USER.md/MEMORY.md` 只能显式导出为阅读快照，修改导出文件不会更新数据库。
+
+```powershell
+uv run agentcore memory import-legacy --config agentcore.toml --directory memories
+uv run agentcore memory export --config agentcore.toml --directory memory-export
+```
+
+导出拒绝覆盖已有文件。嵌入 `AgentCore` 时使用 `memory.MemoryFeature` 安装工具，
+传入其 `prompt_builder`、`review_scheduler`，在关闭 Agent 后关闭 Feature；
+Feature 接受注入的 MemoryStore，未来后端只需实现统一协议和工厂分支。
 
 ## 诊断日志
 

@@ -4,15 +4,16 @@ from __future__ import annotations
 import threading
 from collections import deque
 from concurrent.futures import CancelledError
-from dataclasses import asdict
+from pydantic import ValidationError
 
 from agentcore.workers import TurnQueueFullError
-from file_memory.store import MemoryError, MemoryOperation, MemoryVersionConflict
+from memory.store import KINDS, MemoryBackendError, MemoryError, MemoryVersionConflict
+from memory.tool import MemoryArgs, execute_memory
 from gateway.gateway import GatewayRuntime
 from tools.runtime import get_tool_registry, get_tool_services
 
 from .events import WebEventHub, WebInteractionPort, WebLifecycleSink
-from .read_model import ReadModel, WebError
+from .read_model import ReadModel, WebError, integer
 
 
 def required_text(body, key, *, max_length=65536):
@@ -127,33 +128,47 @@ class WebHost:
         self.events.publish("interaction.resolved", sid, request.turn_id, {"request_id": request_id})
         return self.interactions(sid)
 
-    def memory_document(self, target):
-        if target not in {"memory", "user"}:
-            raise WebError(404, "not_found", "unknown memory document")
+    def _memory_available(self, kind):
+        if kind not in KINDS:
+            raise WebError(404, "not_found", "unknown memory kind")
         if self.memory is None:
-            raise WebError(409, "memory_disabled", "enable [file_memory] and restart")
+            raise WebError(409, "memory_disabled", "enable [memory] and restart")
+
+    def _memory_call(self, args):
         try:
-            return {**asdict(self.memory.read(target)), "limit": self.memory.limits[target]}
+            result = execute_memory(self.memory, args, {"type": "web"})
+            if result.get("reason") == "missing":
+                raise WebError(404, "not_found", "memory entry no longer exists")
+            return result
+        except MemoryVersionConflict as exc:
+            raise WebError(409, "memory_conflict", str(exc)) from None
+        except MemoryBackendError as exc:
+            raise WebError(503, "memory_unavailable", str(exc)) from None
         except MemoryError as exc:
             raise WebError(422, "memory_invalid", str(exc)) from None
 
-    def edit_memory(self, target, body):
-        self.memory_document(target)
-        version = required_text(body, "expected_version", max_length=64)
-        action = body.get("action")
-        if action not in {"add", "replace", "remove"}:
-            raise WebError(422, "invalid_input", "invalid memory action")
-        for key in ("content", "old_text"):
-            if not isinstance(body.get(key, ""), str):
-                raise WebError(422, "invalid_input", f"{key} must be text")
+    def memory_records(self, kind, query=None):
+        self._memory_available(kind)
+        query = query or {}
+        if set(query) - {"q", "limit", "cursor"}:
+            raise WebError(422, "invalid_input", "unknown memory query option")
+        limit = integer(query.get("limit", 50), "limit", 1, 200)
         try:
-            self.memory.apply(MemoryOperation(action, target, body.get("content", ""), body.get("old_text", "")),
-                              expected_version=version, exact_match=True)
-        except MemoryVersionConflict as exc:
-            raise WebError(409, "memory_conflict", str(exc)) from None
-        except MemoryError as exc:
-            raise WebError(422, "memory_invalid", str(exc)) from None
-        return self.memory_document(target)
+            args = MemoryArgs(action="search" if query.get("q", "").strip() else "list", kind=kind,
+                              query=query.get("q", ""), cursor=query.get("cursor"), limit=limit)
+        except ValidationError:
+            raise WebError(422, "invalid_input", "invalid memory query") from None
+        return {"kind": kind, **self._memory_call(args)}
+
+    def edit_memory(self, kind, body):
+        self._memory_available(kind)
+        if body.get("action") not in {"add", "replace", "remove"} or ("kind" in body and body["kind"] != kind):
+            raise WebError(422, "invalid_input", "invalid memory action or kind")
+        try:
+            args = MemoryArgs.model_validate({**body, "kind": kind})
+        except ValidationError:
+            raise WebError(422, "invalid_input", "invalid memory edit; replace/remove require id and integer expected_version") from None
+        return self._memory_call(args)
 
     def status(self):
         return {"version": "0.1.0", "epoch": self.events.epoch, "accepting": self.accepting,

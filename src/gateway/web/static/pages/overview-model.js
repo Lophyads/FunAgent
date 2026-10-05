@@ -8,7 +8,7 @@ export const phaseLabels = {
   end_turn:'结束轮次', release_execution:'释放执行权', handle_turn_error:'处理异常',
 };
 export const nodeLabels = {gateway:'Gateway', context:'会话上下文', model:'模型推理', tools:'工具执行',
-  reply:'最终回复', human:'人工交互', memory:'文件记忆', storage:'SQLite', hub:'WebEventHub', browser:'Web 前端'};
+  reply:'最终回复', human:'人工交互', memory:'数据库记忆', storage:'SQLite', hub:'WebEventHub', browser:'Web 前端'};
 export const stateLabels = {idle:'等待执行', active:'执行中', done:'已完成', waiting:'等待答复',
   failed:'失败', interrupted:'已中断', queued:'排队中', unknown:'状态未确认', support:'按需使用',
   accepted:'已采纳', discarded:'已丢弃', started:'等待输出', delta:'流式输出',

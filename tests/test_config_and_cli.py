@@ -55,7 +55,7 @@ def test_individual_tool_policy_loads_from_session_config(tmp_path):
 
     config = load_config(path)
     request = SessionBuildRequest.from_defaults(config.session_defaults)
-    assert request.enabled_toolsets == ("default",)
+    assert request.enabled_toolsets == ("default", "memory")
     assert request.enabled_tools == ("write_file",)
     assert request.disabled_tools == ("calculator",)
     assert request.permissions == frozenset({"file.write"})

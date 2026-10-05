@@ -129,7 +129,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 elif path == ["api", "interactions"]:
                     value = host.interactions(query.get("session_id"))
                 elif len(path) == 3 and path[1] == "memory":
-                    value = host.memory_document(path[2])
+                    value = host.memory_records(path[2], query)
                 elif path == ["api", "data", "schema"]:
                     value = host.read.schema()
                 elif len(path) in {4, 5} and path[1:3] == ["data", "tables"] and (len(path) == 4 or path[4] == "row"):

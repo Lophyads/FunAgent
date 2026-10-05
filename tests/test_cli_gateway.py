@@ -98,6 +98,10 @@ def test_real_cli_clarification_and_denied_approval_stay_in_one_turn(
 
     monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(cli, "GatewayRuntime", lambda *args, **kwargs: host)
+    from memory.feature import MemoryConfig, SqliteConfig
+    monkeypatch.setattr(cli, "load_memory_config", lambda path: MemoryConfig(
+        review_every_turns=0, sqlite=SqliteConfig(config.database_path.parent / "memory.db"),
+    ))
     monkeypatch.setattr(cli, "configure_logging", lambda config: SimpleNamespace(
         close=lambda **kwargs: CleanupReport(),
     ))
@@ -503,15 +507,15 @@ def test_cli_cleanup_preserves_business_error_and_attempts_all_steps(monkeypatch
         def install_tool(self, registry):
             calls.append("install_memory")
         def close(self, *, timeout):
-            calls.append("file_memory")
+            calls.append("memory")
             budgets.append(timeout)
             return True
 
     monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(cli.ToolSystemConfig, "from_agent_config", lambda config: object())
     monkeypatch.setattr(cli, "initialize_tool_system", lambda config: calls.append("initialize"))
-    monkeypatch.setattr(cli, "load_file_memory_config", lambda path: object())
-    monkeypatch.setattr(cli, "FileMemoryFeature", Feature)
+    monkeypatch.setattr(cli, "load_memory_config", lambda path: object())
+    monkeypatch.setattr(cli, "MemoryFeature", Feature)
     monkeypatch.setattr(cli, "get_tool_registry", lambda: object())
     monkeypatch.setattr(cli, "configure_logging", lambda config: SimpleNamespace(close=close_logging))
     monkeypatch.setattr(cli, "GatewayRuntime", lambda *args, **kwargs: Host())
@@ -519,7 +523,7 @@ def test_cli_cleanup_preserves_business_error_and_attempts_all_steps(monkeypatch
     monkeypatch.setattr(cli, "_chat_loop", run)
     with pytest.raises(ValueError, match="original business failure"):
         cli._chat(SimpleNamespace(config="unused.toml", session="sid"))
-    assert calls == ["initialize", "install_memory", "start", "gateway", "file_memory", "tools", "logging"]
+    assert calls == ["initialize", "install_memory", "start", "gateway", "memory", "tools", "logging"]
     assert 5 >= budgets[0] >= budgets[1] >= budgets[2] >= budgets[3] >= 0
     output = capsys.readouterr()
     assert "gateway cleanup failed" in output.err and "tools cleanup failed" in output.err

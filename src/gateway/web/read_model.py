@@ -41,6 +41,8 @@ def sanitized(value, key=""):
         return {k: sanitized(v, k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [sanitized(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, str) and (name.endswith("url") or name == "endpoint"):
         parsed = urlsplit(value)
         host = parsed.hostname or ""
@@ -212,7 +214,6 @@ class ReadModel:
             result = sanitized(self.config.model_dump(mode="json"))
             if self.memory_settings is not None:
                 from dataclasses import asdict
-                result["file_memory"] = {k: str(v) if isinstance(v, Path) else v
-                                         for k, v in asdict(self.memory_settings).items()}
+                result["memory"] = sanitized(asdict(self.memory_settings))
             return result
         raise WebError(404, "not_found", "unknown resource")

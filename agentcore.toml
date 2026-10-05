@@ -65,9 +65,10 @@ PYTHONIOENCODING = "utf-8"
 [logging]
 level = "DEBUG"
 
-[file_memory]
+[memory]
 enabled = true
-directory = "memories"
-memory_char_limit = 2200
-user_char_limit = 1375
+backend = "sqlite"
 review_every_turns = 10
+
+[memory.sqlite]
+path = "memories/memory.db"

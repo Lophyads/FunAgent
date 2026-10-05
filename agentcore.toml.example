@@ -110,13 +110,14 @@ permissions = []
 default_cwd = "."
 allowed_root = "."
 
-# Optional durable memory. Relative directory is resolved beside this file.
-[file_memory]
+# Durable memory is enabled by default. Paths are relative to this file.
+[memory]
 enabled = true
-directory = "memories"
-memory_char_limit = 2200
-user_char_limit = 1375
+backend = "sqlite"
 review_every_turns = 10  # 0 disables background review
+
+[memory.sqlite]
+path = "memories/memory.db"
 
 # Prepare knowledge before the main model. Enable the rag MCP server above first.
 # Omitting [knowledge.planner] reuses routes[0] with a separate planning prompt.

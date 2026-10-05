@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from gateway import GatewayRuntime
-from file_memory import FileMemoryFeature, load_file_memory_config
+from memory import MemoryFeature, create_store, load_memory_config
 from log.logging_system import configure_logging
 from tools.config import ToolSystemConfig
 from tools.lifecycle import SessionResourcesBusyError, remaining
@@ -44,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
     web = subparsers.add_parser("web", help="local Web UI through an in-process Gateway")
     web.add_argument("--config", type=Path, default=Path("agentcore.toml"))
     web.add_argument("--port", type=int, default=7777)
+    memory = subparsers.add_parser("memory", help="import legacy memory or export database views")
+    memory_commands = memory.add_subparsers(dest="action", required=True)
+    for action in ("import-legacy", "export"):
+        command = memory_commands.add_parser(action)
+        command.add_argument("--config", type=Path, default=Path("agentcore.toml"))
+        command.add_argument("--directory", type=Path, required=True)
     return parser
 
 
@@ -101,7 +107,7 @@ def _chat(args) -> int:
     try:
         initialize_tool_system(ToolSystemConfig.from_agent_config(config))
         initialized = True
-        feature = FileMemoryFeature(load_file_memory_config(args.config), config)
+        feature = MemoryFeature(load_memory_config(args.config), config)
         feature.install_tool(get_tool_registry())
         gateway = GatewayRuntime(
             config, interaction_mode="poll", recovery_policy="attached",
@@ -115,7 +121,7 @@ def _chat(args) -> int:
         deadline = time.monotonic() + config.timeouts.finalize_seconds
         if gateway is not None:
             _cleanup_step("gateway", gateway.close_blocking, deadline)
-        memory_stopped = feature is None or _cleanup_step("file memory", feature.close, deadline)
+        memory_stopped = feature is None or _cleanup_step("memory", feature.close, deadline)
         if initialized and memory_stopped:
             _cleanup_step("tools", shutdown_tool_system, deadline)
         _cleanup_step("logging", logging_handle.close, deadline)
@@ -180,7 +186,7 @@ def _web(args) -> int:
     try:
         initialize_tool_system(ToolSystemConfig.from_agent_config(config))
         initialized = True
-        feature = FileMemoryFeature(load_file_memory_config(args.config), config)
+        feature = MemoryFeature(load_memory_config(args.config), config)
         feature.install_tool(get_tool_registry())
         host = WebHost(config, memory=feature.store, memory_settings=feature.settings,
             **({"prompt_builder": feature.prompt_builder, "review_scheduler": feature.review_scheduler}
@@ -201,7 +207,7 @@ def _web(args) -> int:
         # serve_forever has returned here; shutdown() from its own thread would deadlock.
         if host is not None:
             _cleanup_step("gateway", host.close, deadline)
-        memory_stopped = feature is None or _cleanup_step("file memory", feature.close, deadline)
+        memory_stopped = feature is None or _cleanup_step("memory", feature.close, deadline)
         if initialized and memory_stopped:
             _cleanup_step("tools", shutdown_tool_system, deadline)
         if host is not None:
@@ -292,6 +298,18 @@ def _diagnose_tools(config_path: Path) -> int:
     return 0
 
 
+def _memory(args) -> int:
+    from memory.prompt import export_markdown, import_legacy
+    settings = load_memory_config(args.config, allow_legacy=args.action == "import-legacy")
+    store = create_store(settings)
+    try:
+        operation = import_legacy if args.action == "import-legacy" else export_markdown
+        print(json.dumps(operation(store, args.directory), ensure_ascii=False))
+        return 0
+    finally:
+        store.close()
+
+
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -303,6 +321,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             return _show_logs(args)
         if args.command == "tools":
             return _diagnose_tools(args.config)
+        if args.command == "memory":
+            return _memory(args)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

@@ -27,7 +27,7 @@ class RecoverySessionMissing(SessionContextError):
 
 @dataclass(frozen=True, slots=True)
 class SessionBuildRequest:
-    enabled_toolsets: tuple[str, ...] = ("default",)
+    enabled_toolsets: tuple[str, ...] = ("default", "memory")
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
     workspace: Path | None = None

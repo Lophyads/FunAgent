@@ -90,7 +90,7 @@ class ModelRoute(FrozenStrictModel):
 
 
 class SessionDefaults(FrozenStrictModel):
-    enabled_toolsets: tuple[str, ...] = ("default",)
+    enabled_toolsets: tuple[str, ...] = ("default", "memory")
     disabled_toolsets: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset()
     enabled_tools: tuple[str, ...] = ()
