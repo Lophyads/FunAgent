@@ -21,6 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+supabase = ["supabase>=2.32,<3"]
 mcp = [
   "mcp>=2.2,<3",
   "httpx2>=2.7,<3",

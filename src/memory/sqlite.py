@@ -2,22 +2,20 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import math
 import re
 import sqlite3
 import time
-import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .store import (
     KINDS, UNSET, MemoryBackendError, MemoryDraft, MemoryEntry, MemoryError, MemoryPage,
     MemoryPatch, MemoryQuery, MemorySearch, MemoryVersionConflict, MemoryWriteResult,
+    memory_key as _key, normalized as _normalized, validate_text as _text, validate_draft, validate_query, validate_version,
 )
 
 SCHEMA_VERSION = 1
@@ -68,38 +66,12 @@ class ReviewState:
     reviewed_fingerprint: str = ""
 
 
-def _text(value: str, *, blank: bool = False, limit: int = 5000) -> str:
-    if not isinstance(value, str) or len(value) > limit or (not blank and not value.strip()):
-        raise MemoryError(f"text must be {'possibly blank' if blank else 'nonblank'} and at most {limit} characters")
-    return value.strip()
-
-
-def _event(value: str | None) -> str | None:
-    if value is not None:
-        try:
-            datetime.fromisoformat(value)
-        except (ValueError, TypeError):
-            raise MemoryError("event_at must be an ISO date or datetime") from None
-    return value
-
-
-def _normalized(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-
-def _key(draft: MemoryDraft) -> str:
-    parts = ["core", _normalized(draft.subject), _normalized(draft.content)]
-    if draft.kind == "episode":
-        origin = {k: draft.source[k] for k in ("session_id", "turn_id", "range_start", "range_end") if k in draft.source}
-        parts = ["episode", _normalized(draft.subject), _normalized(draft.content), draft.event_at, origin or uuid.uuid4().hex]
-    return hashlib.sha256(json.dumps(parts, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-
-
 class SqliteMemoryStore:
     """Connections belong to individual calls, never to shared worker threads."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, review_scope: tuple[str, ...] = ()) -> None:
         self.path = Path(path).expanduser().absolute()
+        self._review_scope = review_scope
         self._closed = False
         if self.path.is_symlink() or self.path.parent.is_symlink():
             raise MemoryError("memory database must not be a symlink")
@@ -160,22 +132,11 @@ class SqliteMemoryStore:
 
     @staticmethod
     def _draft(draft: MemoryDraft) -> MemoryDraft:
-        if draft.kind not in KINDS:
-            raise MemoryError("unknown memory kind")
-        try:
-            source = json.loads(json.dumps(draft.source, ensure_ascii=False, allow_nan=False))
-        except (TypeError, ValueError):
-            raise MemoryError("source must be JSON data") from None
-        if not isinstance(source, dict):
-            raise MemoryError("source must be an object")
-        return MemoryDraft(draft.kind, _text(draft.content), _text(draft.subject, blank=True, limit=200), source, _event(draft.event_at))
+        return validate_draft(draft)
 
     @staticmethod
     def _filter(kind, limit):
-        if kind is not None and kind not in KINDS:
-            raise MemoryError("unknown memory kind")
-        if type(limit) is not int or not 1 <= limit <= 200:
-            raise MemoryError("limit must be an integer from 1 to 200")
+        validate_query(kind, limit)
 
     def add(self, draft: MemoryDraft) -> MemoryWriteResult:
         draft = self._draft(draft)
@@ -252,8 +213,7 @@ class SqliteMemoryStore:
 
     @staticmethod
     def _version(version):
-        if type(version) is not int or version < 1:
-            raise MemoryError("expected_version must be a positive integer")
+        validate_version(version)
 
     @staticmethod
     def _current(conn, entry_id, expected_version):
@@ -291,6 +251,7 @@ class SqliteMemoryStore:
             return MemoryWriteResult(True, self._entry(row))
 
     def observe_turn(self, session_id: str, turn_id: str, position: int) -> int | None:
+        session_id = self._review_id(session_id)
         with self._connection(write=True) as conn:
             conn.execute("INSERT OR IGNORE INTO review_state(session_id,updated_at) VALUES(?,?)", (session_id, time.time()))
             row = conn.execute("SELECT * FROM review_state WHERE session_id=?", (session_id,)).fetchone()
@@ -302,15 +263,20 @@ class SqliteMemoryStore:
             return count
 
     def review_state(self, session_id: str) -> ReviewState:
+        session_id = self._review_id(session_id)
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM review_state WHERE session_id=?", (session_id,)).fetchone()
         return ReviewState(row["completed_count"], row["seen_position"], row["reviewed_position"], row["reviewed_fingerprint"]) if row else ReviewState()
 
     def mark_reviewed(self, session_id: str, position: int, fingerprint: str) -> None:
+        session_id = self._review_id(session_id)
         with self._connection(write=True) as conn:
             conn.execute("INSERT OR IGNORE INTO review_state(session_id,updated_at) VALUES(?,?)", (session_id, time.time()))
             conn.execute("UPDATE review_state SET reviewed_position=?,reviewed_fingerprint=?,updated_at=? WHERE session_id=? AND reviewed_position<=?",
                          (position, fingerprint, time.time(), session_id, position))
+
+    def _review_id(self, session_id: str) -> str:
+        return json.dumps([*self._review_scope, session_id], ensure_ascii=False) if self._review_scope else session_id
 
     def close(self) -> None:
         self._closed = True

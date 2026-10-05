@@ -73,7 +73,7 @@ def memory_entry(store: MemoryStore, *, review: bool = False, source_context: di
         tool_id="memory.memory", implementation_version="2", name="memory", toolset="memory",
         description=(
             "Manage durable database memory. kind: user for confirmed stable preferences/facts, note for project knowledge, episode for historical events. "
-            "List records or search using short keywords (not semantic search). Add only useful, nonduplicative facts; skip assistant guesses and conflicting current facts. "
+            "List records or search with concise keywords or a short description. Add only useful, nonduplicative facts; skip assistant guesses and conflicting current facts. "
             + ("Background review may only list/search/add." if review else
                "Explicit corrections use replace/remove with the original string id and expected_version. Latest tool records supersede older bootstrap versions.")
         ),

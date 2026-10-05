@@ -101,7 +101,7 @@ uv run agentcore web --config agentcore.toml --port 7777
 
 - ChatDock：新建/继续会话、真实流式文本、工具结果、澄清、审批和取消。
 - Overview：当前会话的轮次、阶段流程、模型尝试、工具状态、耗时、usage 和事件时间线。
-- Memory：MEMORY / USER 条目新增、替换和删除，保存时检查文件版本；冲突保留草稿。
+- Memory：user/note/episode 记录新增、替换和删除，保存时检查记录版本；冲突保留草稿。
 - Data：四张 SQLite 业务表的只读分页、筛选、排序、行详情和 JSON 展开。
 - 工具、连接、模型、配置：当前进程的脱敏只读视图，修改配置文件后重启生效。
 
@@ -234,7 +234,7 @@ CLI/Web 默认启用本地 SQLite，存放于配置文件旁的 `memories/memory
 `note` 保存长期笔记，`episode` 保存历史事件。原始对话仍由会话数据库保存。
 
 `memory` 工具支持 `list/search/add/replace/remove`，返回字符串 ID 和整数版本。
-`replace/remove` 按记录版本检查冲突并走现有人工审批。关键词检索使用 FTS5/BM25，
+`replace/remove` 按记录版本检查冲突并走现有人工审批。SQLite 关键词检索使用 FTS5/BM25，
 中文等 CJK 词补充子串匹配；这是关键词检索。新会话在 `memory_max_chars` 预算内
 加载 `user/note` 并冻结提示词；历史事件和最新记录通过工具查询。
 
@@ -255,6 +255,57 @@ uv run agentcore memory export --config agentcore.toml --directory memory-export
 导出拒绝覆盖已有文件。嵌入 `AgentCore` 时使用 `memory.MemoryFeature` 安装工具，
 传入其 `prompt_builder`、`review_scheduler`，在关闭 Agent 后关闭 Feature；
 Feature 接受注入的 MemoryStore，未来后端只需实现统一协议和工厂分支。
+
+### Supabase 与本地 embedding
+
+安装可选依赖 `uv sync --extra supabase`，在 Supabase SQL 编辑器显式执行
+[sql/supabase/001_memory.sql](sql/supabase/001_memory.sql)。首次部署前将脚本的
+`vector(1024)` 改成模型实际维度；配置的 `dimensions` 必须一致。SQL 不会自动迁移已有表。
+在配置文件旁的 `.env` 设置 `SUPABASE_SECRET_KEY`，然后选择后端：
+
+```toml
+[memory]
+backend = "supabase"
+review_every_turns = 10
+
+[memory.supabase]
+url = "https://YOUR_PROJECT.supabase.co"
+credential_ref = "env:SUPABASE_SECRET_KEY"
+namespace = "personal-agent"
+timeout_seconds = 20
+min_similarity = 0.3 # 示例阈值，按实际模型验证
+
+[memory.supabase.embedding]
+base_url = "http://127.0.0.1:1234/v1"
+model = "YOUR_LOCAL_EMBEDDING_MODEL"
+dimensions = 1024
+# credential_ref = "env:EMBEDDING_API_KEY" # 服务有鉴权时填写
+```
+
+用 `uv run --extra supabase agentcore web --config agentcore.toml` 启动；同时使用 MCP
+时追加 `--extra mcp`。LM Studio 与 Ollama 共用兼容的 embeddings 客户端，Ollama
+地址为 `http://127.0.0.1:11434/v1`；远程兼容服务同样设置 `base_url/model/credential_ref`。
+无需鉴权的服务可以省略 embedding 凭据，不要求 `OPENAI_API_KEY`。
+模型需要查询/文档前缀时，可设置 `query_prefix/document_prefix`，默认均为空。
+
+Supabase 保存提炼出的记忆正文和向量，使用语义检索；正文与向量同步提交，更新和删除
+继续检查记录版本。模型或前缀变化会拒绝混用向量，需要显式重建。服务端需保持同名
+模型权重一致，客户端不能检测权重被悄悄替换。云端故障不会转写到 SQLite。
+
+复盘仍使用现有后台队列，本地 `[memory.sqlite].path` 只更新复盘进度，不缓存云端记忆；
+原始会话仍保存在本地。切换 Supabase 项目或 namespace 后使用独立进度。旧 SQLite
+记忆保留，切换后端不会自动迁移或双写。维护命令同样操作选定的后端。
+
+SQL 仅授予 service_role 访问；服务密钥保存在 Python 宿主，浏览器使用现有本地 API。
+namespace 用于数据范围筛选，服务密钥拥有者可以访问所有范围；多用户部署需另配身份授权。
+
+离线验证新客户端：`uv run --extra dev --extra supabase pytest tests/test_supabase_memory.py`。
+实际 PostgreSQL/pgvector SQL 验证使用独立的测试运行时，无需 Supabase 账号：
+
+```powershell
+npm install --prefix .funagent/sql-test-runtime --no-audit --no-fund @electric-sql/pglite @electric-sql/pglite-pgvector
+node --test tests/supabase_sql.mjs
+```
 
 ## 诊断日志
 

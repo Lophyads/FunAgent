@@ -119,6 +119,24 @@ review_every_turns = 10  # 0 disables background review
 [memory.sqlite]
 path = "memories/memory.db"
 
+# Optional Supabase memory: set memory.backend = "supabase" and install the extra.
+# Deploy sql/supabase/001_memory.sql first; vector dimensions must match the model.
+# SQLite above continues to hold only local review progress when Supabase is selected.
+# [memory.supabase]
+# url = "https://YOUR_PROJECT.supabase.co"
+# credential_ref = "env:SUPABASE_SECRET_KEY"
+# namespace = "personal-agent"
+# timeout_seconds = 20
+# min_similarity = 0.3  # calibrate with the actual embedding model
+#
+# [memory.supabase.embedding]
+# base_url = "http://127.0.0.1:1234/v1"  # LM Studio; Ollama: http://127.0.0.1:11434/v1
+# model = "YOUR_LOCAL_EMBEDDING_MODEL"
+# dimensions = 1024
+# credential_ref = "env:EMBEDDING_API_KEY"  # omit for a service without authentication
+# query_prefix = ""      # optional, only if required by the model
+# document_prefix = ""
+
 # Prepare knowledge before the main model. Enable the rag MCP server above first.
 # Omitting [knowledge.planner] reuses routes[0] with a separate planning prompt.
 [knowledge]

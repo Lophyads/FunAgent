@@ -12,6 +12,7 @@ from agentcore.models import AgentConfig
 from agentcore.prompt_builder import StaticSystemPromptBuilder
 from tools.runtime import get_tool_services
 from .prompt import MemoryPromptBuilder
+from .embedding import EmbeddingConfig, http_url
 from .review import ReviewProgress
 from .store import MemoryError, MemoryStore
 from .tool import memory_entry
@@ -23,15 +24,41 @@ class SqliteConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SupabaseConfig:
+    url: str
+    credential_ref: str
+    embedding: EmbeddingConfig
+    namespace: str = "personal-agent"
+    timeout_seconds: float = 20
+    min_similarity: float = 0.3
+
+    def __post_init__(self):
+        object.__setattr__(self, "url", http_url(self.url))
+        if not isinstance(self.credential_ref, str) or not self.credential_ref.startswith("env:") or len(self.credential_ref) <= 4:
+            raise MemoryError("supabase credential_ref must be an env reference")
+        if not isinstance(self.namespace, str) or not self.namespace.strip() or len(self.namespace) > 200:
+            raise MemoryError("supabase namespace must be nonblank text of at most 200 characters")
+        if type(self.timeout_seconds) not in (int, float) or not 0 < self.timeout_seconds <= 600:
+            raise MemoryError("supabase timeout_seconds must be from 0 to 600")
+        if type(self.min_similarity) not in (int, float) or not -1 <= self.min_similarity <= 1:
+            raise MemoryError("supabase min_similarity must be from -1 to 1")
+        if not isinstance(self.embedding, EmbeddingConfig):
+            raise MemoryError("supabase requires embedding configuration")
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryConfig:
     enabled: bool = True
     backend: str = "sqlite"
     review_every_turns: int = 10
     sqlite: SqliteConfig = field(default_factory=SqliteConfig)
+    supabase: SupabaseConfig | None = None
 
     def __post_init__(self):
-        if type(self.enabled) is not bool or self.backend != "sqlite":
-            raise MemoryError("memory backend must be sqlite; unsupported backends never fall back")
+        if type(self.enabled) is not bool or not isinstance(self.backend, str) or self.backend not in {"sqlite", "supabase"}:
+            raise MemoryError("memory backend must be sqlite or supabase; unsupported backends never fall back")
+        if self.backend == "supabase" and not isinstance(self.supabase, SupabaseConfig):
+            raise MemoryError("supabase backend requires [memory.supabase]")
         if type(self.review_every_turns) is not int or self.review_every_turns < 0:
             raise MemoryError("review_every_turns must be a nonnegative integer")
 
@@ -43,9 +70,9 @@ def load_memory_config(path: Path | str, *, allow_legacy: bool = False) -> Memor
     if "file_memory" in raw and not allow_legacy:
         raise MemoryError("[file_memory] was removed: run 'agentcore memory import-legacy --directory <old-directory>' then replace it with [memory]")
     settings = raw.get("memory", {})
-    if not isinstance(settings, dict) or set(settings) - {"enabled", "backend", "review_every_turns", "sqlite"}:
+    if not isinstance(settings, dict) or set(settings) - {"enabled", "backend", "review_every_turns", "sqlite", "supabase"}:
         raise MemoryError("invalid [memory] configuration")
-    sqlite = settings.get("sqlite", {})
+    sqlite = settings.get("sqlite", {}) if settings.get("backend", "sqlite") == "sqlite" or settings.get("review_every_turns", 10) else {}
     if not isinstance(sqlite, dict) or set(sqlite) - {"path"}:
         raise MemoryError("invalid [memory.sqlite] configuration")
     db_path = sqlite.get("path", "memories/memory.db")
@@ -54,13 +81,29 @@ def load_memory_config(path: Path | str, *, allow_legacy: bool = False) -> Memor
     db_path = Path(db_path).expanduser()
     if not db_path.is_absolute():
         db_path = config_path.parent / db_path
-    return MemoryConfig(**{k: v for k, v in settings.items() if k != "sqlite"}, sqlite=SqliteConfig(db_path.absolute()))
+    supabase = None
+    if settings.get("backend") == "supabase":
+        try:
+            values = dict(settings["supabase"])
+            values["embedding"] = EmbeddingConfig(**values["embedding"])
+            supabase = SupabaseConfig(**values)
+        except (KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, MemoryError):
+                raise
+            raise MemoryError("invalid [memory.supabase] or embedding configuration") from None
+        from dotenv import load_dotenv
+        load_dotenv(config_path.with_name(".env"), override=False)
+    return MemoryConfig(**{k: v for k, v in settings.items() if k not in {"sqlite", "supabase"}},
+                        sqlite=SqliteConfig(db_path.absolute()), supabase=supabase)
 
 
 def create_store(settings: MemoryConfig) -> MemoryStore:
     if settings.backend == "sqlite":
         from .sqlite import SqliteMemoryStore
         return SqliteMemoryStore(settings.sqlite.path)
+    if settings.backend == "supabase":
+        from .supabase import SupabaseMemoryStore
+        return SupabaseMemoryStore(settings.supabase)
     raise MemoryError(f"unsupported memory backend: {settings.backend}")
 
 
@@ -74,11 +117,20 @@ class MemoryFeature:
         self._protected = ()
         self._installed = False
         self._closed = False
+        self._owned_progress = None
+        self._local_paths = [self.store.path] if self.store is not None and hasattr(self.store, "path") else []
         if self.store is not None and settings.review_every_turns:
             from .review import MemoryReviewRunner, MemoryReviewScheduler
             # SQLite implements local checkpoints; alternative stores can inject a separate checkpoint object.
-            progress = progress if progress is not None else self.store
             try:
+                if progress is None and settings.backend == "supabase":
+                    from .sqlite import SqliteMemoryStore
+                    target = settings.supabase
+                    progress = self._owned_progress = SqliteMemoryStore(settings.sqlite.path,
+                        review_scope=("supabase", target.url, target.namespace))
+                progress = progress if progress is not None else self.store
+                if hasattr(progress, "path"):
+                    self._local_paths.append(progress.path)
                 if not all(callable(getattr(progress, name, None)) for name in ("observe_turn", "review_state", "mark_reviewed")):
                     raise MemoryError("this memory backend requires a separate ReviewProgress adapter")
                 self.runner = MemoryReviewRunner(agent_config, self.store, progress)
@@ -88,6 +140,8 @@ class MemoryFeature:
                 if self.runner is not None:
                     self.runner.close(5)
                 self.store.close()
+                if self._owned_progress is not None:
+                    self._owned_progress.close()
                 raise
 
     def install_tool(self, registry):
@@ -96,7 +150,7 @@ class MemoryFeature:
         if self.store is None or self._installed:
             return
         services = get_tool_services()
-        paths = tuple(Path(str(self.settings.sqlite.path) + suffix) for suffix in ("", "-wal", "-shm", "-journal"))
+        paths = tuple(Path(str(path) + suffix) for path in dict.fromkeys(self._local_paths) for suffix in ("", "-wal", "-shm", "-journal"))
         for path in paths:
             services.protect_path(path)
         try:
@@ -117,6 +171,8 @@ class MemoryFeature:
             return False
         if self.store is not None:
             self.store.close()
+        if self._owned_progress is not None:
+            self._owned_progress.close()
         for path in self._protected:
             get_tool_services().unprotect_path(path)
         self._protected = ()
