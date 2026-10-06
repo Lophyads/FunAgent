@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from memory import EmbeddingConfig, MemoryConfig, MemoryFeature, SqliteConfig, SupabaseConfig, load_memory_config
 from memory.embedding import EmbeddingClient
@@ -172,6 +173,49 @@ def test_initialization_failure_cleans_resources_and_redacts_body(failure):
     assert client.closed == embed.closed == 1
 
 
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ConnectTimeout])
+def test_initialization_recovers_from_transient_connection_failures(monkeypatch, error_type):
+    module = importlib.import_module("memory.supabase")
+    delays = []
+    monkeypatch.setattr(module.time, "sleep", delays.append)
+    client, embed = RpcClient(), Embedder()
+    schema = client.responses[0]
+    client.responses = [error_type("private connection details"), error_type("private connection details"), schema]
+    store = SupabaseMemoryStore(config(), client=client, embedding=embed)
+    assert len(client.calls) == 3
+    assert all(call == client.calls[0] for call in client.calls)
+    assert delays == [0.25, 0.5]
+    assert not embed.calls
+    store.close()
+    assert client.closed == embed.closed == 1
+
+
+def test_connection_retry_is_bounded_and_failure_cleans_resources(monkeypatch):
+    module = importlib.import_module("memory.supabase")
+    delays = []
+    monkeypatch.setattr(module.time, "sleep", delays.append)
+    client, embed = RpcClient(), Embedder()
+    client.responses = [httpx.ConnectError("private secret body") for _ in range(3)]
+    with pytest.raises(MemoryBackendError) as raised:
+        SupabaseMemoryStore(config(), client=client, embedding=embed)
+    assert len(client.calls) == 3 and delays == [0.25, 0.5]
+    assert "proxy" in str(raised.value) and "private secret" not in str(raised.value)
+    assert client.closed == embed.closed == 1
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.WriteError, httpx.RemoteProtocolError])
+def test_uncertain_write_failures_are_never_retried(monkeypatch, error_type):
+    module = importlib.import_module("memory.supabase")
+    monkeypatch.setattr(module.time, "sleep", lambda _: pytest.fail("retried an uncertain write"))
+    client, embed = RpcClient(error_type("private request body")), Embedder()
+    store = SupabaseMemoryStore(config(), client=client, embedding=embed)
+    with pytest.raises(MemoryBackendError) as raised:
+        store.add(MemoryDraft("user", "fact"))
+    assert len(client.calls) == 2  # Schema check and one write attempt.
+    assert "unconfirmed" in str(raised.value) and "private request" not in str(raised.value)
+    store.close()
+
+
 def test_config_active_backend_env_and_optional_credentials(tmp_path, monkeypatch):
     path = tmp_path / "config.toml"
     path.write_text('[memory.supabase]\nnonsense=true\n', encoding="utf-8")
@@ -231,7 +275,8 @@ def test_supabase_feature_reuses_local_progress_and_protects_actual_files(tmp_pa
     assert feature.close()
 
 
-def test_real_sdk_uses_owned_mock_http_and_environment_key(monkeypatch):
+@pytest.mark.parametrize("connection_failures", [0, 2])
+def test_real_sdk_uses_owned_mock_http_and_environment_key(monkeypatch, connection_failures):
     supabase = pytest.importorskip("supabase")
     import httpx
     module = importlib.import_module("memory.supabase")
@@ -239,15 +284,37 @@ def test_real_sdk_uses_owned_mock_http_and_environment_key(monkeypatch):
     requests = []
     def handle(request):
         requests.append(request)
+        if len(requests) <= connection_failures:
+            raise httpx.ConnectError("private connection details", request=request)
         return httpx.Response(200, json={"status":"ok", "version":1, "dimensions":3})
     owned = original(transport=httpx.MockTransport(handle))
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: owned)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
     monkeypatch.setenv("SUPABASE_TEST_KEY", "sb_secret_test_placeholder")
     store = module.SupabaseMemoryStore(config(), embedding=Embedder())
-    assert len(requests) == 1 and requests[0].url.path.endswith("/rpc/funagent_memory_schema")
+    assert len(requests) == connection_failures + 1 and requests[0].url.path.endswith("/rpc/funagent_memory_schema")
+    assert all(request.content == requests[0].content for request in requests)
     assert requests[0].headers["apikey"] == "sb_secret_test_placeholder"
     store.close()
     assert owned.is_closed
+
+
+def test_real_sdk_authentication_error_is_not_retried(monkeypatch):
+    pytest.importorskip("supabase")
+    module = importlib.import_module("memory.supabase")
+    requests = []
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(401, json={"message":"private invalid key details", "code":"401"})
+    owned = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: owned)
+    monkeypatch.setattr(module.time, "sleep", lambda _: pytest.fail("retried an authentication error"))
+    monkeypatch.setenv("SUPABASE_TEST_KEY", "sb_secret_test_placeholder")
+    embed = Embedder()
+    with pytest.raises(MemoryBackendError) as raised:
+        SupabaseMemoryStore(config(), embedding=embed)
+    assert "APIError" in str(raised.value) and "private" not in str(raised.value)
+    assert len(requests) == 1 and owned.is_closed and embed.closed == 1
 
 
 def test_empty_search_and_faults_are_distinct_and_invalid_versions_do_not_embed():

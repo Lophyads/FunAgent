@@ -97,8 +97,14 @@ class ToolRoundRunner:
                 "[redacted]",
             )
             tool_started = time.monotonic()
+
+            def persist_policy(policy):
+                if assistant.tool_call_effects[tool_call.id] != policy.side_effects:
+                    self._persistence.save_tool_policy(tool_call.id, policy.side_effects)
+                    assistant.tool_call_effects[tool_call.id] = policy.side_effects
+
             executed = self._executor.execute(
-                runtime, state, tool_call,
+                runtime, state, tool_call, on_policy_resolved=persist_policy,
             )
             tool_duration_ms = int((time.monotonic() - tool_started) * 1000)
             self._persistence.save_tool_result(executed.message)

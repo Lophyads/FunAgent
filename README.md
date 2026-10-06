@@ -243,6 +243,11 @@ CLI/Web 默认启用本地 SQLite，存放于配置文件旁的 `memories/memory
 进度持久化，失败或取消不推进；队列仍在进程内，退出时未完成的任务会在后续触发时处理，
 不会在启动时自动补跑。复盘逐条写入，不承诺整个批次原子提交。
 
+Web 对话到复盘写入、记忆召回到模型上下文的用例与人工验收步骤见
+[tests/MEMORY_WEB_CASES.md](tests/MEMORY_WEB_CASES.md)。运行
+`uv run --extra dev pytest tests/test_web_memory_flow.py` 可通过真实本地 HTTP
+接口和临时 SQLite 验证两条链路，模型回复使用离线脚本。
+
 文件模式已移除。旧 `[file_memory]` 配置会提示迁移；先显式导入旧目录的 § 分隔条目，
 再将配置替换为示例中的 `[memory]` 和 `[memory.sqlite]`。导入保留原文件，重复执行会去重。
 `USER.md/MEMORY.md` 只能显式导出为阅读快照，修改导出文件不会更新数据库。
@@ -287,6 +292,10 @@ dimensions = 1024
 地址为 `http://127.0.0.1:11434/v1`；远程兼容服务同样设置 `base_url/model/credential_ref`。
 无需鉴权的服务可以省略 embedding 凭据，不要求 `OPENAI_API_KEY`。
 模型需要查询/文档前缀时，可设置 `query_prefix/document_prefix`，默认均为空。
+
+Supabase HTTP 客户端沿用 HTTPX 的环境和系统代理设置。建立连接失败时最多尝试三次；
+认证、读写或响应解析失败不会自动重试。持续出现 `ConnectError` 时检查网络、代理和 TLS
+连接；该错误发生在连接层，重新执行初始化 SQL 无法解决。
 
 Supabase 保存提炼出的记忆正文和向量，使用语义检索；正文与向量同步提交，更新和删除
 继续检查记录版本。模型或前缀变化会拒绝混用向量，需要显式重建。服务端需保持同名

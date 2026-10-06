@@ -6,7 +6,10 @@ from dataclasses import asdict
 from datetime import datetime
 import hashlib
 import json
+import time
 import uuid
+
+import httpx
 
 from .embedding import EmbeddingClient, validate_vectors
 from .store import (
@@ -27,7 +30,6 @@ class SupabaseMemoryStore:
                 self._embedding = EmbeddingClient(config.embedding, timeout_seconds=config.timeout_seconds)
             if self._client is None:
                 try:
-                    import httpx
                     from supabase import ClientOptions, create_client
                 except ImportError:
                     raise MemoryError("Supabase backend requires 'uv sync --extra supabase'") from None
@@ -48,14 +50,23 @@ class SupabaseMemoryStore:
     def _rpc(self, name, **params):
         if self._closed:
             raise MemoryBackendError("memory store is closed")
-        try:
-            response = self._client.rpc("funagent_memory_" + name, {
-                "p_namespace": self.config.namespace, "p_profile": self.config.embedding.profile, **params,
-            }).execute()
-            data = response.data
-        except Exception as exc:
-            detail = "; write result may be unconfirmed" if name == "write" else ""
-            raise MemoryBackendError(f"Supabase {name} request failed ({type(exc).__name__}){detail}") from None
+        for attempt in range(3):
+            try:
+                response = self._client.rpc("funagent_memory_" + name, {
+                    "p_namespace": self.config.namespace, "p_profile": self.config.embedding.profile, **params,
+                }).execute()
+                data = response.data
+                break
+            except Exception as exc:
+                # Only connection establishment is safe to retry; a read/write
+                # failure can leave the result of a mutation unconfirmed.
+                connection_error = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                if connection_error and attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                hint = "; check network, proxy and TLS connectivity" if connection_error else ""
+                detail = "; write result may be unconfirmed" if name == "write" else ""
+                raise MemoryBackendError(f"Supabase {name} request failed ({type(exc).__name__}){hint}{detail}") from None
         if not isinstance(data, dict):
             raise MemoryBackendError("Supabase memory RPC returned an invalid response")
         status = data.get("status")

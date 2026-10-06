@@ -266,6 +266,7 @@ def test_disabled_writer_skips_all_writes_even_with_a_store(config_factory, monk
         )
         writer.save_user_message(Message.user("next"))
         writer.save_tool_calls(Message.assistant_tools(tool_response("one").tool_calls))
+        writer.save_tool_policy("one", "none")
         writer.save_tool_result(Message.tool_result(
             "ok", tool_call_id="one", tool_name="echo",
             tool_outcome_state="succeeded", effect_disposition="none",
@@ -387,3 +388,67 @@ def test_tool_call_write_failure_stops_before_tool_execution(
         assert "cannot stage tool call" in result.error.message
         assert [m.role for m in store.load_messages("stage-failure")] == ["user"]
         assert not result.tool_outcomes
+
+
+@pytest.mark.parametrize("declared,resolved", [("possible", "none"), ("none", "possible")])
+def test_dynamic_tool_policy_is_persisted_before_handler_runs(config_factory, agent_factory, declared, resolved):
+    from tools.registry import ToolExecutionPolicy
+
+    config = config_factory()
+    policies, executions = [], []
+    store = SQLiteStore(config.database_path)
+
+    def policy(args):
+        policies.append(args.text)
+        return ToolExecutionPolicy(side_effects=resolved)
+
+    def handler(args, context):
+        parent = store.load_messages(context.session_id)[-1]
+        assert parent.tool_call_effects == {"dynamic": resolved}
+        executions.append(args.text)
+        return args.text
+
+    from tools.registry import ToolRegistry
+    registry = ToolRegistry()
+    registry.register(ToolEntry(
+        tool_id="test.echo", implementation_version="1", name="echo", description="Echo",
+        args_model=EchoArgs, handler=handler, side_effects=declared, policy_resolver=policy,
+    ))
+    transport = ScriptedTransport(tool_response("dynamic"), NormalizedModelResponse(content="done"))
+    with agent_factory(config, transports={"primary": transport}, tool_registry=registry, store=store) as agent:
+        result = agent.run_turn_blocking("question", session_id="dynamic-policy")
+        assert result.status == "completed"
+        assert policies == executions == ["hello"]
+        outcome, = result.tool_outcomes
+        assert outcome.side_effects == resolved
+        assert outcome.effect_disposition == ("none" if resolved == "none" else "confirmed")
+        parent = next(m for m in store.load_messages("dynamic-policy") if m.tool_calls)
+        assert parent.tool_call_effects == {"dynamic": resolved}
+
+
+def test_dynamic_policy_write_failure_stops_before_handler(config_factory, agent_factory):
+    from tools.registry import ToolExecutionPolicy, ToolRegistry
+
+    config = config_factory()
+    executions = []
+
+    class FailingPolicyStore(SQLiteStore):
+        def update_tool_call_effect(self, *args, **kwargs):
+            raise StorageError("cannot persist dynamic policy")
+
+    registry = ToolRegistry()
+    registry.register(ToolEntry(
+        tool_id="test.echo", implementation_version="1", name="echo", description="Echo",
+        args_model=EchoArgs, handler=lambda args, context: executions.append(args.text),
+        side_effects="possible", policy_resolver=lambda args: ToolExecutionPolicy(side_effects="none"),
+    ))
+    store = FailingPolicyStore(config.database_path)
+    with agent_factory(config, transports={"primary": ScriptedTransport(tool_response("blocked"))},
+                       tool_registry=registry, store=store) as agent:
+        result = agent.run_turn_blocking("question", session_id="policy-write-failure")
+        assert result.status == "failed" and "cannot persist dynamic policy" in result.error.message
+        assert executions == []
+        outcome, = result.tool_outcomes
+        assert outcome.state == "unknown" and outcome.effect_disposition == "unknown"
+        parent = next(m for m in store.load_messages("policy-write-failure") if m.tool_calls)
+        assert parent.tool_call_effects == {"blocked": "possible"}

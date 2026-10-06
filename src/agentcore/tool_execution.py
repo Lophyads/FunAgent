@@ -5,7 +5,7 @@ import json
 import threading
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import ValidationError
 
@@ -46,6 +46,7 @@ class ToolExecutor:
 
     def execute(
         self, runtime: TurnRuntime, state: LoopState, tool_call: ToolCall,
+        *, on_policy_resolved: Callable[[ToolExecutionPolicy], None] | None = None,
     ) -> ToolExecution:
         context = state.require_context("execute_tool")
         runtime.check_active()
@@ -107,6 +108,8 @@ class ToolExecutor:
                 side_effects=entry.side_effects, state_name="denied",
                 effect="not_applied", error_type="policy_error",
             )
+        if on_policy_resolved is not None:
+            on_policy_resolved(policy)
         invocation = self._invocation(
             state, tool_call, args_model.model_dump(mode="json"),
             policy.approval_scopes,

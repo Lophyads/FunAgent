@@ -18,3 +18,4 @@ logs/
 .funagent/
 *.approvals.lock
 examples/
+agentcore.toml

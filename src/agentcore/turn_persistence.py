@@ -70,6 +70,16 @@ class TurnPersistence:
         ))
         self._tool_parent_id = row_id
 
+    def save_tool_policy(self, call_id: str, side_effects: str) -> None:
+        def save(db: SQLiteStore, fence: LeaseFence) -> None:
+            if self._tool_parent_id is None:
+                raise StorageError("tool policy has no persisted assistant batch")
+            db.update_tool_call_effect(
+                self.session_id, self._tool_parent_id, call_id, side_effects, fence=fence,
+            )
+
+        self._write(save)
+
     def save_tool_result(self, message: Message) -> None:
         def save(db: SQLiteStore, fence: LeaseFence) -> None:
             if self._tool_parent_id is None:

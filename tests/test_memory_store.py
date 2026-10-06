@@ -64,6 +64,13 @@ def test_fts_tracks_add_update_delete_unicode_and_safe_queries(store):
         db.execute("INSERT INTO entries_fts(entries_fts,rank) VALUES('integrity-check',1)")
 
 
+def test_episode_search_orders_by_event_date_including_timezone_offsets(store):
+    newest = store.add(MemoryDraft("episode", "Cache migration confirmed", event_at="2026-10-06T09:00:00+08:00")).entry
+    middle = store.add(MemoryDraft("episode", "Cache migration discussed", event_at="2026-10-06T00:30:00+00:00")).entry
+    oldest = store.add(MemoryDraft("episode", "Cache migration proposed", event_at="2026-10-05")).entry
+    assert [entry.id for entry in store.search(MemorySearch("cache", "episode"))] == [newest.id, middle.id, oldest.id]
+
+
 def test_paging_kind_filters_and_query_validation(store):
     for i in range(7):
         store.add(MemoryDraft("user" if i % 2 else "note", f"fact {i}"))

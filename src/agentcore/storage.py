@@ -564,6 +564,31 @@ class SQLiteStore:
                 raise StorageError("previous tool batch is incomplete")
             return self._insert_message(connection, session_id, message)
 
+    def update_tool_call_effect(
+        self, session_id: str, parent_id: int, call_id: str, side_effects: str, *, fence: LeaseFence,
+    ) -> None:
+        """Persist the resolved policy before a dynamic tool can execute."""
+        with self._transaction() as connection:
+            self._assert_fence(connection, fence, session_id=session_id)
+            parent = connection.execute(
+                "SELECT tool_calls_json,tool_call_effects_json FROM messages "
+                "WHERE id=? AND session_id=? AND role='assistant'",
+                (parent_id, session_id),
+            ).fetchone()
+            if parent is None or not parent["tool_calls_json"]:
+                raise StorageError("tool policy references an unknown assistant batch")
+            calls = [ToolCall.model_validate(item) for item in json.loads(parent["tool_calls_json"])]
+            if call_id not in {call.id for call in calls}:
+                raise StorageError("tool policy does not match its parent call")
+            effects = json.loads(parent["tool_call_effects_json"] or "{}")
+            if not effects:
+                effects = {call.id: "possible" for call in calls}
+            effects[call_id] = side_effects
+            Message.assistant_tools(calls, tool_call_effects=effects)
+            connection.execute(
+                "UPDATE messages SET tool_call_effects_json=? WHERE id=?", (_json(effects), parent_id),
+            )
+
     def append_tool_result(
         self, session_id: str, message: Message, *, fence: LeaseFence
     ) -> int:
