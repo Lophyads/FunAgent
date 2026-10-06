@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -17,6 +18,7 @@ _METADATA_NETWORKS = (
 def validate_url(
     raw_url: str, *, allow_private: bool = False,
     resolve_dns: bool = True,
+    resolver: Callable[[str, int], tuple[str, ...]] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     if len(raw_url) > 4096:
         raise ValueError("URL is too long")
@@ -47,8 +49,11 @@ def validate_url(
     except ValueError:
         if not resolve_dns:
             return urlunsplit(parts._replace(fragment="")), ()
-        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
-        addresses = tuple(dict.fromkeys(info[4][0] for info in infos))
+        if resolver is None:
+            infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            addresses = tuple(dict.fromkeys(info[4][0] for info in infos))
+        else:
+            addresses = resolver(hostname, port)
     if not addresses:
         raise ValueError("hostname did not resolve")
     for address in addresses:

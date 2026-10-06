@@ -151,7 +151,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         except WebError as exc:
             self.close_connection = True  # Invalid requests may leave unread bytes.
             self._json(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             self.close_connection = True
         except Exception:
             logger.exception("web.request_failed")

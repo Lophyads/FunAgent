@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from agentcore.interfaces import ToolContext, TurnCancelled
 from .network_safety import validate_url
+from .network_http import open_web_connection, search_proxy, validate_web_url
 from .registry import ToolEntry, ToolRegistry
 
 
@@ -79,7 +80,7 @@ def _search_subprocess(
     context.check_active()
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(
-            [sys.executable, "-m", "tools._ddgs_worker"],
+            [sys.executable, "-X", "utf8", "-m", "tools._ddgs_worker"],
             stdin=subprocess.PIPE, stdout=output,
             stderr=subprocess.DEVNULL, env=_minimal_env(),
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
@@ -87,7 +88,8 @@ def _search_subprocess(
         try:
             assert process.stdin is not None
             process.stdin.write(
-                json.dumps({"query": query, "limit": limit}).encode("utf-8")
+                json.dumps({"query": query, "limit": limit,
+                            "proxy": search_proxy()}).encode("utf-8")
             )
             process.stdin.close()
             deadline = time.monotonic() + timeout
@@ -100,9 +102,13 @@ def _search_subprocess(
             raw = output.read(256_001)
             if len(raw) > 256_000:
                 raise ValueError("search response exceeded size limit")
-            response = json.loads(raw)
+            response = json.loads(raw.decode("utf-8"))
             if process.returncode != 0:
-                raise RuntimeError(f"DDGS search failed: {response.get('error', 'unknown')}")
+                detail = response.get("message", "")
+                raise RuntimeError(
+                    f"DDGS search failed: {response.get('error', 'unknown')}"
+                    + (f": {detail}" if detail else "")
+                )
             return response
         finally:
             if process.poll() is None:
@@ -112,24 +118,27 @@ def _search_subprocess(
 
 def _fetch_http(
     url: str, *, allow_private: bool, max_bytes: int,
+    use_proxy: bool = False,
 ) -> tuple[str, str, bytes]:
     current = url
     for _ in range(6):
-        safe_url, addresses = validate_url(
-            current, allow_private=allow_private
-        )
+        validator = validate_web_url if use_proxy else validate_url
+        safe_url, addresses = validator(current, allow_private=allow_private)
         parts = urlsplit(safe_url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
-        connection_type = (
-            http.client.HTTPSConnection if parts.scheme == "https"
-            else http.client.HTTPConnection
-        )
-        conn = connection_type(parts.hostname, port, timeout=15)
         pinned_ip = addresses[0]
-        conn._create_connection = (
-            lambda _address, timeout=15, source_address=None:
-            socket.create_connection((pinned_ip, port), timeout, source_address)
-        )
+        if use_proxy:
+            conn = open_web_connection(safe_url, pinned_ip)
+        else:
+            connection_type = (
+                http.client.HTTPSConnection if parts.scheme == "https"
+                else http.client.HTTPConnection
+            )
+            conn = connection_type(parts.hostname, port, timeout=15)
+            conn._create_connection = (
+                lambda _address, timeout=15, source_address=None:
+                socket.create_connection((pinned_ip, port), timeout, source_address)
+            )
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -234,9 +243,9 @@ def web_extract(args: WebExtractArgs, context: ToolContext) -> dict:
     for url in args.urls:
         context.check_active()
         try:
-            validate_url(url, allow_private=allow_private)
+            validate_web_url(url, allow_private=allow_private)
             final_url, content_type, data = context.services.fetch(url, context)
-            validate_url(final_url, allow_private=allow_private)
+            validate_web_url(final_url, allow_private=allow_private)
             context.check_active()
             text = _decode_content(content_type, data)
             if len(text) > page_budget:

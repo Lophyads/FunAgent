@@ -159,7 +159,7 @@ class ToolServices:
             return self._http_backend.get(url)
         from .web_tool import _fetch_http
         return _fetch_http(url, allow_private=self.config.tools.allow_private_web_addresses,
-                           max_bytes=self.config.tools.artifact_max_bytes)
+                           max_bytes=self.config.tools.artifact_max_bytes, use_proxy=True)
 
     def _cleanup(self, identity: tuple, callback, deadline: float) -> CleanupIssue | None:
         # Keep timed-out calls: another close joins the same operation instead

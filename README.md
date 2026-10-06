@@ -46,6 +46,13 @@ agent-browser，桌面工具需显式安装并启动 cua-driver。FunAgent 不�
 文本 AX capture，拒绝 SOM/vision 和图像型 capture_after。默认拒绝 Web/browser
 访问本地及私有地址。
 
+`web_search` 子进程使用 UTF-8，并读取现有 HTTPS/ALL 代理（包括 Windows
+系统代理）；可在 `.env` 中用 `DDGS_PROXY` 覆盖搜索代理。搜索失败的工具结果
+保留有界错误详情，并遮蔽代理 URL 中的凭据。`web_extract` 使用现有 HTTP
+CONNECT 代理和 `NO_PROXY` 设置，连接前校验并固定目标 IP，HTTPS 仍校验原域名
+证书。如果 DNS 返回 `198.18.0.0/15` 的代理 Fake-IP，会给出明确诊断；需在代理
+中让相关域名返回真实 IP。此时不要直接开启 `allow_private_web_addresses`。
+
 可运行 uv run agentcore tools doctor --config agentcore.toml 查看各后端是否可用
 ；该命令不下载或升级程序。
 

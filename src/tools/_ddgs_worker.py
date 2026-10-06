@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 
@@ -11,7 +12,7 @@ def main() -> int:
         from ddgs import DDGS
 
         request = json.load(sys.stdin)
-        results = list(DDGS().text(
+        results = list(DDGS(proxy=request.get("proxy")).text(
             request["query"], max_results=request["limit"]
         ))
         sanitized = [
@@ -26,7 +27,11 @@ def main() -> int:
         json.dump({"results": sanitized}, sys.stdout, ensure_ascii=False)
         return 0
     except BaseException as exc:
-        json.dump({"error": type(exc).__name__}, sys.stdout)
+        # Bound diagnostics and avoid exposing proxy credentials in tool results.
+        message = re.sub(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@",
+                         r"\1[redacted]@", str(exc), flags=re.IGNORECASE)
+        json.dump({"error": type(exc).__name__, "message": message[:1000]},
+                  sys.stdout, ensure_ascii=True)
         return 1
 
 
