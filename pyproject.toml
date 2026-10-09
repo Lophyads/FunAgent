@@ -34,14 +34,16 @@ dev = [
 
 [project.scripts]
 agentcore = "agentcore.cli:main"
+funagent = "funagent.global_server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentcore", "src/gateway", "src/log", "src/tools", "src/memory", "src/knowledge"]
+packages = ["src/funagent", "src/agentcore", "src/gateway", "src/log", "src/tools", "src/memory", "src/knowledge"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests_refactor"]
+pythonpath = ["src"]
 markers = [
   "multiprocess: Windows spawn-based persistence and lease tests",
 ]
