@@ -2,21 +2,13 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from threading import Lock
 from types import MappingProxyType
 import tomllib
-from math import isfinite
 
-from .contracts import DomainError
-
-
-def _freeze(value):
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
+from .contracts import DomainError, freeze
 
 
 @dataclass(frozen=True)
@@ -66,7 +58,7 @@ class ServConf(ABC):
 
 class _TomlModelConf(ModelConf):
     def __init__(self, data):
-        self._providers = _freeze(data["providers"])
+        self._providers = freeze(data["providers"])
         self._profiles = MappingProxyType({
             key: ModelProfile(key, value["provider_id"], value["adapter_id"],
                               value["model"], value["timeout"], value.get("max_retries", 0),
@@ -86,7 +78,7 @@ class _TomlModelConf(ModelConf):
 
 class _TomlToolConf(ToolConf):
     def __init__(self, data):
-        self._data = _freeze(data)
+        self._data = freeze(data)
 
     def Definitions(self):
         return self._data.get("definitions", MappingProxyType({}))
@@ -97,7 +89,7 @@ class _TomlToolConf(ToolConf):
 
 class _TomlMemoryConf(MemoryConf):
     def __init__(self, data):
-        self._data = _freeze(data)
+        self._data = freeze(data)
 
     def Sources(self):
         return self._data.get("sources", MappingProxyType({}))
@@ -111,7 +103,7 @@ class _TomlMemoryConf(MemoryConf):
 
 class _TomlOptionsConf:
     def __init__(self, data):
-        self._options = _freeze(data["options"])
+        self._options = freeze(data["options"])
 
     def Options(self):
         return self._options
