@@ -19,3 +19,7 @@ logs/
 *.approvals.lock
 examples/
 agentcore.toml
+
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

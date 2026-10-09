@@ -8,7 +8,7 @@ python -m funagent --conf-dir examples/refactor --check-config
 python -m pytest tests_refactor
 ```
 
-新 console entry point 为 `funagent = funagent.global_server:main`。当前入口仅校验配置；任务 CLI 在 P2 接入。旧入口与依赖的最终删除属于 P7。
+新 console entry point 为 `funagent = funagent.global_server:main`。此目录保留为 P0/P1 测试配置，仅用于配置校验和测试启动绑定；可运行的 P2 CLI 见 `../refactor-cli/README.md`。旧入口与依赖的最终删除属于 P7。
 
 `model.conf` 声明 provider ID、adapter ID、profile、正 timeout、非负 max_retries 和已存在的 fallback_profiles。adapter ID 在启动绑定到静态 Adapter；provider 的 kind 与 credential_env 只缓存为数据，本阶段不会创建客户端或解析凭据。
 
@@ -29,3 +29,8 @@ RunResult 的 completed/failed/limit/cancelled 及 final/reason/error_code/tool_
 调用者必须等 Run 和实际 IO 返回后再关闭资源，顺序为 ModelRuntime.Close、ToolMgr.Close、配置 Stop。成功初始化后 ModelRuntime 拥有传入 provider；同一连接被多个 ID 使用也只关闭一次。配置或绑定失败不发布半就绪单例；未接管的资源由启动调用者关闭。
 
 离线脚本 Provider、两种最小 Adapter 和三种策略见 `tests_refactor/fakes.py`；相同循环与失败场景由两种协议替换验证。本阶段未实现真实 SDK，Provider 协议要求真实实现关闭 SDK 的自动重试。
+
+
+## P2
+
+P2 已接入 SQLite 主存储、单 worker TaskMgr 和任务 CLI。此目录的 `scripted/chat/blocks` 仍由测试绑定；生产启动使用 `examples/refactor-cli`（离线 demo）或 `examples/refactor-openai`（真实 SDK）。详见 `architecture/p2-implementation.md`。业务主 Run 使用 `RecordScope("main_history", task_id)`；ephemeral Run 继续不写主历史。配置校验不创建数据库、Provider 或 worker。

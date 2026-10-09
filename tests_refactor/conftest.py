@@ -20,12 +20,8 @@ def close_resources():
     try:
         yield
     finally:
-        # The production close APIs are also the test isolation boundary.
-        try:
-            ModelRuntime.Close()
-        finally:
-            ToolMgr.Close()
-            ConfMgr.Close()
+        from funagent.global_server import Stop
+        Stop()
 
 
 @pytest.fixture
@@ -55,3 +51,29 @@ def assemble(conf_dir):
         ModelRuntime.Close()
     finally:
         ToolMgr.Close()
+
+
+@pytest.fixture
+def task_app(assemble, tmp_path):
+    from funagent.persistence import DbMgr, SQLiteStore
+    from funagent.task import TaskMgr
+    from funagent.session import SessionMgr
+    from funagent.contracts import SessionCreate
+
+    def bind(provider, *, handler=None, capacity=4):
+        runtime, spy = assemble(provider, handler=handler)
+        store = SQLiteStore(tmp_path / "app.sqlite3")
+        DbMgr.Initialize(store)
+        TaskMgr.Initialize(capacity)
+        return TaskMgr.GetInstance(), store, SessionMgr.Create(SessionCreate()), spy
+    try:
+        yield bind
+    finally:
+        TaskMgr.Close()
+        DbMgr.Close()
+
+
+@pytest.fixture
+def cli_conf(tmp_path):
+    copytree(Path(__file__).parents[1] / "examples" / "refactor-cli", tmp_path / "cli-conf")
+    return tmp_path / "cli-conf"

@@ -26,6 +26,15 @@ def freeze(value):
     return value
 
 
+def thaw(value):
+    """JSON-compatible copy of frozen data for wire and persistence encoders."""
+    if isinstance(value, Mapping):
+        return {key: thaw(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [thaw(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class ToolCall:
     call_id: str
@@ -104,7 +113,9 @@ class RunContext:
     access: frozenset[str] = frozenset()
     cancel: Event = field(default_factory=Event, repr=False, compare=False)
     deadline: float | None = None
-    record_scope: str = "ephemeral"
+    record_scope: "RecordScope | str" = "ephemeral"
+    task_id: str = ""
+    session_id: str = ""
 
     def CheckCancelled(self):
         if self.cancel.is_set():
@@ -131,3 +142,71 @@ class RunResult:
     def __post_init__(self):
         object.__setattr__(self, "tool_results", tuple(self.tool_results))
         object.__setattr__(self, "usage", freeze(self.usage))
+
+
+@dataclass(frozen=True)
+class RecordScope:
+    kind: str = "ephemeral"
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionCreate:
+    title: str = "New session"
+    workspace: str = "."
+
+
+@dataclass(frozen=True)
+class Session:
+    session_id: str
+    title: str
+    workspace: str
+    prompt: str | None = None
+    created_at: float = 0
+
+
+@dataclass(frozen=True)
+class SessionSnapshot:
+    session: Session
+    messages: tuple[Message, ...] = ()
+    through_message_id: int = 0
+
+
+@dataclass(frozen=True)
+class TurnRequest:
+    session_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class Task:
+    task_id: str
+    request: TurnRequest
+    status: str
+    result: RunResult | None = None
+    created_at: float = 0
+    finished_at: float | None = None
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    task_id: str
+    status: str
+    requested: bool
+
+
+@dataclass(frozen=True)
+class PageQuery:
+    limit: int = 50
+    cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class HistoryQuery(PageQuery):
+    pass
+
+
+@dataclass(frozen=True)
+class Page:
+    items: tuple
+    next_cursor: str | None = None

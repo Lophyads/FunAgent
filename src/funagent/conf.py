@@ -32,6 +32,9 @@ class ModelConf(ABC):
 
 class ToolConf(ABC):
     @abstractmethod
+    def Allowed(self, purpose: str) -> tuple[str, ...]: ...
+
+    @abstractmethod
     def Definitions(self) -> Mapping: ...
 
     @abstractmethod
@@ -85,6 +88,9 @@ class _TomlToolConf(ToolConf):
 
     def Backends(self):
         return self._data.get("backends", MappingProxyType({}))
+
+    def Allowed(self, purpose):
+        return self._data.get("purposes", {}).get(purpose, ())
 
 
 class _TomlMemoryConf(MemoryConf):
@@ -217,6 +223,11 @@ def _validate(docs):
     for key in ("host", "workspace", "database"):
         _text(serv_options[key], f"serv.options.{key}")
     _refs([serv_options["model_profile"]], profiles, "serv.options.model_profile")
+    for key in ("max_iterations", "task_timeout"):
+        if key in serv_options:
+            _number(serv_options[key], f"serv.options.{key}", strict=True, integer=key == "max_iterations")
+    if "system_prompt" in serv_options:
+        _text(serv_options["system_prompt"], "serv.options.system_prompt")
 
 
 class ConfMgr:

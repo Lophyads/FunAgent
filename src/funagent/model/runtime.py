@@ -8,9 +8,10 @@ import time
 from ..conf import ModelProfile
 from ..contracts import (
     ControlError, DomainError, Message, ModelReply, ModelRequest,
-    RunContext, RunInput, RunResult, ToolCall, ToolResult,
+    RunContext, RunInput, RunResult, ToolCall, ToolResult, RecordScope,
 )
 from ..tool import ToolMgr
+from ..persistence import DbMgr
 from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provider
 
 
@@ -150,8 +151,13 @@ class ModelRuntime:
         raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
 
     def Run(self, input: RunInput, strategy: type[ModelStrategy], context: RunContext) -> RunResult:
-        if context.record_scope != "ephemeral":
-            raise DomainError("UNSUPPORTED", "Only ephemeral runs are available")
+        scope = context.record_scope
+        persistent = isinstance(scope, RecordScope) and scope.kind == "main_history"
+        if persistent:
+            if not scope.turn_id or scope.turn_id != context.task_id:
+                raise DomainError("INVALID_REQUEST", "Main history requires the current Turn")
+        elif scope != "ephemeral" and scope != RecordScope():
+            raise DomainError("INVALID_REQUEST", "Invalid record scope")
         maximum = strategy.MaxIterations()
         allowed = strategy.ToolSet()
         rule = strategy.FallbackPolicy()
@@ -190,7 +196,10 @@ class ModelRuntime:
                     usage[key] = usage.get(key, 0) + value
                 if not reply.calls:
                     return finish("completed", final=reply.content)
-                messages.append(Message("assistant", reply.content or "", reply.calls))
+                message = Message("assistant", reply.content or "", reply.calls)
+                if persistent:
+                    DbMgr.GetInstance().AppendToolCalls(scope, message)
+                messages.append(message)
                 seen.update(call.call_id for call in reply.calls)
                 pending = reply.calls
                 for call in reply.calls:
@@ -198,6 +207,8 @@ class ModelRuntime:
                     result = ToolMgr.GetInstance().Execute(call, allowed, context)
                     results.append(result)
                     pending = pending[1:]
+                    if persistent:
+                        DbMgr.GetInstance().AppendToolResult(scope, result)
                     messages.append(Message("tool", result.content, call_id=result.call_id,
                                             status=result.status, effect=result.effect))
                     context.CheckCancelled()
@@ -208,3 +219,6 @@ class ModelRuntime:
             return finish("cancelled", reason=error.code)
         except ModelError as error:
             return finish("failed", reason=error.code, error_code=error.cause_code or error.code)
+        except DomainError as error:
+            results.extend(ToolResult(call.call_id, "cancelled", "Tool not executed") for call in pending)
+            return finish("failed", reason=error.code, error_code=error.code)
