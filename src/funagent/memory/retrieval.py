@@ -56,7 +56,8 @@ class MemorySearchHandler:
 
 def RecordData(record):
     return {"source_id": record.ref.source_id, "record_id": record.ref.record_id, "kind": record.kind,
-            "type": record.type, "content": record.content, "citation": record.citation, "version": record.version}
+            "type": record.type, "content": record.content, "citation": record.citation, "version": record.version,
+            **({"deleted": True, "evidence": record.evidence} if record.deleted else {})}
 
 
 def Evidence(records):

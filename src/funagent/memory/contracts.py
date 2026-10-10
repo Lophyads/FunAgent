@@ -20,6 +20,7 @@ class MemoryRecord:
     citation: str
     version: str | None = None
     evidence: tuple[str, ...] = ()
+    deleted: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "evidence", tuple(self.evidence))
@@ -32,6 +33,7 @@ class MemoryQuery:
     kind: str | None = None
     types: tuple[str, ...] = ()
     limit: int = 10
+    include_deleted: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "source_ids", tuple(self.source_ids))

@@ -1,5 +1,6 @@
 """Atomic main records on one owned, thread-safe SQLite connection."""
 from contextlib import contextmanager
+from dataclasses import replace
 from threading import RLock
 from uuid import uuid4
 import json
@@ -81,6 +82,8 @@ class SQLiteStore:
                     task_id TEXT NOT NULL REFERENCES tasks(task_id), call_id TEXT NOT NULL,
                     batch_message_id INTEGER NOT NULL REFERENCES messages(id),
                     result_message_id INTEGER REFERENCES messages(id), PRIMARY KEY(task_id,call_id));
+                CREATE TABLE IF NOT EXISTS review_watermarks (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), through_id INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS task_session ON tasks(session_id, seq);
                 CREATE INDEX IF NOT EXISTS message_task ON messages(task_id, id);
             """)
@@ -284,6 +287,58 @@ class SQLiteStore:
             page = rows[:query.limit]
             cursor = _cursor("sessions", page[-1]["seq"], through) if len(rows) > query.limit else None
             return Page(tuple(self._session(row) for row in page), cursor)
+
+    def ReviewThrough(self, task_id):
+        with self._transaction() as db:
+            task = self._task_row(db, task_id)
+            if task["status"] in {"queued", "running"}:
+                raise DomainError("INVALID_REQUEST", "Review requires a committed Turn")
+            return db.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE task_id=?", (task_id,)).fetchone()[0]
+
+    def _review_boundary(self, db, session_id, identifier):
+        if type(identifier) is not int or identifier < 0:
+            raise DomainError("INVALID_REQUEST", "Invalid review boundary")
+        if identifier == 0:
+            return
+        row = db.execute("SELECT t.status,MAX(m.id) AS last FROM tasks t JOIN messages m ON m.task_id=t.task_id "
+                         "WHERE t.session_id=? AND t.task_id=(SELECT task_id FROM messages WHERE id=?) "
+                         "GROUP BY t.task_id", (session_id, identifier)).fetchone()
+        if row is None or row["status"] in {"queued", "running"} or row["last"] != identifier:
+            raise DomainError("INVALID_REQUEST", "Review requires a complete Turn boundary")
+
+    def ReviewRange(self, session_id, after_id, through_id):
+        with self._transaction() as db:
+            self._session_row(db, session_id)
+            self._review_boundary(db, session_id, after_id)
+            self._review_boundary(db, session_id, through_id)
+            if through_id < after_id:
+                raise DomainError("INVALID_REQUEST", "Review range is reversed")
+            rows = db.execute("SELECT m.id,m.payload,t.status FROM messages m JOIN tasks t ON t.task_id=m.task_id "
+                              "WHERE t.session_id=? AND m.id>? AND m.id<=? ORDER BY m.id",
+                              (session_id, after_id, through_id)).fetchall()
+            if any(row["status"] in {"queued", "running"} for row in rows):
+                raise DomainError("INVALID_REQUEST", "Review range contains an unfinished Turn")
+            return tuple(replace(_message(row["payload"]), message_id=row["id"]) for row in rows)
+
+    def ReviewWatermark(self, session_id):
+        with self._transaction() as db:
+            self._session_row(db, session_id)
+            row = db.execute("SELECT through_id FROM review_watermarks WHERE session_id=?", (session_id,)).fetchone()
+            return row[0] if row else 0
+
+    def AdvanceReview(self, session_id, expected_id, through_id):
+        with self._transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._session_row(db, session_id)
+            self._review_boundary(db, session_id, expected_id)
+            self._review_boundary(db, session_id, through_id)
+            if through_id <= expected_id:
+                raise DomainError("INVALID_REQUEST", "Review watermark must increase")
+            row = db.execute("SELECT through_id FROM review_watermarks WHERE session_id=?", (session_id,)).fetchone()
+            if (row[0] if row else 0) != expected_id:
+                raise DomainError("CONFLICT", "Review watermark changed")
+            db.execute("INSERT INTO review_watermarks(session_id,through_id) VALUES(?,?) "
+                       "ON CONFLICT(session_id) DO UPDATE SET through_id=excluded.through_id", (session_id, through_id))
 
     def Close(self):
         with self._lock:

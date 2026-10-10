@@ -63,7 +63,8 @@ class MemoryMgr:
         if operation not in source.get("capabilities", ("search",)) or operation not in store.capabilities:
             raise DomainError("UNSUPPORTED", "Memory source does not support this operation")
         write = operation in {"write", "update", "delete"}
-        if self._token(source_id, write) not in context.access or (write and context.purpose == "recall"):
+        if self._token(source_id, write) not in context.access or (write and (context.purpose == "recall" or
+                                              (context.purpose == "review" and source["kind"] != "episodic"))):
             raise DomainError("DENIED", "Memory access denied")
         return store
 
@@ -82,6 +83,8 @@ class MemoryMgr:
         context.CheckCancelled()
         validate_query(query)
         names = query.source_ids or tuple(name for name in self._sources if self._token(name) in context.access)
+        if query.include_deleted and (context.purpose != "review" or any(self._sources.get(name, {}).get("kind") != "episodic" for name in names)):
+            raise DomainError("DENIED", "Deleted receipts are available only to episodic review")
         selected = []
         for name in names:
             if name not in self._sources:

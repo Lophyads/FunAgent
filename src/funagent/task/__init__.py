@@ -4,6 +4,7 @@ from dataclasses import replace
 from threading import Condition, Thread
 from uuid import uuid4
 import time
+import logging
 
 from ..conf import ConfMgr
 from ..contracts import (CancelResult, ControlError, DomainError, RecordScope,
@@ -14,6 +15,7 @@ from ..session import SessionMgr
 from ..interaction import InteractionMgr
 from ..memory import MemoryMgr, MemoryPrepareRequest
 from ..memory.retrieval import Evidence, SelectEvidence
+from ..review import ReviewScheduler
 
 
 class MainStrategy(ModelStrategy):
@@ -68,14 +70,24 @@ class TaskProcess:
         except DomainError as error:
             result = RunResult("failed", reason=error.code, error_code=error.code)
         try:
-            return store.FinishTurn(task_id, result).result
+            committed = store.FinishTurn(task_id, result)
         except DomainError as error:
             actual = store.GetTask(task_id)
             if actual.status not in {"queued", "running"}:
-                return actual.result
-            # Preserve known tool effects when the final transaction fails.
-            failure = replace(result, status="failed", final=None, reason=error.code, error_code=error.code)
-            return store.FinishTurn(task_id, failure).result
+                committed = actual
+            else:
+                # Preserve known effects when the final transaction fails.
+                failure = replace(result, status="failed", final=None, reason=error.code, error_code=error.code)
+                committed = store.FinishTurn(task_id, failure)
+        policy = ConfMgr.GetInstance().Memory().Policy("review")
+        if committed.status == "completed" and policy.get("enabled", False) and policy.get("sources"):
+            try:
+                ReviewScheduler.GetInstance().Schedule(committed.request.session_id, store.ReviewThrough(task_id))
+            except DomainError as error:
+                # The reply is already committed; background admission cannot
+                # turn it into a failed task or rewrite its final assistant.
+                logging.getLogger(__name__).warning("Review scheduling failed (%s)", error.code)
+        return committed.result
 
 
 class TaskMgr:

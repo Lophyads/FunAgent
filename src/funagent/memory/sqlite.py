@@ -65,14 +65,16 @@ class SQLiteMemoryStore:
     def _record(self, row):
         return MemoryRecord(MemoryRef(self.source_id, row["record_id"]), self.kind,
                             row["type"], row["content"], f"memory://{self.source_id}/{row['record_id']}",
-                            row["version"], tuple(json.loads(row["evidence"])))
+                            row["version"].removeprefix("deleted:"), tuple(json.loads(row["evidence"])), bool(row["deleted"]))
 
     def Search(self, query, context):
         context.CheckCancelled()
         validate_query(query)
         if (query.source_ids and self.source_id not in query.source_ids) or (query.kind and query.kind != self.kind):
             return MemorySearchResult()
-        clauses, parameters = ["source_id=?", "deleted=0", "instr(search_text,?)>0"], [self.source_id, normalize(query.text)]
+        clauses, parameters = ["source_id=?", "instr(search_text,?)>0"], [self.source_id, normalize(query.text)]
+        if not query.include_deleted:
+            clauses.append("deleted=0")
         if query.types:
             clauses.append("type IN (" + ",".join("?" for _ in query.types) + ")")
             parameters.extend(query.types)
@@ -152,9 +154,20 @@ class SQLiteMemoryStore:
 
     def Delete(self, ref, expected_version, context):
         context.CheckCancelled()
+        if ref.source_id != self.source_id or not text(expected_version):
+            raise DomainError("INVALID_REQUEST", "Invalid memory reference or version")
         with self._connection(context, write=True) as db:
-            self._existing(db, ref, expected_version)
-            db.execute("UPDATE memory_records SET deleted=1,version=? WHERE source_id=? AND record_id=?", (uuid4().hex, self.source_id, ref.record_id))
+            receipt = context.purpose == "review" and bool(context.review_evidence)
+            row = db.execute("SELECT * FROM memory_records WHERE source_id=? AND record_id=?", (ref.source_id, ref.record_id)).fetchone()
+            if (receipt and row is not None and row["deleted"] and row["version"] == "deleted:" + expected_version
+                    and tuple(json.loads(row["evidence"])) == context.review_evidence):
+                return
+            old = self._existing(db, ref, expected_version)
+            # Existing tombstone fields retain a review deletion receipt. This
+            # confirms only the same version and trusted evidence on a retry.
+            db.execute("UPDATE memory_records SET deleted=1,version=?,evidence=? WHERE source_id=? AND record_id=?",
+                       ("deleted:" + expected_version if receipt else uuid4().hex,
+                        json.dumps(context.review_evidence) if receipt else old["evidence"], self.source_id, ref.record_id))
             context.CheckCancelled()
 
     def Close(self):

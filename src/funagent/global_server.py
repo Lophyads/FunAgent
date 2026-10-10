@@ -1,4 +1,4 @@
-"""Startup owns connections; shutdown drains the main worker before closing them."""
+"""Startup owns connections; shutdown drains both workers before closing them."""
 import argparse
 from pathlib import Path
 import sys
@@ -17,6 +17,8 @@ from .interaction import InteractionMgr
 from .memory import MemoryMgr, SQLiteMemoryStore, CallbackMemoryStore
 from .memory.http_query import HTTPMemoryQuery
 from .memory.retrieval import MemorySearchHandler, SEARCH_DEFINITION
+from .memory.review import REVIEW_DEFINITIONS, MemoryWriteHandler, MemoryUpdateHandler, MemoryDeleteHandler
+from .review import ReviewScheduler
 
 
 PROVIDERS = {"demo": DemoProvider, "openai": OpenAIProvider}
@@ -59,6 +61,9 @@ def Start(conf_dir):
             raise DomainError("UNSUPPORTED", "Only CLI mode is currently supported")
         profiles = {}
         pending = [options["model_profile"]]
+        review = conf.Memory().Policy("review")
+        if review.get("enabled", False) and review.get("sources"):
+            pending.append(review["profile"])
         recall = conf.Memory().Policy("recall")
         if recall.get("enabled", True) and recall.get("sources"):
             pending.append(recall["profile"])
@@ -83,13 +88,17 @@ def Start(conf_dir):
                 raise DomainError("DRIVER_UNAVAILABLE", "Selected tool handler is unavailable")
             definitions[name] = ToolDefinition(name, settings.get("description", ""), settings["parameters"])
             handlers[name] = HANDLERS[settings["handler"]]
-        # The internal recall tool is fixed and read-only, even if configuration
-        # grants additional main/review tools in later phases.
+        # Internal memory tool definitions are fixed at startup; strategies
+        # choose which operations each purpose may dispatch.
         if "memory_search" in definitions and (definitions["memory_search"] != SEARCH_DEFINITION or
                                                handlers["memory_search"] is not MemorySearchHandler):
             raise DomainError("CONFIG_INVALID", "The retrieval tool definition is fixed")
         definitions["memory_search"] = SEARCH_DEFINITION
         handlers["memory_search"] = MemorySearchHandler
+        for name, handler in (("memory_write", MemoryWriteHandler), ("memory_update", MemoryUpdateHandler), ("memory_delete", MemoryDeleteHandler)):
+            if name in definitions and (definitions[name] != REVIEW_DEFINITIONS[name] or handlers[name] is not handler):
+                raise DomainError("CONFIG_INVALID", "The review tool definition is fixed")
+            definitions[name], handlers[name] = REVIEW_DEFINITIONS[name], handler
         approval_names = tuple(name for name, settings in conf.Tool().Definitions().items()
                                if settings.get("requires_approval", False))
         ToolMgr.Initialize(definitions, handlers, approval_names=approval_names)
@@ -109,6 +118,8 @@ def Start(conf_dir):
             memories[name] = factory(name, settings, Path(conf_dir).resolve())
         MemoryMgr.Initialize(memories)
         memory_bound = True
+        if review.get("enabled", False) and review.get("sources"):
+            ReviewScheduler.Initialize(review.get("capacity", 16))
         TaskMgr.Initialize(options["capacity"])
         return TaskMgr.GetInstance()
     except Exception as error:
@@ -143,7 +154,7 @@ def Stop():
     except DomainError as failure:
         # Close clears TaskMgr only after its worker has actually exited.
         error = failure
-    for close in (InteractionMgr.Close, MemoryMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
+    for close in (ReviewScheduler.Close, InteractionMgr.Close, MemoryMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
         try:
             close()
         except Exception:

@@ -1,8 +1,9 @@
 """Chat Completions wire adapter and one SDK attempt, with implicit retry disabled."""
 import json
 import os
+from threading import Lock
 
-from ..contracts import ControlError, DomainError, ModelReply, ToolCall, thaw
+from ..contracts import ControlError, DomainError, ModelReply, ToolCall, thaw, controlled_lock
 from .protocols import Adapter, ModelError, ProviderRequest, ProviderResponse
 
 
@@ -65,6 +66,7 @@ class OpenAIProvider:
             raise DomainError("CONFIG_CREDENTIAL", "Model credential environment variable is missing")
         self._openai = openai
         self._closed = False
+        self._lock = Lock()
         client = httpx.Client(transport=transport, timeout=30)
         try:
             self._client = openai.OpenAI(api_key=token, base_url=options.get("base_url"),
@@ -74,6 +76,10 @@ class OpenAIProvider:
             raise DomainError("CONFIG_INVALID", "Invalid model connection configuration") from None
 
     def Send(self, request, context):
+        with controlled_lock(self._lock, context):
+            return self._send(request, context)
+
+    def _send(self, request, context):
         if self._closed:
             raise DomainError("NOT_READY", "Provider closed")
         context.CheckCancelled()
@@ -103,6 +109,7 @@ class OpenAIProvider:
             raise ModelError("PROVIDER_FATAL") from None
 
     def Close(self):
-        if not self._closed:
-            self._client.close()
-            self._closed = True
+        with self._lock:
+            if not self._closed:
+                self._client.close()
+                self._closed = True

@@ -1,4 +1,5 @@
 """Small immutable values shared by configuration, runtime, and tools."""
+from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from threading import Event
@@ -71,6 +72,7 @@ class Message:
     call_id: str | None = None
     status: str | None = None
     effect: str | None = None
+    message_id: int = 0
 
     def __post_init__(self):
         object.__setattr__(self, "calls", tuple(self.calls))
@@ -116,6 +118,7 @@ class RunContext:
     record_scope: "RecordScope | str" = "ephemeral"
     task_id: str = ""
     session_id: str = ""
+    review_evidence: tuple[str, ...] = ()
 
     def CheckCancelled(self):
         if self.cancel.is_set():
@@ -220,3 +223,16 @@ class Interaction:
     kind: str
     prompt: str
     expires_at: float
+
+
+@contextmanager
+def controlled_lock(lock, context):
+    """Connection acquisition spends the same cooperative IO budget."""
+    context.CheckCancelled()
+    while not lock.acquire(timeout=min(0.05, context.Remaining())):
+        context.CheckCancelled()
+    try:
+        context.CheckCancelled()
+        yield
+    finally:
+        lock.release()

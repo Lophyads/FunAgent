@@ -8,6 +8,7 @@ from ..conf import ConfMgr
 from ..contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, RunContext
 from ..session import SessionMgr
 from ..task import TaskMgr
+from ..review import ReviewScheduler
 from ..interaction import InteractionMgr
 from ..memory import MemoryMgr, MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
 from ..memory.retrieval import RecordData
@@ -114,11 +115,14 @@ class CLIController:
             return
         command = parts[0]
         if command == "help" and len(parts) == 1:
-            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | memory search/list/write/update/delete | quit", file=output)
+            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | memory search/list/write/update/delete | quit", file=output)
         elif command == "new":
             title = line.strip().partition(" ")[2].strip() or "New session"
             workspace = ConfMgr.GetInstance().Serv().Options()["workspace"]
             print(SessionMgr.Create(SessionCreate(title, workspace)).session_id, file=output)
+        elif command == "review" and len(parts) == 2:
+            SessionMgr.Load(parts[1])
+            print(json.dumps(dict(ReviewScheduler.GetInstance().GetStatus(parts[1])), ensure_ascii=False), file=output)
         elif command == "sessions" and len(parts) == 1:
             cursor = None
             while True:

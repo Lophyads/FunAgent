@@ -1,5 +1,6 @@
 """Explicit offline demo driver, without network or external effects."""
 from uuid import uuid4
+import json
 from ..contracts import ModelReply, ToolCall, ToolResult
 from .protocols import Adapter, ProviderRequest, ProviderResponse
 
@@ -21,7 +22,16 @@ class DemoProvider:
     def Send(self, request, context):
         context.CheckCancelled()
         message = request.payload.messages[-1]
-        if context.purpose == "recall":
+        if context.purpose == "review":
+            if message.role == "tool":
+                reply = ModelReply("Review complete")
+            else:
+                history = json.loads(message.content)
+                facts = [m for m in history if m["role"] == "user" and m["content"].startswith("remember:") and m["content"][9:].strip()]
+                reply = (ModelReply(calls=tuple(ToolCall(uuid4().hex, "memory_write", {
+                    "source": "facts", "message_ids": [m["message_id"]], "type": "profile", "content": m["content"][9:].strip()})
+                    for m in facts), finish_reason="tool_calls") if facts else ModelReply("No durable facts"))
+        elif context.purpose == "recall":
             if message.role == "user" and message.content.startswith("memory:"):
                 reply = ModelReply(calls=(ToolCall(uuid4().hex, "memory_search", {"text": message.content[7:].strip()}),), finish_reason="tool_calls")
             else:

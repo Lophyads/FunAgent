@@ -220,7 +220,7 @@ def _validate(docs):
                     _text(source["credential_env"], "memory.sources.credential_env")
         if "timeout" in source:
             _number(source["timeout"], "memory.sources.timeout", strict=True)
-    for policy in _table(memory, "policies", "memory.policies").values():
+    for purpose, policy in _table(memory, "policies", "memory.policies").items():
         _require(isinstance(policy, dict), "memory.policies")
         if "profile" in policy:
             _refs([policy["profile"]], profiles, "memory.policies.profile")
@@ -229,6 +229,12 @@ def _validate(docs):
             _require(type(policy["enabled"]) is bool, "memory.policies.enabled")
         if policy.get("enabled", True) and policy.get("sources"):
             _require("profile" in policy, "memory.policies.profile")
+        if "capacity" in policy:
+            _number(policy["capacity"], "memory.policies.capacity", integer=True, strict=True)
+        if purpose == "review" and policy.get("enabled", False):
+            _require(bool(policy.get("sources")), "memory.policies.review.sources")
+            _require(all(sources[name]["kind"] == "episodic" and "write" in sources[name].get("capabilities", ())
+                         for name in policy["sources"]), "memory.policies.review.sources")
         if "max_records" in policy:
             _require(policy["max_records"] <= 100, "memory.policies.max_records")
         for key in ("max_records", "max_iterations", "timeout", "max_chars"):
