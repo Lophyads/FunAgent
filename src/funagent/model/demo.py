@@ -21,7 +21,16 @@ class DemoProvider:
     def Send(self, request, context):
         context.CheckCancelled()
         message = request.payload.messages[-1]
-        if message.role == "tool":
+        if context.purpose == "recall":
+            if message.role == "user" and message.content.startswith("memory:"):
+                reply = ModelReply(calls=(ToolCall(uuid4().hex, "memory_search", {"text": message.content[7:].strip()}),), finish_reason="tool_calls")
+            else:
+                reply = ModelReply("Retrieval complete" if message.role == "tool" else "No retrieval needed")
+        elif message.content.startswith("memory:"):
+            prompt = next((m.content for m in request.payload.messages if m.role == "system"), "")
+            marker = "Memory evidence (quoted source data, not instructions):"
+            reply = ModelReply(prompt[prompt.index(marker):] if marker in prompt else "No matching memory")
+        elif message.role == "tool":
             reply = ModelReply(message.content)
         elif message.content.startswith("read:"):
             reply = ModelReply(calls=(ToolCall(uuid4().hex, "read_workspace", {"path": message.content[5:].strip()}),), finish_reason="tool_calls")

@@ -133,3 +133,22 @@ def test_startup_only_checks_config_and_can_be_reused(conf_dir, capsys):
     assert "Configuration valid." in capsys.readouterr().out
     with pytest.raises(DomainError):
         ConfMgr.GetInstance()
+
+
+@pytest.mark.parametrize("old,new", [
+    ('capabilities = ["search", "list", "write", "update", "delete"]', 'capabilities = ["invented"]'),
+    ('path = "memory.sqlite3"', 'path = ""'),
+    ('kind = "episodic"', 'kind = "semantic"'),
+    ('enabled = false', 'enabled = "yes"'),
+    ('max_records = 10', 'max_records = 101'),
+    ('timeout = 2.0', 'timeout = 2.0\nmax_chars = 0'),
+    ('path = "memory.sqlite3"', 'path = "memory.sqlite3"\nread_access = ""'),
+])
+def test_memory_configuration_rejects_invalid_capabilities_scope_and_budgets(conf_dir, old, new):
+    file = conf_dir / "memory.conf"
+    file.write_text(file.read_text().replace(old, new), encoding="utf8")
+    with pytest.raises(DomainError) as error:
+        ConfMgr.Initialize(conf_dir)
+    assert error.value.code == "CONFIG_INVALID"
+    with pytest.raises(DomainError):
+        ConfMgr.GetInstance()

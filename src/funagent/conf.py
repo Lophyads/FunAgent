@@ -203,7 +203,21 @@ def _validate(docs):
         _require(isinstance(source, dict), "memory.sources")
         _require(source["kind"] in {"semantic", "episodic"}, "memory.sources.kind")
         _text(source["store"], "memory.sources.store")
-        _names(source.get("capabilities", ["search"]), "memory.sources.capabilities")
+        capabilities = _names(source.get("capabilities", ["search"]), "memory.sources.capabilities")
+        _require("search" in capabilities and set(capabilities) <= {"search", "list", "write", "update", "delete"}, "memory.sources.capabilities")
+        for key in ("read_access", "write_access"):
+            if key in source:
+                _text(source[key], f"memory.sources.{key}")
+        if source["store"] == "sqlite":
+            _require(source["kind"] == "episodic", "memory.sources.kind")
+            _text(source["path"], "memory.sources.path")
+        if source["store"] == "callback":
+            _require(source["kind"] == "semantic" and capabilities == ["search"], "memory.sources.capabilities")
+            _text(source["callback_id"], "memory.sources.callback_id")
+            if source["callback_id"] == "http_json":
+                _text(source["endpoint"], "memory.sources.endpoint")
+                if "credential_env" in source:
+                    _text(source["credential_env"], "memory.sources.credential_env")
         if "timeout" in source:
             _number(source["timeout"], "memory.sources.timeout", strict=True)
     for policy in _table(memory, "policies", "memory.policies").values():
@@ -211,7 +225,13 @@ def _validate(docs):
         if "profile" in policy:
             _refs([policy["profile"]], profiles, "memory.policies.profile")
         _refs(_names(policy.get("sources", []), "memory.policies.sources"), sources, "memory.policies.sources")
-        for key in ("max_records", "max_iterations", "timeout"):
+        if "enabled" in policy:
+            _require(type(policy["enabled"]) is bool, "memory.policies.enabled")
+        if policy.get("enabled", True) and policy.get("sources"):
+            _require("profile" in policy, "memory.policies.profile")
+        if "max_records" in policy:
+            _require(policy["max_records"] <= 100, "memory.policies.max_records")
+        for key in ("max_records", "max_iterations", "timeout", "max_chars"):
             if key in policy:
                 _number(policy[key], f"memory.policies.{key}", strict=True, integer=key != "timeout")
     log_options = _table(log, "options", "log.options", required=True)

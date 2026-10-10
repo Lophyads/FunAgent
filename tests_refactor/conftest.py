@@ -65,6 +65,8 @@ def task_app(assemble, tmp_path):
         runtime, spy = assemble(provider, handler=handler)
         store = SQLiteStore(tmp_path / "app.sqlite3")
         DbMgr.Initialize(store)
+        from funagent.memory import MemoryMgr, SQLiteMemoryStore
+        MemoryMgr.Initialize({"facts": SQLiteMemoryStore(tmp_path / "memory.sqlite3")})
         InteractionMgr.Initialize()
         TaskMgr.Initialize(capacity)
         return TaskMgr.GetInstance(), store, SessionMgr.Create(SessionCreate()), spy

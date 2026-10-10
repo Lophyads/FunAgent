@@ -1,12 +1,16 @@
 """Commands use application APIs; execution stays on the main worker."""
 from threading import Event
+from uuid import uuid4
+import json
 import sys
 
 from ..conf import ConfMgr
-from ..contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery
+from ..contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, RunContext
 from ..session import SessionMgr
 from ..task import TaskMgr
 from ..interaction import InteractionMgr
+from ..memory import MemoryMgr, MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
+from ..memory.retrieval import RecordData
 
 
 class CLIController:
@@ -35,9 +39,64 @@ class CLIController:
                                             task_id=request.task_id, run_id=request.run_id)
 
     @staticmethod
+    def _memory(line, output):
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 3:
+            raise DomainError("INVALID_REQUEST", "Use memory search/list/write/update/delete with a source")
+        _, operation, rest = parts
+        sources = ConfMgr.GetInstance().Memory().Sources()
+        # CLI is a local administrative entry; grants come from trusted config.
+        access = frozenset(token for name, settings in sources.items() for token in (
+            settings.get("read_access", f"memory.{name}.read"), settings.get("write_access", f"memory.{name}.write")))
+        context = RunContext(run_id=uuid4().hex, purpose="management", access=access)
+        manager = MemoryMgr.GetInstance()
+        if operation == "search":
+            fields = rest.split(maxsplit=1)
+            if len(fields) != 2:
+                raise DomainError("INVALID_REQUEST", "Use memory search <source|*> <text>")
+            source, query = fields
+            result = manager.Search(MemoryQuery(query, () if source == "*" else (source,)), context)
+            value = {"records": [RecordData(r) for r in result.records], "source_status": dict(result.source_status), "warnings": result.warnings}
+        elif operation == "list":
+            fields = rest.split()
+            if len(fields) not in {1, 2}:
+                raise DomainError("INVALID_REQUEST", "Use memory list <source> [type]")
+            # Stream all pages through the same stable Store cursor.
+            records, cursor = [], None
+            while True:
+                page = manager.List(MemoryListQuery(fields[0], fields[1] if len(fields) == 2 else None, cursor=cursor), context)
+                records.extend(RecordData(r) for r in page.items)
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+            value = {"records": records}
+        elif operation == "write":
+            fields = rest.split(maxsplit=2)
+            if len(fields) != 3:
+                raise DomainError("INVALID_REQUEST", "Use memory write <source> <type> <content>")
+            action = "cli:" + context.run_id
+            value = RecordData(manager.Write(MemoryDraft(fields[0], fields[2], action, (action,), fields[1]), context))
+        elif operation == "update":
+            fields = rest.split(maxsplit=3)
+            if len(fields) != 4:
+                raise DomainError("INVALID_REQUEST", "Use memory update <source> <record_id> <version> <content>")
+            value = RecordData(manager.Update(MemoryRef(fields[0], fields[1]), MemoryPatch(fields[3], ("cli:" + context.run_id,)), fields[2], context))
+        elif operation == "delete":
+            fields = rest.split()
+            if len(fields) != 3:
+                raise DomainError("INVALID_REQUEST", "Use memory delete <source> <record_id> <version>")
+            manager.Delete(MemoryRef(fields[0], fields[1]), fields[2], context)
+            value = {"deleted": True}
+        else:
+            raise DomainError("INVALID_REQUEST", "Unknown memory command")
+        print(json.dumps(value, ensure_ascii=False), file=output)
+
+    @staticmethod
     def Execute(line, output=None, read_answer=None):
         output = output or sys.stdout
         read_answer = read_answer or input
+        if line.strip().split(maxsplit=1)[:1] == ["memory"]:
+            return CLIController._memory(line, output)
         answer_parts = line.strip().split(maxsplit=3)
         if answer_parts and answer_parts[0] == "answer":
             if len(answer_parts) != 4:
@@ -55,7 +114,7 @@ class CLIController:
             return
         command = parts[0]
         if command == "help" and len(parts) == 1:
-            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | quit", file=output)
+            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | memory search/list/write/update/delete | quit", file=output)
         elif command == "new":
             title = line.strip().partition(" ")[2].strip() or "New session"
             workspace = ConfMgr.GetInstance().Serv().Options()["workspace"]

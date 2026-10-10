@@ -12,6 +12,8 @@ from ..model import ModelRuntime, ModelStrategy, FallbackRule
 from ..persistence import DbMgr
 from ..session import SessionMgr
 from ..interaction import InteractionMgr
+from ..memory import MemoryMgr, MemoryPrepareRequest
+from ..memory.retrieval import Evidence, SelectEvidence
 
 
 class MainStrategy(ModelStrategy):
@@ -46,11 +48,21 @@ class TaskProcess:
                 SessionMgr.FreezePrompt(session.session_id, prompt)
             context.CheckCancelled()
             snapshot = store.BeginTurn(task_id)
+            memory_conf = ConfMgr.GetInstance().Memory()
+            policy = memory_conf.Policy("recall")
+            access = {"workspace.read"}
+            for name in policy.get("sources", ()):
+                access.add(memory_conf.Sources()[name].get("read_access", f"memory.{name}.read"))
             context = replace(context, session_id=session.session_id, workspace=session.workspace,
-                              access=frozenset({"workspace.read"}),
-                              record_scope=RecordScope("main_history", task_id))
-            # Prepare is disabled until P4. BeginTurn already contains this user.
-            result = ModelRuntime.GetInstance().Run(RunInput(snapshot.messages, snapshot.session.prompt), MainStrategy, context)
+                              access=frozenset(access), record_scope=RecordScope("main_history", task_id))
+            memory = MemoryMgr.GetInstance()
+            profile = memory.GetProfile(context)
+            recalled = memory.Prepare(MemoryPrepareRequest(task.request.text), context)
+            records, _ = SelectEvidence((*profile, *recalled.records), policy.get("max_records", 10), policy.get("max_chars", 16000))
+            evidence = Evidence(records)
+            # BeginTurn already contains this user; only this Run sees evidence.
+            result = ModelRuntime.GetInstance().Run(RunInput(snapshot.messages, snapshot.session.prompt,
+                                                          (evidence,) if evidence else ()), MainStrategy, context)
         except ControlError as error:
             result = RunResult("cancelled", reason=error.code)
         except DomainError as error:
