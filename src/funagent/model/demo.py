@@ -23,6 +23,10 @@ class DemoProvider:
         message = request.payload.messages[-1]
         if message.role == "tool":
             reply = ModelReply(message.content)
+        elif message.content.startswith("read:"):
+            reply = ModelReply(calls=(ToolCall(uuid4().hex, "read_workspace", {"path": message.content[5:].strip()}),), finish_reason="tool_calls")
+        elif message.content.startswith("ask:"):
+            reply = ModelReply(calls=(ToolCall(uuid4().hex, "ask_user", {"prompt": message.content[4:].strip()}),), finish_reason="tool_calls")
         elif message.content.startswith("tool:"):
             reply = ModelReply(calls=(ToolCall(uuid4().hex, "echo", {"value":message.content[5:].strip()}),), finish_reason="tool_calls")
         else:

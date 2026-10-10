@@ -210,3 +210,13 @@ class HistoryQuery(PageQuery):
 class Page:
     items: tuple
     next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class Interaction:
+    interaction_id: str
+    task_id: str
+    run_id: str
+    kind: str
+    prompt: str
+    expires_at: float

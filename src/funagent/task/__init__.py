@@ -11,6 +11,7 @@ from ..contracts import (CancelResult, ControlError, DomainError, RecordScope,
 from ..model import ModelRuntime, ModelStrategy, FallbackRule
 from ..persistence import DbMgr
 from ..session import SessionMgr
+from ..interaction import InteractionMgr
 
 
 class MainStrategy(ModelStrategy):
@@ -46,6 +47,7 @@ class TaskProcess:
             context.CheckCancelled()
             snapshot = store.BeginTurn(task_id)
             context = replace(context, session_id=session.session_id, workspace=session.workspace,
+                              access=frozenset({"workspace.read"}),
                               record_scope=RecordScope("main_history", task_id))
             # Prepare is disabled until P4. BeginTurn already contains this user.
             result = ModelRuntime.GetInstance().Run(RunInput(snapshot.messages, snapshot.session.prompt), MainStrategy, context)
@@ -140,6 +142,7 @@ class TaskMgr:
             if task.status not in {"queued", "running"} or context is None:
                 return CancelResult(task_id, task.status, False)
             context.cancel.set()
+            InteractionMgr.CancelTask(task_id)
             if self._running != task_id:
                 task = DbMgr.GetInstance().FinishTurn(task_id, RunResult("cancelled", reason="CANCELLED"))
                 if task_id in self._queue:
@@ -175,6 +178,7 @@ class TaskMgr:
                         for pending in self._contexts.values():
                             pending.cancel.set()
             finally:
+                InteractionMgr.CancelTask(task_id)
                 with self._condition:
                     if committed:
                         self._contexts.pop(task_id, None)

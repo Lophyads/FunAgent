@@ -1,12 +1,23 @@
 """Stateless session use cases; snapshots always come from the Store."""
+from dataclasses import replace
+from pathlib import Path
+
 from .persistence import DbMgr
-from .contracts import PageQuery, HistoryQuery
+from .contracts import DomainError, SessionCreate, PageQuery, HistoryQuery
 
 
 class SessionMgr:
     @staticmethod
     def Create(request):
-        return DbMgr.GetInstance().CreateSession(request)
+        if not isinstance(request, SessionCreate) or not isinstance(request.workspace, str) or not request.workspace.strip():
+            raise DomainError("INVALID_REQUEST", "Invalid session workspace")
+        try:
+            workspace = Path(request.workspace).resolve(strict=True)
+            if not workspace.is_dir():
+                raise ValueError
+        except (OSError, ValueError, RuntimeError):
+            raise DomainError("INVALID_REQUEST", "Session workspace must be an existing directory") from None
+        return DbMgr.GetInstance().CreateSession(replace(request, workspace=str(workspace)))
 
     @staticmethod
     def Load(session_id):

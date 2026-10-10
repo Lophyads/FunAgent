@@ -9,6 +9,7 @@ from types import MappingProxyType
 import tomllib
 
 from .contracts import DomainError, freeze
+from .schema import ToolValidator
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,9 @@ def _validate(docs):
         _require(isinstance(definition, dict), "tool.definitions")
         _text(definition["handler"], "tool.definitions.handler")
         _require(isinstance(definition["parameters"], dict), "tool.definitions.parameters")
+        ToolValidator(definition["parameters"])
+        if "requires_approval" in definition:
+            _require(type(definition["requires_approval"]) is bool, "tool.definitions.requires_approval")
         if "backend_id" in definition:
             _refs([definition["backend_id"]], backends, "tool.definitions.backend_id")
     for names in _table(tool, "purposes", "tool.purposes").values():
@@ -223,7 +227,7 @@ def _validate(docs):
     for key in ("host", "workspace", "database"):
         _text(serv_options[key], f"serv.options.{key}")
     _refs([serv_options["model_profile"]], profiles, "serv.options.model_profile")
-    for key in ("max_iterations", "task_timeout"):
+    for key in ("max_iterations", "task_timeout", "interaction_timeout"):
         if key in serv_options:
             _number(serv_options[key], f"serv.options.{key}", strict=True, integer=key == "max_iterations")
     if "system_prompt" in serv_options:

@@ -11,11 +11,14 @@ from .model.openai_chat import OpenAIChatAdapter, OpenAIProvider
 from .persistence import DbMgr, SQLiteStore
 from .task import TaskMgr
 from .tool import ToolMgr
+from .tool.workspace import ReadWorkspaceHandler
+from .tool.human import AskUserHandler
+from .interaction import InteractionMgr
 
 
 PROVIDERS = {"demo": DemoProvider, "openai": OpenAIProvider}
 ADAPTERS = {"demo": DemoAdapter, "openai_chat": OpenAIChatAdapter}
-HANDLERS = {"echo": EchoHandler}
+HANDLERS = {"echo": EchoHandler, "read_workspace": ReadWorkspaceHandler, "ask_user": AskUserHandler}
 
 
 def Initialize(conf_dir):
@@ -32,7 +35,7 @@ def Start(conf_dir):
     try:
         options = conf.Serv().Options()
         if options["mode"] != "cli":
-            raise DomainError("UNSUPPORTED", "Only CLI mode is available in P2")
+            raise DomainError("UNSUPPORTED", "Only CLI mode is currently supported")
         profiles = {}
         pending = [options["model_profile"]]
         while pending:
@@ -56,7 +59,10 @@ def Start(conf_dir):
                 raise DomainError("DRIVER_UNAVAILABLE", "Selected tool handler is unavailable")
             definitions[name] = ToolDefinition(name, settings.get("description", ""), settings["parameters"])
             handlers[name] = HANDLERS[settings["handler"]]
-        ToolMgr.Initialize(definitions, handlers)
+        approval_names = tuple(name for name, settings in conf.Tool().Definitions().items()
+                               if settings.get("requires_approval", False))
+        ToolMgr.Initialize(definitions, handlers, approval_names=approval_names)
+        InteractionMgr.Initialize(options.get("interaction_timeout", 120))
         ModelRuntime.Initialize(profiles, providers, ADAPTERS)
         bound = True
         database = Path(options["database"])
@@ -93,7 +99,7 @@ def Stop():
     except DomainError as failure:
         # Close clears TaskMgr only after its worker has actually exited.
         error = failure
-    for close in (DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
+    for close in (InteractionMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
         try:
             close()
         except Exception:

@@ -13,6 +13,7 @@ dependencies = [
   "portalocker>=2.7,<5",
   "openai>=2.0,<3",
   "pydantic>=2.11,<3",
+  "jsonschema>=4.18,<5",
   "python-dotenv>=1.1,<2",
   "ddgs>=9,<10",
   "pypdf>=5,<7",
@@ -25,7 +26,6 @@ supabase = ["supabase>=2.32,<3"]
 mcp = [
   "mcp>=2.2,<3",
   "httpx2>=2.7,<3",
-  "jsonschema>=4.18,<5",
 ]
 dev = [
   "pytest>=8.4,<10",

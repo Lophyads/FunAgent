@@ -57,6 +57,7 @@ def assemble(conf_dir):
 def task_app(assemble, tmp_path):
     from funagent.persistence import DbMgr, SQLiteStore
     from funagent.task import TaskMgr
+    from funagent.interaction import InteractionMgr
     from funagent.session import SessionMgr
     from funagent.contracts import SessionCreate
 
@@ -64,12 +65,14 @@ def task_app(assemble, tmp_path):
         runtime, spy = assemble(provider, handler=handler)
         store = SQLiteStore(tmp_path / "app.sqlite3")
         DbMgr.Initialize(store)
+        InteractionMgr.Initialize()
         TaskMgr.Initialize(capacity)
         return TaskMgr.GetInstance(), store, SessionMgr.Create(SessionCreate()), spy
     try:
         yield bind
     finally:
         TaskMgr.Close()
+        InteractionMgr.Close()
         DbMgr.Close()
 
 
