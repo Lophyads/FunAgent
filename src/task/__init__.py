@@ -46,7 +46,7 @@ class TaskProcess:
             task = store.GetTask(task_id)
             session = SessionMgr.Load(task.request.session_id).session
             if session.prompt is None:
-                prompt = ConfMgr.GetInstance().Serv().Options().get("system_prompt", "You are FunAgent, a helpful assistant.")
+                prompt = ConfMgr.GetInstance().Serv().Options().get("system_prompt", "You are a helpful assistant.")
                 SessionMgr.FreezePrompt(session.session_id, prompt)
             context.CheckCancelled()
             snapshot = store.BeginTurn(task_id)
