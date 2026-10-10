@@ -3,9 +3,9 @@
 将 `model.conf` 的 `your-model-name` 替换为所用端点支持的模型名称；如使用兼容 Chat Completions 的端点，修改 `base_url`。`credential_env` 声明已有的凭据环境变量名，配置文件不保存密钥。
 
 ```powershell
-$env:PYTHONPATH = "src"
-& E:\FunAgent\.venv\Scripts\python.exe -m funagent --conf-dir examples/refactor-openai --check-config
-& E:\FunAgent\.venv\Scripts\python.exe -m funagent --conf-dir examples/refactor-openai
+uv sync --extra openai
+uv run --extra openai funagent --conf-dir examples/refactor-openai --check-config
+uv run --extra openai funagent --conf-dir examples/refactor-openai
 ```
 
 命令用法与 `../refactor-cli/README.md` 相同。只有启动所选真实驱动时才导入 SDK、解析凭据；缺凭据会清理已建资源并报 `CONFIG_CREDENTIAL`。离线 demo 和纯配置校验不要求真实凭据。

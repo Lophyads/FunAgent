@@ -109,7 +109,7 @@ class ReviewScheduler:
                 self._running = None
                 self._condition.notify_all()
 
-    def Stop(self):
+    def RequestStop(self):
         with self._condition:
             self._accepting = False
             for job in self._pending.values():
@@ -119,4 +119,7 @@ class ReviewScheduler:
             if self._running:
                 self._running[1].cancel.set()
             self._condition.notify_all()
+
+    def Stop(self):
+        self.RequestStop()
         self._worker.join()

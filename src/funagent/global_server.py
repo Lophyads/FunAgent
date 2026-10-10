@@ -136,7 +136,10 @@ def Start(conf_dir):
                 except Exception:
                     pass
         if store is not None and not database_bound:
-            store.Close()
+            try:
+                store.Close()
+            except Exception:
+                pass
         if not bound:
             for provider in providers.values():
                 try:
@@ -154,17 +157,38 @@ def Start(conf_dir):
 
 def Stop():
     global _http_server
+    # Signal both queues before joining either worker: they share connections.
+    for resource in (TaskMgr, ReviewScheduler):
+        try:
+            instance = resource.GetInstance()
+        except DomainError as failure:
+            if failure.code != "NOT_READY":
+                raise
+        else:
+            instance.RequestStop()
     if _http_server is not None:
-        _http_server.Close()
+        try:
+            _http_server.Close()
+        except Exception:
+            # HTTP handlers can still borrow application state; retain ownership.
+            raise DomainError("CLOSE_FAILED", "HTTP server close failed") from None
         _http_server = None
-    # TaskMgr.Close waits for actual synchronous IO to return.
     error = None
-    try:
-        TaskMgr.Close()
-    except DomainError as failure:
-        # Close clears TaskMgr only after its worker has actually exited.
-        error = failure
-    for close in (ReviewScheduler.Close, InteractionMgr.Close, MemoryMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
+    for close in (TaskMgr.Close, ReviewScheduler.Close):
+        try:
+            close()
+        except Exception as failure:
+            error = failure if isinstance(failure, DomainError) else DomainError("CLOSE_FAILED", "Worker drain failed")
+    # A failed join must never release connections still borrowed by a worker.
+    for resource in (TaskMgr, ReviewScheduler):
+        try:
+            resource.GetInstance()
+        except DomainError as failure:
+            if failure.code != "NOT_READY":
+                raise
+        else:
+            raise error or DomainError("CLOSE_FAILED", "Application worker is still running")
+    for close in (InteractionMgr.Close, MemoryMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
         try:
             close()
         except Exception:

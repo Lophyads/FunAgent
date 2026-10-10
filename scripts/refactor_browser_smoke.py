@@ -1,4 +1,4 @@
-"""Run a real Chromium P6 smoke with temporary SQLite/config and bounded cleanup.
+"""Run a real Chromium installed/source smoke with temporary SQLite/config and bounded cleanup.
 
 Requires Node and Playwright separately from the production Python package.
 """
@@ -11,18 +11,6 @@ import tempfile
 import threading
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from funagent import global_server
-from funagent.model.demo import DemoProvider
-from funagent.model import ModelError
-
-
-class SmokeProvider(DemoProvider):
-    def Send(self, request, context):
-        if context.purpose == "main" and request.payload.messages[-1].content.startswith("fail:"):
-            raise ModelError("AUTH")
-        return super().Send(request, context)
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -30,15 +18,29 @@ def main():
     parser.add_argument("--playwright", default="playwright")
     parser.add_argument("--browser", required=True)
     parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--installed", action="store_true", help="Use the installed package without adding checkout src")
     args = parser.parse_args()
+    if not args.installed:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from funagent import global_server
+    from funagent.model.demo import DemoProvider
+    from funagent.model import ModelError
+
+    class SmokeProvider(DemoProvider):
+        def Send(self, request, context):
+            if context.purpose == "main" and request.payload.messages[-1].content.startswith("fail:"):
+                raise ModelError("AUTH")
+            return super().Send(request, context)
+
+    print(f"Application package: {Path(global_server.__file__).resolve()}", flush=True)
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(prefix="funagent-p6-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="funagent-browser-") as temporary:
         conf = Path(temporary) / "conf"
         shutil.copytree(root / "examples/refactor-review", conf)
         workspace = Path(temporary) / "workspace"
         workspace.mkdir()
-        (workspace / "note.txt").write_text("P6 actual workspace read", encoding="utf8")
+        (workspace / "note.txt").write_text("FunAgent actual workspace read", encoding="utf8")
         with socket.socket() as reserve:
             reserve.bind(("127.0.0.1", 0))
             port = reserve.getsockname()[1]

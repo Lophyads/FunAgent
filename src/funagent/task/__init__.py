@@ -209,18 +209,24 @@ class TaskMgr:
                     self._running = None
                     self._condition.notify_all()
 
-    def Stop(self):
-        error = None
+    def RequestStop(self):
+        """Stop admission and wake cancellation without waiting on borrowed IO."""
         with self._condition:
             self._accepting = False
-            for context in self._contexts.values():
+            for task_id, context in self._contexts.items():
                 context.cancel.set()
+                InteractionMgr.CancelTask(task_id)
+            self._condition.notify_all()
+
+    def Stop(self):
+        self.RequestStop()
+        error = None
+        with self._condition:
             for task_id in tuple(self._contexts):
                 try:
                     self.Cancel(task_id)
                 except Exception as failure:
                     error = failure if isinstance(failure, DomainError) else DomainError("STORAGE", "Task shutdown persistence failed")
-            self._condition.notify_all()
         self._worker.join()
         if self._contexts and error is None:
             error = DomainError("STORAGE", "Unresolved tasks require startup repair")

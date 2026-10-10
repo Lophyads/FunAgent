@@ -16,9 +16,6 @@ docs/
 logs/
 .correlation-key
 .funagent/
-*.approvals.lock
-examples/
-agentcore.toml
 
 *.sqlite3
 *.sqlite3-shm

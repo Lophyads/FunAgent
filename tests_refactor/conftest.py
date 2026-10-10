@@ -22,6 +22,18 @@ def close_resources():
     finally:
         from funagent.global_server import Stop
         Stop()
+        from threading import enumerate as threads
+        from funagent.contracts import DomainError
+        from funagent.persistence import DbMgr
+        from funagent.task import TaskMgr
+        from funagent.interaction import InteractionMgr
+        from funagent.memory import MemoryMgr
+        from funagent.review import ReviewScheduler
+        for resource in (ConfMgr, DbMgr, ModelRuntime, ToolMgr, TaskMgr, InteractionMgr, MemoryMgr, ReviewScheduler):
+            with pytest.raises(DomainError) as error:
+                resource.GetInstance()
+            assert error.value.code == "NOT_READY"
+        assert not any(t.name.startswith("funagent-") for t in threads())
 
 
 @pytest.fixture

@@ -3,47 +3,27 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fun-agent-core"
-version = "0.1.0"
-description = "A small, durable agent loop inspired by Hermes Agent"
+name = "funagent"
+version = "0.2.0"
+description = "A single-process agent with durable tasks, shared memory, CLI and browser access"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = [
-  "concurrent-log-handler>=0.9,<1",
-  "portalocker>=2.7,<5",
-  "openai>=2.0,<3",
-  "pydantic>=2.11,<3",
-  "jsonschema>=4.18,<5",
-  "python-dotenv>=1.1,<2",
-  "ddgs>=9,<10",
-  "pypdf>=5,<7",
-  "tomlkit>=0.13,<1",
-  "tzdata>=2025.3; sys_platform == 'win32'",
-]
+dependencies = ["jsonschema>=4.18,<5"]
 
 [project.optional-dependencies]
-supabase = ["supabase>=2.32,<3"]
-mcp = [
-  "mcp>=2.2,<3",
-  "httpx2>=2.7,<3",
-]
-dev = [
-  "pytest>=8.4,<10",
-  "pytest-asyncio>=1.1,<2",
-]
+openai = ["openai>=2.0,<3"]
+dev = ["pytest>=8.4,<10"]
 
 [project.scripts]
-agentcore = "agentcore.cli:main"
 funagent = "funagent.global_server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/funagent", "src/agentcore", "src/gateway", "src/log", "src/tools", "src/memory", "src/knowledge"]
+packages = ["src/funagent"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/funagent", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/architecture/p7-implementation.md", "/pyproject.toml", "/uv.lock"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
-asyncio_mode = "auto"
 testpaths = ["tests_refactor"]
 pythonpath = ["src"]
-markers = [
-  "multiprocess: Windows spawn-based persistence and lease tests",
-]
