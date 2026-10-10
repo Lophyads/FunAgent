@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 from .conf import ConfMgr
+from .api.http import HttpServer
 from .contracts import DomainError, ToolDefinition
 from .model import ModelRuntime
 from .model.demo import DemoAdapter, DemoProvider, EchoHandler
@@ -26,6 +27,9 @@ ADAPTERS = {"demo": DemoAdapter, "openai_chat": OpenAIChatAdapter}
 HANDLERS = {"echo": EchoHandler, "read_workspace": ReadWorkspaceHandler, "ask_user": AskUserHandler,
             "memory_search": MemorySearchHandler}
 MEMORY_QUERIES = {"http_json": HTTPMemoryQuery}
+
+# The entry owns one HTTP listener; controllers share the business managers.
+_http_server = None
 
 
 def _sqlite_memory(source_id, settings, conf_dir):
@@ -50,6 +54,7 @@ def Initialize(conf_dir):
 
 
 def Start(conf_dir):
+    global _http_server
     conf = Initialize(conf_dir)
     providers, bound = {}, False
     store = None
@@ -57,8 +62,6 @@ def Start(conf_dir):
     memories, memory_bound = {}, False
     try:
         options = conf.Serv().Options()
-        if options["mode"] != "cli":
-            raise DomainError("UNSUPPORTED", "Only CLI mode is currently supported")
         profiles = {}
         pending = [options["model_profile"]]
         review = conf.Memory().Policy("review")
@@ -121,6 +124,9 @@ def Start(conf_dir):
         if review.get("enabled", False) and review.get("sources"):
             ReviewScheduler.Initialize(review.get("capacity", 16))
         TaskMgr.Initialize(options["capacity"])
+        if options["mode"] in {"web", "both"}:
+            _http_server = HttpServer(options["host"], options["port"])
+            _http_server.Start()
         return TaskMgr.GetInstance()
     except Exception as error:
         if not memory_bound:
@@ -147,6 +153,10 @@ def Start(conf_dir):
 
 
 def Stop():
+    global _http_server
+    if _http_server is not None:
+        _http_server.Close()
+        _http_server = None
     # TaskMgr.Close waits for actual synchronous IO to return.
     error = None
     try:
@@ -175,8 +185,14 @@ def main(argv=None):
             print("Configuration valid.")
         else:
             Start(args.conf_dir)
-            from .api.cli import CLIController
-            result = CLIController.Run()
+            mode = ConfMgr.GetInstance().Serv().Options()["mode"]
+            if _http_server is not None:
+                print(f"FunAgent Web: {_http_server.url}", flush=True)
+            if mode in {"cli", "both"}:
+                from .api.cli import CLIController
+                result = CLIController.Run()
+            else:
+                _http_server.Wait()
     except DomainError as error:
         print(f"{error.code}: {error}", file=sys.stderr)
         result = 1

@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>FunAgent</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><header><strong>FunAgent</strong><span>会话与任务</span></header><main>
+<aside><form id="new-session"><label for="title">新会话标题</label><input id="title" maxlength="200" placeholder="新会话" value="新会话"><button>新建会话</button></form><label for="sessions">选择会话</label><select id="sessions"><option value="">请选择会话</option></select><button id="refresh">刷新会话</button></aside>
+<section><h1 id="heading">开始一个会话</h1><div id="notice" role="alert"></div><div id="history" aria-label="会话历史"></div>
+<div id="task" role="status"></div><button id="cancel" hidden>取消任务</button><div id="interactions"></div>
+<form id="submit"><label for="message">消息</label><textarea id="message" rows="3" maxlength="16000" required placeholder="输入消息；离线演示可用 tool:、ask:、read:、remember:、memory:"></textarea><button id="send" disabled>发送</button></form></section></main></body></html>

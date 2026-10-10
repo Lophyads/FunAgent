@@ -1,0 +1,16 @@
+:root { font-family: system-ui, sans-serif; color: #24324a; background: #f4f6fa; }
+* { box-sizing: border-box; }
+body { margin: 0; } header { background: #24324a; color: white; padding: 18px 28px; display: flex; gap: 24px; align-items: center; }
+header strong { font-size: 24px; } header span { color: #ccd6e8; }
+main { display: grid; grid-template-columns: 250px minmax(0, 850px); gap: 24px; max-width: 1200px; margin: 24px auto; padding: 0 20px; }
+aside, section { background: white; border: 1px solid #dfe5ee; border-radius: 12px; padding: 20px; }
+label { display: block; margin: 12px 0 6px; font-weight: 600; }
+input, select, textarea, button { font: inherit; border-radius: 6px; padding: 10px; }
+input, select, textarea { width: 100%; border: 1px solid #bfcade; }
+textarea { resize: vertical; } button { cursor: pointer; border: 0; background: #315fce; color: white; margin-top: 10px; }
+button:disabled { opacity: .5; cursor: default; } #cancel { background: #8e4050; } h1 { margin: 0 0 18px; font-size: 22px; }
+#notice { color: #a22c3d; white-space: pre-wrap; } #task { margin: 16px 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #52647e; }
+#history { max-height: 55vh; overflow-y: auto; } article { border-bottom: 1px solid #e8edf5; padding: 14px 0; } article strong { color: #52647e; font-size: 13px; }
+article pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 6px 0; }
+.interaction { border: 1px solid #cfb47c; background: #fff9ed; padding: 14px; border-radius: 8px; margin: 12px 0; } .interaction p { white-space: pre-wrap; } .interaction button { margin-right: 8px; }
+@media (max-width: 720px) { main { grid-template-columns: 1fr; } #history { max-height: 45vh; } }
