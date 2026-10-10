@@ -214,7 +214,7 @@ def _execute_evaluation(
 
     from src.core.settings import load_settings
     from src.libs.evaluator.evaluator_factory import EvaluatorFactory
-    from src.observability.evaluation.eval_runner import EvalRunner, load_test_set
+    from src.observability.evaluation.eval_runner import EvalRunner
 
     settings = load_settings()
 
@@ -231,19 +231,8 @@ def _execute_evaluation(
 
     evaluator = EvaluatorFactory.create(settings_with_override)
 
-    # Try to create HybridSearch (optional – works without if not configured)
     target_collection = collection or "default"
-    hybrid_search = _try_create_hybrid_search(settings, target_collection)
-
-    # Create reranker if enabled
-    reranker = None
-    try:
-        from src.core.query_engine.reranker import create_core_reranker
-        reranker = create_core_reranker(settings=settings)
-        if not reranker.is_enabled:
-            reranker = None
-    except Exception as exc:
-        logger.warning("Could not create reranker: %s", exc)
+    hybrid_search = _create_search(settings, target_collection)
 
     # Build answer_override map: index → user-provided answer text
     # EvalRunner will use these instead of auto-generating from chunks.
@@ -252,60 +241,18 @@ def _execute_evaluation(
         hybrid_search=hybrid_search,
         evaluator=evaluator,
         answer_overrides=user_answers,
-        reranker=reranker,
     )
 
-    report = runner.run(
-        test_set_path=golden_path,
-        top_k=top_k,
-        collection=collection,
-    )
-
-    return report.to_dict()
-
-
-def _try_create_hybrid_search(settings: Any, collection: str = "default") -> Any:
-    """Attempt to create a HybridSearch instance.
-
-    Returns None if required dependencies are not available
-    (e.g., no indexed data).
-    """
     try:
-        from src.core.query_engine.query_processor import QueryProcessor
-        from src.core.query_engine.hybrid_search import create_hybrid_search
-        from src.core.query_engine.dense_retriever import create_dense_retriever
-        from src.core.query_engine.sparse_retriever import create_sparse_retriever
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
-        from src.libs.embedding.embedding_factory import EmbeddingFactory
-        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
+        report = runner.run(test_set_path=golden_path, top_k=top_k, collection=target_collection)
+        return report.to_dict()
+    finally:
+        hybrid_search.close()
 
-        vector_store = VectorStoreFactory.create(
-            settings, collection_name=collection,
-        )
-        embedding_client = EmbeddingFactory.create(settings)
-        dense_retriever = create_dense_retriever(
-            settings=settings,
-            embedding_client=embedding_client,
-            vector_store=vector_store,
-        )
-        bm25_indexer = BM25Indexer(index_dir=f"data/db/bm25/{collection}")
-        sparse_retriever = create_sparse_retriever(
-            settings=settings,
-            bm25_indexer=bm25_indexer,
-            vector_store=vector_store,
-        )
-        sparse_retriever.default_collection = collection
 
-        query_processor = QueryProcessor()
-        return create_hybrid_search(
-            settings=settings,
-            query_processor=query_processor,
-            dense_retriever=dense_retriever,
-            sparse_retriever=sparse_retriever,
-        )
-    except Exception as exc:
-        logger.warning("Could not create HybridSearch: %s", exc)
-        return None
+def _create_search(settings, collection="default"):
+    from src.core.query_engine.query_entrypoint import StructuredSearchAdapter
+    return StructuredSearchAdapter(settings, collection)
 
 
 def _render_aggregate_metrics(report: Dict[str, Any]) -> None:

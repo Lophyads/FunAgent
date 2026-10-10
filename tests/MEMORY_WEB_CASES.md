@@ -1,6 +1,6 @@
 **Web 对话与记忆链路测试用例**
 
-自动化用例位于 `tests/test_web_memory_flow.py`，通过前端使用的真实 HTTP 接口发起对话，执行真实 Agent、后台复盘、memory 工具及临时 SQLite 数据库；仅主模型和复盘模型的回复使用现有 ScriptedTransport。
+自动化用例位于 `tests/test_web_memory_flow.py`，通过前端使用的真实 HTTP 接口发起对话，执行真实 Agent、后台复盘、自动事实召回及临时 SQLite 数据库；主模型、规划器和复盘模型使用离线回复。`tests/test_memory.py` 补充预算、中断、重试和恢复覆盖。
 
 **运行自动化测试**
 
@@ -12,7 +12,7 @@ uv run --extra dev pytest tests/test_web_memory_flow.py
 相关回归测试：
 
 ```powershell
-uv run --extra dev pytest tests/test_web_memory_flow.py tests/test_loop_persistence.py tests/test_memory_store.py
+uv run --extra dev pytest tests/test_web_memory_flow.py tests/test_memory.py tests/test_knowledge_integration.py tests/test_supabase_memory.py
 ```
 
 同时需要保持 Supabase 或 MCP 依赖时，在 `uv run` 中追加相应 `--extra supabase` 或 `--extra mcp`。
@@ -28,15 +28,15 @@ uv run --extra dev pytest tests/test_web_memory_flow.py tests/test_loop_persiste
 | A05 | review_every_turns=0 | Web 对话正常，后台模型不调用，自动记忆不更新 |
 | A06 | 前台模型请求失败 | Web 返回 failed，该轮不计入成功轮次，不触发复盘 |
 | A07 | 后台模型第一次失败，下一轮成功 | 前台回复正常，失败不推进复盘游标；下一次复盘重新处理未完成区间 |
-| B01 | 通过 Web 添加 user/note，再开始新会话 | 记忆正文、ID 和版本进入真正发送给模型的 system prompt，并标注为不可信上下文 |
+| B01 | 通过 Web 添加 user/note，再开始新会话 | 只有预算内的 user 进入冻结 system；note/episode 不进入 bootstrap |
 | B02 | 已有会话中修改数据库记忆 | 旧会话 system prompt 保持冻结；新会话注入修改后的正文和版本 |
-| B03 | Web 问题触发 memory.search，存在相关 episode | 初始 system prompt 不含 episode；搜索只返回匹配记录，工具结果进入下一次模型请求，最终回复正常 |
-| B04 | memory.search 无匹配记录 | 模型收到空 entries，可以正常回复；不编造数据库命中，不修改记忆 |
+| B03 | Web 自动召回相关 episode | 事实只追加到当前 user 的 API 请求副本；历史仍只有原始问题与回复 |
+| B04 | 自动事实搜索无匹配记录 | 当前请求收到 empty 状态，可以正常回复；不修改记忆 |
 | C01 | 复盘提炼事实后开启新会话 | 新会话实际模型请求包含刚写入的事实，贯通写入与读取两条链路 |
 
-A01/A02 共用参数化用例；当前共 13 个自动化 Web 测试实例。它们验证调用链和数据传递，不评估真实模型的提炼质量或浏览器页面布局，也不连接真实 Supabase 项目。额外回归用例验证动态工具策略在 handler 执行前持久化、策略写入失败阻止 handler，以及带日期事件的检索排序。
+A01/A02 共用参数化用例。它们验证调用链和数据传递，不评估真实模型的提炼质量或浏览器页面布局，也不连接真实 Supabase 项目。
 
-当前召回行为需要区分：`user/note` 在新会话创建时按预算加载；`episode` 和会话期间最新记录由模型调用 memory.search/list 获取。没有每轮用户输入自动触发的向量召回步骤。SQLite 搜索为关键词检索，Supabase 搜索使用 embedding；两者共用上下文注入与工具结果链路。
+当前行为：新会话只加载 user 并冻结 system；每轮共用一次规划，按需召回 note/episode 和已启用的知识库。普通模型不能调用 memory，即使显式启用该工具。召回仅进入请求副本，本轮循环/重试复用，后续轮次和恢复重新检索；不保存快照。SQLite 使用关键词，Supabase 使用 embedding。
 
 **真实模型人工验收：先准备独立数据范围**
 
@@ -45,6 +45,9 @@ A01/A02 共用参数化用例；当前共 13 个自动化 Web 测试实例。它
 ```toml
 [agent]
 database_path = ".funagent/memory-web-test/agentcore.db"
+memory_max_chars = 4000
+memory_recall_top_k = 5
+memory_recall_max_chars = 4000
 
 [memory]
 enabled = true
@@ -64,11 +67,11 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 纯 SQLite 可以省略 `--extra supabase`；使用 MCP 时保留 `--extra mcp`。
 
-下面共 25 个人工场景，覆盖两条主链路及其边界。每个独立场景使用新的测试数据库目录，或新的 Supabase namespace；明确依赖用例 1 的场景则沿用该场景的数据。修改配置后重启 Web，并确认实际使用的是配置副本。
+下面共 30 个人工场景，覆盖两条主链路及其边界。每个独立场景使用新的测试目录或 Supabase namespace；依赖用例 1 的场景沿用该数据。修改配置后重启，并核对配置副本。
 
 建议每次记录：后端、namespace/数据库路径、session_id、turn_id、实际成功轮数、复盘日志、记录 ID/版本/来源、检索工具结果和结论。session_id 与 turn_id 可从浏览器 Network 中的 `/api/turns` 请求和响应取得。普通纯文本一轮通常有两条消息；工具调用会增加消息数，不能把消息数直接当成对话轮数。
 
-复盘按成功完成的普通用户轮次触发，需要等到 `review.completed` 后再检查最终记忆。前台调用 memory.add 与后台提炼是不同写入路径，用例要求“只确认、不调用记忆工具”时，应同时检查工具记录。
+复盘按成功完成的普通用户轮次触发，需要等到 review.completed 后检查记忆。前台 memory 工具已隐藏，“记住”由后台提炼；显式修改记录使用 Web Memory 页面。
 
 | 用例 | 测试重点 | 后端 |
 | --- | --- | --- |
@@ -94,7 +97,7 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 - 记录 `source.type` 为 `review`，`session_id` 为当前会话，`turn_id` 为第 3 轮前台轮次；普通纯文本三轮对应 `range_start=0`、`range_end=6`。
 - 主会话历史只有原始三次提问与回复，没有复盘模型的消息或工具结果。
 
-如果前台模型提前调用 memory.add，那属于前台写入路径，不能用作后台复盘已完成的证据；应核对工具来源和 review 日志。
+前台不应成功执行 memory 调用；模型猜测调用应返回 unknown_tool。后台工具来源和 review 日志才是复盘写入证据。
 
 继续发送三轮相同偏好或一般聊天，第二批复盘完成后检查：已有稳定事实没有重复记录，复盘处理新增区间。真实模型不一定每批都新增记忆，返回“没有值得记住的新事实”也是有效结果。
 
@@ -104,15 +107,15 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 `我的昵称是什么？我希望你用什么语言和风格回答？Aurora 的开发环境是什么？`
 
-期望回答能利用已确认的 user/note 记忆。如果要严格证明注入，而非仅观察答案，应检查实际模型请求的 system prompt：包含相应记录、ID 和版本。自动化 B01/C01 已直接断言这些请求字段。
+实际请求的 system 只包含 user 的昵称/偏好及 ID、版本；项目事实需本轮规划召回，位于当前 user API 文本末尾的 retrieved_memory 块。system 不含 note/episode。自动化直接断言这些请求字段。
 
 **人工用例 3：召回相关历史事件并交给模型**
 
 新建会话，发送：
 
-`请先使用 memory 工具搜索“Redis”相关的 episode，再告诉我我们此前决定如何处理缓存，以及这个决定的日期。`
+`我们此前决定如何处理 Aurora 的 Redis 缓存？这个决定是哪一天做出的？`
 
-验收点：出现 `memory.search` 工具调用；工具结果包含用例 1 的缓存决策；下一次模型请求包含这条 tool 消息；最终回答提及“先保留 Redis”“压测后评估迁移”和正确日期。查询一个独立数据范围中不存在的主题时，应返回空搜索结果，并说明没有相关记录。
+验收点：规划选择 need_memory=true、空格分隔关键词查询；出现 memory.query_completed。当前 user 请求副本含决定、日期、来源，历史无参考块和 memory tool 消息。回答提及正确决定和日期；不存在的主题收到 empty 状态。
 
 人工测试不要把“模型答对了”作为唯一证据；还需确认数据库记录来源、检索工具结果及实际上下文。Supabase 验收另外核对项目中 `funagent_memory_entries` 的测试 namespace，确认云端记录与 Web 显示一致。
 
@@ -120,9 +123,9 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 前置：新的独立数据范围，Memory 页面三种类型均无记录。
 
-发送：`请使用 memory 工具搜索我的昵称。如果数据库没有记录，就明确说不知道，不要推测。`
+发送：`Aurora 以前决定如何迁移缓存？没有记录就说不知道，不要推测。`
 
-预期：搜索结果为 `entries: []`，模型说明没有记录；新会话 system prompt 没有昵称资料。仅查询不增加数据库记录。以工具结果和 Memory 页面总数为证据，不以模型碰巧回答“青竹”作为通过。
+预期：触发检索时参考状态为 empty，模型说明没有记录；初始 system 无画像。查询不新增记录。以搜索事件和 Memory 总数为证据，区分 empty、failed 与 skipped。
 
 **人工用例 5：重复表达同一偏好**
 
@@ -186,11 +189,11 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 前置：沿用用例 9 的 note。
 
-在 Memory 页面选择该条目，将正文改为 `Aurora 的开发环境使用 Supabase。`，保存。再新建会话发送：`请读取 memory 中 Aurora 的数据库配置，告诉我当前记录是什么。`
+在 Memory 页面将 note 改为 `Aurora 的开发环境使用 Supabase。` 并保存。同一会话再次问 `Aurora 的数据库配置是什么？`，再新建会话问一次。
 
-预期：保存后 ID 不变，版本由 v1 升为 v2；新会话的核心上下文包含新正文与 v2，工具读取也返回新版本。原 SQLite 正文不再作为该条记录的当前值。旧会话的冻结系统上下文另按用例 13 检查。
+预期：ID 不变、v1→v2；两次新查询的临时参考包含新值/v2，system 都不含 note，原会话 system 保持冻结。旧模型回复可能仍提到 SQLite，应以本轮参考和版本判断最新记录。
 
-如果改用聊天里的 memory.replace 完成修正，应提供原 ID、expected_version=1，并处理宿主的审批请求；不能把未经执行的“已修改”回复当作通过。
+聊天无法调用 memory.replace，修正以 Web 保存成功和版本变更为准。
 
 **人工用例 11：两个编辑窗口争用同一版本**
 
@@ -204,21 +207,21 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 **人工用例 12：删除后新会话不能召回该记录**
 
-前置：通过 Memory 页面添加独立 user 记录 `用户的备用昵称是紫杉。`，记录 ID。新建会话查询一次并确认该记录被读取。
+前置：review_every_turns=0，通过 Memory 页面添加独立 note `Atlas 项目备用端口是 8123。`，记录 ID。新建会话查询一次，确认动态召回。
 
-回到 Memory 页面删除该条目并确认，然后再新建会话发送：`请搜索 memory 中我的备用昵称，没有记录就说没有。`
+删除该条目，在同一会话及新会话询问备用端口。
 
-预期：记录 ID 不再出现在列表和搜索中，新会话核心上下文不含该条记录。已有对话历史及旧会话的冻结上下文仍可包含先前信息；删除记忆不等于删除聊天历史。查询阶段不要再提供“紫杉”作为新的个人事实。
+预期：下轮参考不含已删除 ID。旧模型回复/用户输入仍可包含先前信息，删除记忆不擦除聊天历史，因此应检查召回结果而非只检查答案。
 
-**人工用例 13：同一会话在复盘后读取最新记忆**
+**人工用例 13：用户画像在旧会话中冻结**
 
-前置：空库完成用例 1，并保留当时的会话。
+前置：添加 user `用户偏好中文。`，开启会话 A；随后通过 Web 改为 `用户偏好英文。`。
 
-在同一会话继续发送：`请实际使用 memory 工具查我的昵称和回答偏好，并给出记录 ID 和版本。不要只依据当前聊天历史回答。`
+继续 A 并新开会话 B，各自请求按偏好回答。
 
-预期：该会话初始 system prompt 保持创建时的内容；memory.search/list 却能获取刚刚复盘写入的记录。工具结果进入下一次模型请求，回答可使用最新记忆。没有工具调用时，只说明模型使用了聊天历史，不能证明此用例通过。
+预期：A 的 system 保留中文，B 使用英文；user 不参与 note/episode 动态搜索。后台新增 user 也只影响后续新会话。
 
-再编辑这条记忆并在原会话重做查询，应得到新的版本；系统上下文无需随每次数据库更新重建。
+对实际冻结 prompt 作对比；仅看回答不能证明画像读取策略。
 
 **人工用例 14：复盘轮数按会话分别累计**
 
@@ -257,9 +260,9 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 前置：已有一条 user 记忆。在配置副本中设 `review_every_turns=0`，重启。
 
-新建会话询问已存资料；再完成至少三轮包含新事实的对话，每轮要求只确认、不调用记忆工具。最后发送：`请用 memory 工具列出现有 user 记录。`
+新建会话询问已存画像及项目事实，再完成至少三轮新事实，最后通过 Memory 页面查看列表。
 
-预期：已有资料仍能注入和查询；不出现新复盘任务，不因达到三轮自动新增记录。前台显式 memory.add 仍可写入，不能把关闭复盘理解为关闭整个记忆系统。
+预期：画像仍可注入、事实仍可召回、Web 可 CRUD；不触发复盘、不自动新增记录。前台仍不能调用 memory.add。
 
 **人工用例 18：关闭整个记忆功能**
 
@@ -273,7 +276,7 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 在 Memory 页面添加两条 episode，主题均为 `Aurora 压测`，正文均为 `Aurora 压测完成，缓存命中率为 95%。`，日期分别为 `2026-10-05` 和 `2026-10-06`。
 
-新建会话发送：`请搜索 episode 中的“Aurora 压测”，列出每条记录的日期与 ID，不要合并为一次事件。`
+新建会话发送：`Aurora 两次压测的日期分别是什么？请区分两次事件。`
 
 预期：两条事件均被保留，ID 不同、日期正确。SQLite 对匹配度相同的有日期事件按事件时间排序；Supabase 首先按向量相似度排序，不要求两种后端的排序完全一致。可再编辑其中一条日期，确认另一条没有变化。
 
@@ -281,9 +284,9 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 前置：通过 Memory 页面添加一条主题含 Redis 的 note，以及两条内容含 Redis 的 episode，记录三条 ID 与版本。
 
-发送：`请调用 memory.search，query="Redis"，kind="episode"，limit=1。展示实际返回的 ID、类型和正文，不要写入记忆。`
+配置 memory_recall_top_k=2 并重启，再问 Redis 历史事实。
 
-预期：实际工具参数使用指定类型和数量；结果最多一条，只包含 episode，不包含 note。若有匹配，返回的 ID 属于前置事件记录。查询前后记录正文、版本和总数均不变。
+预期：搜索只查 note/episode，每类最多 2 个候选，保留各后端排序、交替合并、按 ID 去重后最多注入 2 条；user 不参与动态搜索。查询前后正文、版本和总数均不变。精确参数与排序由自动化或测试请求记录确认。
 
 在此用例中用 review_every_turns=0，避免查询轮次恰好触发后台提炼干扰总数对比。Supabase 未命中时另检查模型、阈值与语义相似度，不把空结果当作过滤失效。
 
@@ -293,20 +296,20 @@ uv run --extra supabase agentcore web --config agentcore.memory-test.toml
 
 分别发送：
 
-1. `请使用 memory.search 搜索“Redis”，展示真实结果。`
-2. `请使用 memory.search 搜索“此前为了让接口响应更快采用的措施”，展示真实结果。`
+1. `此前关于 Aurora 的 Redis 缓存决定是什么？`
+2. `此前为了让 Aurora 接口响应更快，我们采用了什么措施？`
 
 SQLite：第一种关键词查询应能找到记录；第二种改写可以未命中，因为该后端采用关键词检索。
 
-Supabase：目标是两种问法都召回相关事件，第二种用于评估 embedding 的语义质量。记录实际 query、命中条目与排名；没有命中时区分接口报错与检索质量，结合实际模型调整 min_similarity 后复测，不承诺任意同义句都会命中。两种后端都应将实际返回的 entries 交给下一次模型请求。
+Supabase：两种问法用于评估 embedding 质量。记录规划的实际关键词、命中与排名；未命中时区分接口报错与检索质量，按实际模型调整阈值。不承诺任意同义句命中。两种后端的事实均只交给本轮 user 请求副本。
 
-**人工用例 22：核心上下文预算与工具补充读取**
+**人工用例 22：画像与事实预算独立**
 
-前置：在配置副本的 `[agent]` 中设 `memory_max_chars=200`，重启。添加短 user 记录 `用户偏好中文。`，再添加一条正文超过 300 字、开头包含 `项目长说明：` 的 note。
+前置：设 memory_max_chars=200、memory_recall_max_chars=650 并重启。添加短 user `用户偏好中文。`，再添加超长 note，开头含 `项目长说明：`。
 
-新建会话发送：`请先说一下已知的回答语言偏好，再调用 memory 工具读取“项目长说明”。`
+新会话发送：`按我的回答偏好介绍项目长说明。`
 
-预期：能放入预算的 user 条目优先注入；整条超过预算的 note 不被截断塞进 bootstrap，而是省略。它仍保留在数据库，并可通过 memory 工具查询。检查冻结 system prompt 与后续 tool 消息，不能仅根据最终答案推断是否超出预算。
+预期：能容纳的完整 user 条目进入 bootstrap，note 永不进入 system；相关事实块可截断正文并标注，保留来源，总字符数不超过 650。设 memory_recall_max_chars=0 则停止事实搜索，画像仍可用。
 
 预算统计的是格式化后的记忆块字符数，包含 ID、版本和主题，不是 token 数，也不是整个 system prompt 的长度。
 
@@ -326,15 +329,15 @@ namespace 是查询范围，持有服务密钥的调用方仍有跨范围权限�
 
 预期：启动时结构检查/认证失败，明确报告 Supabase 不可用；不自动切到 SQLite，也不把该状态当作空云端记忆库。恢复配置引用后可重新启动。
 
-若具备只阻断 Supabase 请求、同时保持主 LLM 正常的故障注入条件，再做运行时检查：服务启动后阻断云端记忆请求，继续 Web 对话并触发复盘，或在新会话中显式调用 memory.search。
+若能只阻断 Supabase 并保持主 LLM/MCP 正常，使用已有会话同时询问记忆与知识库事实，继续触发复盘。新会话的画像读取失败也应明确报告。
 
-预期：前台普通回复可完成；失败的检索以工具错误呈现，失败的复盘不推进 reviewed_position，不静默写入本地 SQLite 作为替代。恢复后在下一次 N 轮边界处理未复盘区间。复盘已成功写入的部分条目可以保留，整批不保证回滚。若主 LLM 也同时断网，记录为故障环境不满足条件，不以此证明记忆故障隔离有效。
+预期：事实状态 failed，知识库证据仍进入请求，前台可正常回复；复盘失败不推进游标，不切换 SQLite。恢复后下次 N 轮边界处理未复盘区间，成功写入的部分条目不保证回滚。若主 LLM 同时断网，故障环境不满足条件。
 
 **人工用例 25：本地 embedding 暂时不可用**
 
 前置：Supabase 表已初始化，主 LLM 与 embedding 服务能够独立运行；先新增一条记忆并确认向量读写正常。
 
-停用 embedding 模型或服务，保留主 LLM 与 Supabase 可用。刷新 Memory 列表，然后分别尝试添加一条全新记录、通过聊天调用 memory.search，以及完成 N 轮包含新事实的对话。
+停用 embedding 服务并保留主 LLM/Supabase 可用。刷新 Memory 列表，尝试新增记录、询问历史项目事实以触发自动召回，再完成 N 轮新事实。
 
 预期：不需要 embedding 的列表读取仍能成功；新增/搜索调用返回 embedding 错误。新增失败不应留下只有正文、没有向量的新记录。后台若实际尝试 add/search 并失败，该批复盘不推进完成游标，前台普通回复仍可成功。
 
@@ -359,7 +362,41 @@ with closing(sqlite3.connect("file:.funagent/memory-web-test/agentcore.db?mode=r
 '@ | uv run python -
 ```
 
-如果某个用例使用了其他独立目录，替换为对应测试会话库路径。读取的是会话冻结的 system prompt；动态 search 的结果应从 `/api/sessions/<session_id>/messages` 中对应 memory 的 tool 消息检查。这里的原始会话数据库在两种记忆后端下都保存在本地。
+替换为实际独立测试目录。读取的是冻结 system；动态资料不应出现在 `/api/sessions/<session_id>/messages` 中。两种记忆后端的会话库都在本地。查询事件可确认状态和数量；临时正文通过离线用例捕获的实际模型请求或测试端点记录确认。
+
+以下只读检查用于确认数据库 content/api_content 未被临时参考修改：
+
+```powershell
+@'
+import sqlite3
+from contextlib import closing
+with closing(sqlite3.connect("file:.funagent/memory-web-test/agentcore.db?mode=ro", uri=True)) as db:
+    for role, content, api_content in db.execute("SELECT role,content,api_content FROM messages"):
+        assert "<retrieved_memory>" not in str((content, api_content))
+        assert "<retrieved_knowledge>" not in str((content, api_content))
+    print("历史未保存临时参考块")
+'@ | uv run python -
+```
+
+**人工用例 26：重复召回不膨胀历史**
+
+review_every_turns=0，同一会话连续五轮询问同一项目事实。每轮可重新命中同一 ID，但参考只在当前 user 请求副本附加一次，历史 user 仍是原文；纯文本五轮共十条消息。最后发送“谢谢”，规划跳过后不再提供先前参考（正常模型回复主动引用的事实除外）。
+
+**人工用例 27：共享规划、独立来源**
+
+启用 Modular RAG，分别询问历史决定、知识库制度、需要两者的问题和闲聊。每轮只有一次规划，各 need 字段独立控制搜索，need_knowledge=false 时不查知识库。关闭 knowledge.enabled 后，规划 prompt 不包含知识库规则/字段，事实召回仍可用；关闭记忆时不包含记忆规则/字段。两者关闭时不调用规划器。模型意外输出禁用来源字段不能触发搜索；模式信息不进入 prompt 或模型输入。
+
+**人工用例 28：规划失败、重试和恢复**
+
+使用离线测试模拟无效规划 JSON：已启用来源分别按原问题回退一次，无扩写。模型重试或调用其他工具时参考保持一致、不重新规划；恢复时根据最近真实用户问题重新检索最新资料。取消、租约和总预算中断见 test_memory.py。
+
+**人工用例 29：不能绕过前台工具隐藏**
+
+配置副本显式 session.enabled_tools 加入 memory，询问 `请直接调用 memory.add 保存这句话。`。schema 无 memory；猜测调用返回 unknown_tool，数据库不变。Web CRUD 和后台复盘仍可用。
+
+**人工用例 30：后台复盘历史隔离**
+
+添加相关 note，查询后达到 N 轮。复盘的待提炼对话无 retrieved_memory/retrieved_knowledge 原文；末尾单独读取的数据库视图仍包含 user/note，用于去重。正常模型回复中的引用仍属于对话。以隔离测试与复盘请求确认。
 
 **人工验收记录建议**
 

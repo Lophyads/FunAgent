@@ -6,7 +6,7 @@ mMARCO 中文端到端召回评测：检索已摄入的 mmmarco_eval collection�
 通过 chunk 的 metadata.source_path（文件路径）反查段落 id，与 qrels 对齐。
 
 用法（先 prepare + ingest，再 eval）：
-  python scripts/prepare_mmmarco_docs.py --num-queries 300 --pool-size 2000
+  python scripts/prepare_mmmarco_docs.py --data-dir /path/to/dataset --num-queries 300 --pool-size 2000
   python scripts/ingest.py --path data/mmmarco_eval_docs --collection mmmarco_eval --force
   python scripts/eval_mmmarco_e2e.py --collection mmmarco_eval --ks 1,3,5,10
 """
@@ -31,13 +31,6 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from src.core.settings import load_settings
-from src.core.query_engine.query_processor import QueryProcessor
-from src.core.query_engine.hybrid_search import create_hybrid_search
-from src.core.query_engine.dense_retriever import create_dense_retriever
-from src.core.query_engine.sparse_retriever import create_sparse_retriever
-from src.ingestion.storage.bm25_indexer import BM25Indexer
-from src.libs.embedding.embedding_factory import EmbeddingFactory
-from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
 DEFAULT_META_PATH = _REPO_ROOT / "data" / "mmmarco_eval_meta.json"
 
@@ -48,40 +41,11 @@ def load_meta(meta_path=DEFAULT_META_PATH):
 
 
 def build_search(settings, collection: str, top_k: int):
-    vector_store = VectorStoreFactory.create(settings, collection_name=collection)
-    embedding_client = EmbeddingFactory.create(settings)
-    dense_retriever = create_dense_retriever(
-        settings=settings, embedding_client=embedding_client, vector_store=vector_store,
-    )
-    bm25_indexer = BM25Indexer(index_dir=str(_REPO_ROOT / f"data/db/bm25/{collection}"))
-    sparse_retriever = create_sparse_retriever(
-        settings=settings, bm25_indexer=bm25_indexer, vector_store=vector_store,
-    )
-    sparse_retriever.default_collection = collection
-    query_processor = QueryProcessor()
-    hybrid = create_hybrid_search(
-        settings=settings,
-        query_processor=query_processor,
-        dense_retriever=dense_retriever,
-        sparse_retriever=sparse_retriever,
-    )
-    hybrid.config.dense_top_k = top_k
-    hybrid.config.sparse_top_k = top_k
-    hybrid.config.fusion_top_k = top_k
-    return hybrid
-
-
-def to_doc_ids(results):
-    """把检索结果映射回段落 id（source_path 的文件名），按序去重。"""
-    ids = []
-    seen = set()
-    for r in results or []:
-        sp = (r.metadata or {}).get("source_path", "")
-        did = Path(sp).stem
-        if did and did not in seen:
-            seen.add(did)
-            ids.append(did)
-    return ids
+    from dataclasses import replace
+    from src.core.query_engine.query_entrypoint import StructuredSearchAdapter
+    settings = replace(settings, retrieval=replace(settings.retrieval,
+        dense_top_k=top_k, sparse_top_k=top_k, fusion_top_k=top_k))
+    return StructuredSearchAdapter(settings, collection)
 
 
 def _dcg(rels, k):
@@ -117,14 +81,18 @@ def evaluate(hybrid, queries, qrels, ks):
         if not rel:
             continue
         try:
-            detail = hybrid.search(query=text, top_k=max(ks), return_details=True)
+            detail = hybrid.service.query(text,top_k=max(ks),use_rerank=False,return_details=True)
         except Exception as e:
             print(f"      [WARN] query {qid} 检索失败: {e}")
             continue
+        def unit_documents(rows, key):
+            units = hybrid.service.evidence.get_units([row[key] for row in rows])
+            paths = [hybrid.service.evidence.get_document(u.doc_id).source_path for u in units]
+            return list(dict.fromkeys(Path(path).stem for path in paths))
         ranking = {
-            "dense": to_doc_ids(detail.dense_results),
-            "sparse": to_doc_ids(detail.sparse_results),
-            "hybrid": to_doc_ids(detail.results),
+            'dense':unit_documents(detail.diagnostics['dense_results'],'id'),
+            'sparse':unit_documents(detail.diagnostics['sparse_results'],'chunk_id'),
+            'hybrid':list(dict.fromkeys(Path(row['metadata']['source_path']).stem for row in detail.evidence_results)),
         }
         rel_set = set(rel)
         for n in names:
@@ -159,7 +127,10 @@ def main():
     settings = load_settings(args.config)
     hybrid = build_search(settings, args.collection, max(ks))
 
-    result = evaluate(hybrid, queries, qrels, ks)
+    try:
+        result = evaluate(hybrid, queries, qrels, ks)
+    finally:
+        hybrid.close()
 
     names = ["dense", "sparse", "hybrid"]
     print("\n" + "=" * 66)
@@ -171,7 +142,7 @@ def main():
             vals = [result[n].get(key, 0.0) for n in names]
             print(f"  {key:<9}" + "".join(f"{v:>10.4f}" for v in vals))
     print("-" * 66)
-    print("  说明：hybrid 的 recall@k 高于单独 dense/sparse，说明混合检索有效")
+
 
     out = _REPO_ROOT / "logs" / f"{args.collection}_result.json"
     out.parent.mkdir(parents=True, exist_ok=True)

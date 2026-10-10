@@ -1,13 +1,5 @@
-"""
-Storage Module.
+"""Current evidence storage and SQLite lexical indexes."""
+from src.ingestion.storage.evidence_store import EvidenceStore
+from src.ingestion.storage.sqlite_bm25 import SQLiteBM25
 
-This package contains storage components:
-- Vector upserter
-- BM25 indexer
-- Image storage
-"""
-
-from src.ingestion.storage.bm25_indexer import BM25Indexer
-from src.ingestion.storage.vector_upserter import VectorUpserter
-
-__all__ = ["BM25Indexer", "VectorUpserter"]
+__all__ = ['EvidenceStore', 'SQLiteBM25']

@@ -103,9 +103,10 @@ def main() -> int:
 
     sys.settrace(tracer)
     try:
-        result = pipeline.run(str(doc_path), source_path="uploaded_demo.md")
+        result = pipeline.run(str(doc_path), source_path=doc_path.name if args.doc else "uploaded_demo.md")
     finally:
         sys.settrace(None)
+        pipeline.close()
 
     # 4) 输出
     print("=" * 72)
@@ -121,7 +122,7 @@ def main() -> int:
 
     if tmp_obj is not None:
         doc_path.unlink(missing_ok=True)
-    return 0
+    return 0 if result.success else 1
 
 
 if __name__ == "__main__":

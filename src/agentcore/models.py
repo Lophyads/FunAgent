@@ -116,7 +116,6 @@ class KnowledgeMcpConfig(FrozenStrictModel):
 
 class KnowledgeConfig(FrozenStrictModel):
     enabled: bool = False
-    mode: Literal["auto", "always"] = "auto"
     source_description: str = ""
     max_queries: int = Field(default=3, ge=1, le=3)
     top_k: int = Field(default=5, ge=1, le=20)
@@ -143,6 +142,8 @@ class AgentConfig(FrozenStrictModel):
     max_iterations: int = Field(default=8, ge=1, le=100)
     tool_result_max_chars: int = Field(default=32_768, ge=256, le=1_000_000)
     memory_max_chars: int = Field(default=4_000, ge=0, le=100_000)
+    memory_recall_top_k: int = Field(default=5, ge=1, le=200)
+    memory_recall_max_chars: int = Field(default=4_000, ge=0, le=100_000)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
     workers: WorkerPolicy = Field(default_factory=WorkerPolicy)
     timeouts: TimeoutPolicy = Field(default_factory=TimeoutPolicy)

@@ -8,11 +8,12 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from agentcore import Message, NormalizedModelResponse, ToolCall
+from agentcore import Message, NormalizedModelResponse, StaticProviderResolver, ToolCall, WireResponse
 from conftest import ScriptedTransport, scripted_provider_stack
 from gateway.web import WebHost, WebServer
 from memory import MemoryConfig, MemoryFeature, SqliteConfig
@@ -32,15 +33,36 @@ def memory_call(call_id, **arguments):
     )])
 
 
+def recall_plan(query=""):
+    return reply(json.dumps({
+        "need_knowledge": False, "query": "", "query_variants": [],
+        "need_memory": bool(query), "memory_query": query, "reason": "测试规划",
+    }, ensure_ascii=False))
+
+
+class PlanningTransport(ScriptedTransport):
+    def send(self, request, context):
+        if not self.items:
+            self.items.append(recall_plan())
+        return super().send(request, context)
+
+
 @pytest.fixture
 def memory_web(config_factory, tmp_path, monkeypatch):
     """Assemble the same memory components as CLI Web, with offline providers."""
     resources = []
 
-    def make(*responses, every_turns=0, review_responses=()):
-        config = config_factory(system_prompt="你是测试助手。需要历史事件时使用 memory 搜索。")
+    def make(*responses, every_turns=0, review_responses=(), planning_responses=()):
+        config = config_factory(system_prompt="你是测试助手。结合相关参考资料回答。")
+        planner_route = config.routes[0].model_copy(update={"name": "retrieval-planner"})
+        config = config.model_copy(update={"knowledge": config.knowledge.model_copy(update={"planner": planner_route})})
         foreground = ScriptedTransport(*responses)
+        planner = PlanningTransport(*planning_responses)
         resolver, modes, _ = scripted_provider_stack(config, {"primary": foreground})
+        resolver = StaticProviderResolver({
+            "primary": resolver.resolve(config.routes[0]),
+            "retrieval-planner": replace(resolver.resolve(config.routes[0]), transport=planner),
+        })
         settings = MemoryConfig(
             review_every_turns=every_turns, sqlite=SqliteConfig(tmp_path / "memory.db"),
         )
@@ -65,6 +87,7 @@ def memory_web(config_factory, tmp_path, monkeypatch):
         host = WebHost(
             config, memory=feature.store, memory_settings=settings,
             prompt_builder=feature.prompt_builder, review_scheduler=feature.review_scheduler,
+            memory_retriever=feature.retriever,
             provider_resolver=resolver, api_modes=modes,
         )
         host.start()
@@ -97,6 +120,7 @@ def memory_web(config_factory, tmp_path, monkeypatch):
         return SimpleNamespace(
             request=request, chat=chat, feature=feature, foreground=foreground,
             reviewer=reviewer, reviews=reviews, host=host,
+            planner=planner,
         )
 
     yield make
@@ -265,33 +289,35 @@ def test_web_new_session_injects_core_memory_and_existing_prompt_stays_frozen(me
     web.chat("介绍一下项目。", sid="existing")
     first = web.foreground.requests[0].body["messages"][0]["content"]
     assert "<bootstrap_memory>" in first and "untrusted context" in first
-    assert user["content"] in first and note["content"] in first
-    assert f'id={note["id"]} v1' in first and "历史事件：曾讨论缓存迁移。" not in first
-    web.request("PATCH", "/api/memory/note", {
-        "action": "replace", "id": note["id"], "expected_version": 1, "content": "项目改用 Supabase。",
+    assert user["content"] in first and note["content"] not in first
+    assert "历史事件：曾讨论缓存迁移。" not in first
+    web.request("PATCH", "/api/memory/user", {
+        "action": "replace", "id": user["id"], "expected_version": 1, "content": "用户偏好详细英文。",
     })
     web.chat("继续。", sid="existing")
     web.chat("介绍一下项目。", sid="new")
     assert web.foreground.requests[1].body["messages"][0]["content"] == first
     current = web.foreground.requests[2].body["messages"][0]["content"]
-    assert "项目改用 Supabase。" in current and "项目使用 SQLite。" not in current
-    assert f'id={note["id"]} v2' in current
+    assert "用户偏好详细英文。" in current and user["content"] not in current
+    assert f'id={user["id"]} v2' in current and note["content"] not in current
 
 
 @pytest.mark.parametrize("query, hit", [("缓存迁移", True), ("不存在的火星基地", False)])
-def test_web_search_result_enters_next_llm_context_without_mutating_memory(memory_web, query, hit):
+def test_web_search_result_enters_request_copy_without_mutating_history_or_memory(memory_web, query, hit):
     captured = []
 
     def answer_after_search(request):
         messages = request.body["messages"]
-        assert messages[-1]["role"] == "tool" and messages[-1]["tool_call_id"] == "recall"
-        payload = json.loads(messages[-1]["content"])
-        assert payload["ok"]
-        captured.extend(payload["result"]["entries"])
+        assert messages[-1]["role"] == "user"
+        content = messages[-1]["content"]
+        assert "<retrieved_memory>" in content
+        assert "缓存迁移：决定先保留 Redis" in content if hit else "检索状态：empty" in content
+        if hit:
+            captured.append(related["id"])
         return reply("找到了缓存迁移记录。" if captured else "没有找到相关记忆。")
 
     web = memory_web(
-        memory_call("recall", action="search", kind="episode", query=query, limit=5), answer_after_search,
+        answer_after_search, planning_responses=(recall_plan(query),),
     )
     related = web.request("PATCH", "/api/memory/episode", {
         "action": "add", "content": "缓存迁移：决定先保留 Redis，以减少迁移风险。", "event_at": "2026-10-06",
@@ -303,13 +329,14 @@ def test_web_search_result_enters_next_llm_context_without_mutating_memory(memor
     _, result = web.chat(f"查一下我们之前的{query}记录。")
     assert result["status"] == "completed"
     assert result["final_text"] == ("找到了缓存迁移记录。" if hit else "没有找到相关记忆。")
-    assert [entry["id"] for entry in captured] == ([related["id"]] if hit else [])
+    assert captured == ([related["id"]] if hit else [])
     first = web.foreground.requests[0].body["messages"][0]["content"]
     assert related["content"] not in first  # Episodes arrive through search, not bootstrap.
     assert web.request("GET", "/api/memory/episode")["entries"] == before
     history = web.request("GET", "/api/sessions/chat/messages")["messages"]
-    assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant"]
-    assert history[2]["tool_name"] == "memory" and history[2]["tool_call_id"] == "recall"
+    assert [m["role"] for m in history] == ["user", "assistant"]
+    assert history[0]["content"] == f"查一下我们之前的{query}记录。"
+    assert all("<retrieved_memory>" not in (m.get("api_content") or "") for m in history)
 
 
 def test_web_reviewed_fact_is_available_in_next_session(memory_web):
@@ -326,3 +353,39 @@ def test_web_reviewed_fact_is_available_in_next_session(memory_web):
     assert result["status"] == "completed"
     assert fact in web.foreground.requests[1].body["messages"][0]["content"]
     web.reviews[1].future.result(timeout=5)
+
+
+def test_web_repeated_recall_edits_and_deletion_never_accumulate_reference_history(memory_web):
+    web = memory_web(*(reply("正常回复。") for _ in range(5)),
+                     planning_responses=tuple(recall_plan("Atlas 端口") for _ in range(4)))
+    note = web.request("PATCH", "/api/memory/note", {
+        "action": "add", "content": "Atlas 项目端口是 8123。",
+    })["entry"]
+    question = "Atlas 项目的端口是什么？"
+    for _ in range(2):
+        assert web.chat(question)[1]["status"] == "completed"
+    web.request("PATCH", "/api/memory/note", {
+        "action": "replace", "id": note["id"], "expected_version": 1, "content": "Atlas 项目端口是 9123。",
+    })
+    web.chat(question)
+    web.request("PATCH", "/api/memory/note", {
+        "action": "remove", "id": note["id"], "expected_version": 2,
+    })
+    web.chat(question)
+    web.chat("谢谢。")
+    for index, request in enumerate(web.foreground.requests):
+        messages = request.body["messages"]
+        assert len(messages) == 2 + index * 2
+        assert all("<retrieved_memory>" not in m["content"] for m in messages[1:-1])
+        current = messages[-1]["content"]
+        if index < 2:
+            assert "8123" in current and f'id={note["id"]} v1' in current
+        elif index == 2:
+            assert "9123" in current and "8123" not in current and f'id={note["id"]} v2' in current
+        elif index == 3:
+            assert "检索状态：empty" in current and note["id"] not in current
+        else:
+            assert current == "谢谢。" and "<retrieved_memory>" not in str(messages)
+    history = web.request("GET", "/api/sessions/chat/messages")["messages"]
+    assert len(history) == 10
+    assert [m["content"] for m in history if m["role"] == "user"] == [question] * 4 + ["谢谢。"]

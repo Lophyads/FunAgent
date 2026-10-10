@@ -1,16 +1,5 @@
-"""
-Transform Module.
+"""Source-grounded retrieval representations and section hierarchy."""
+from src.ingestion.transform.retrieval_text_builder import ImageAnalyzer, RetrievalTextBuilder
+from src.ingestion.transform.hierarchy_builder import HierarchyBuilder
 
-This package contains document transformation components:
-- Base transform class
-- Chunk refiner
-- Metadata enricher
-- Image captioner
-"""
-
-from src.ingestion.transform.base_transform import BaseTransform
-from src.ingestion.transform.chunk_refiner import ChunkRefiner
-
-__all__ = ['BaseTransform', 'ChunkRefiner']
-
-__all__ = []
+__all__ = ['ImageAnalyzer', 'RetrievalTextBuilder', 'HierarchyBuilder']

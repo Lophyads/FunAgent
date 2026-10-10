@@ -24,10 +24,9 @@ Exit codes:
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # Ensure project root is on sys.path
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,10 +43,10 @@ if sys.platform == "win32":
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.core.settings import load_settings, Settings
+from src.core.settings import load_settings
 from src.core.trace import TraceContext, TraceCollector
 from src.ingestion.pipeline import IngestionPipeline, PipelineResult
-from src.libs.loader.loader_factory import LoaderFactory
+from src.libs.loader.structured_document_loader import StructuredDocumentLoader
 from src.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -69,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--path", "-p",
         required=True,
         help="Path to file or directory to ingest. "
-             "If directory, processes all PDF files recursively."
+             "If directory, processes all supported PDF/Markdown files recursively."
     )
     
     parser.add_argument(
@@ -111,14 +110,13 @@ def discover_files(path: str, extensions: List[str] = None) -> List[Path]:
     Args:
         path: File or directory path
         extensions: List of file extensions to include. Defaults to every
-            format the LoaderFactory can handle, so registering a new loader
-            makes it ingestible here without touching this script.
+            format the structured document loader supports.
     
     Returns:
         List of file paths to process
     """
     if extensions is None:
-        extensions = list(LoaderFactory.supported_extensions())
+        extensions = list(StructuredDocumentLoader.supported_extensions())
     
     path = Path(path)
     
@@ -239,7 +237,7 @@ def main() -> int:
         return 0
     
     # Initialize pipeline
-    print(f"\n[INFO] Initializing pipeline...")
+    print("\n[INFO] Initializing pipeline...")
     print(f"   Collection: {args.collection}")
     print(f"   Force: {args.force}")
     
@@ -247,7 +245,8 @@ def main() -> int:
         pipeline = IngestionPipeline(
             settings=settings,
             collection=args.collection,
-            force=args.force
+            force=args.force,
+            query_profile=args.config
         )
     except Exception as e:
         print(f"[FAIL] Failed to initialize pipeline: {e}")
@@ -255,7 +254,7 @@ def main() -> int:
         return 2
     
     # Process files
-    print(f"\n[INFO] Processing files...")
+    print("\n[INFO] Processing files...")
     results: List[PipelineResult] = []
     
     collector = TraceCollector()
@@ -273,9 +272,14 @@ def main() -> int:
             if result.success:
                 skipped = result.stages.get("integrity", {}).get("skipped", False)
                 if skipped:
-                    print(f"   [SKIP] Skipped (already processed)")
+                    print("   [SKIP] Skipped (already processed)")
                 else:
-                    print(f"   [OK] Success: {result.chunk_count} chunks, {result.image_count} images")
+                    print(f"   [OK] Success: {result.chunk_count} chunks, {result.image_count} non-decorative image occurrences")
+                if result.build_id:
+                    print(f"   Build: {result.build_id} | {result.publication_status}")
+                    print(f"   Preview: scripts/query.py --collection {args.collection} --build-id {result.build_id} --query YOUR_QUERY")
+                for warning in result.warnings:
+                    print(f"   [WARN] {warning}")
             else:
                 print(f"   [FAIL] Failed: {result.error}")
         
@@ -288,6 +292,8 @@ def main() -> int:
             ))
             print(f"   [FAIL] Error: {e}")
     
+    pipeline.close()
+
     # Print summary
     print_summary(results, args.verbose)
     

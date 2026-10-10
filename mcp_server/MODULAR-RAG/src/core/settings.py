@@ -9,11 +9,13 @@ from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
+from src.core.path_resolver import PROJECT_ROOT, PathResolver
+
 # ---------------------------------------------------------------------------
 # Repo root & path resolution
 # ---------------------------------------------------------------------------
 # Anchored to this file's location: <repo>/src/core/settings.py → parents[2]
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+REPO_ROOT: Path = PROJECT_ROOT
 
 # Default absolute path to settings.yaml
 DEFAULT_SETTINGS_PATH: Path = REPO_ROOT / "config" / "settings.yaml"
@@ -42,10 +44,7 @@ def resolve_path(relative: Union[str, Path]) -> Path:
     >>> resolve_path("config/settings.yaml")  # doctest: +SKIP
     PosixPath('/home/user/Modular-RAG-MCP-Server/config/settings.yaml')
     """
-    p = Path(relative)
-    if p.is_absolute():
-        return p
-    return (REPO_ROOT / p).resolve()
+    return PathResolver(REPO_ROOT).resolve(relative)
 
 
 class SettingsError(ValueError):
@@ -150,6 +149,41 @@ class RetrievalSettings:
     fusion_top_k: int
     rrf_k: int
 
+    def __post_init__(self):
+        if any(type(value) is not int or value < 1 for value in (
+            self.dense_top_k, self.sparse_top_k, self.fusion_top_k, self.rrf_k
+        )):
+            raise SettingsError("Retrieval limits and rrf_k must be positive integers")
+
+
+@dataclass(frozen=True)
+class RerankLLMSettings:
+    provider: str
+    model: str
+    temperature: float = 0.0
+    max_tokens: int = 4096
+    timeout: float = 60.0
+    thinking: str = "disabled"
+    response_format: str = "json_object"
+    base_url: Optional[str] = None
+    api_key_env: Optional[str] = None
+    api_key: Optional[str] = None
+    azure_endpoint: Optional[str] = None
+    api_version: Optional[str] = None
+    deployment_name: Optional[str] = None
+
+    def __post_init__(self):
+        if self.provider not in {"deepseek", "openai", "azure", "ollama"} or not self.model.strip():
+            raise SettingsError("Invalid rerank.llm provider/model")
+        if self.thinking not in {"enabled", "disabled"} or self.response_format != "json_object":
+            raise SettingsError("Invalid rerank.llm thinking/response_format")
+        if type(self.max_tokens) is not int or self.max_tokens <= 0:
+            raise SettingsError("Positive rerank.llm.max_tokens required")
+        if isinstance(self.timeout,bool) or not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise SettingsError("Positive finite rerank.llm.timeout required")
+        if isinstance(self.temperature,bool) or not math.isfinite(self.temperature) or not 0<=self.temperature<=2:
+            raise SettingsError("rerank.llm.temperature must be in 0..2")
+
 
 @dataclass(frozen=True)
 class RerankSettings:
@@ -157,6 +191,22 @@ class RerankSettings:
     provider: str
     model: str
     top_k: int
+    llm: Optional[RerankLLMSettings] = None
+    max_candidates: int = 20
+    max_input_chars: int = 30000
+    min_relevance_score: float = 2.0
+    strict: bool = False
+    cache_dir: str = "data/cache/rerank"
+
+    def __post_init__(self):
+        if self.strict and self.provider not in {"none", "llm", "cross_encoder"}:
+            raise SettingsError("Unknown strict rerank backend")
+        if type(self.max_candidates) is not int or not 1<=self.max_candidates<=20:
+            raise SettingsError("rerank.max_candidates must be in 1..20")
+        if type(self.max_input_chars) is not int or self.max_input_chars<1000:
+            raise SettingsError("rerank.max_input_chars must be >=1000")
+        if isinstance(self.min_relevance_score,bool) or not math.isfinite(self.min_relevance_score) or not 0<=self.min_relevance_score<=3:
+            raise SettingsError("rerank.min_relevance_score must be in 0..3")
 
 
 @dataclass(frozen=True)
@@ -207,12 +257,42 @@ class VisionLLMSettings:
 
 @dataclass(frozen=True)
 class IngestionSettings:
-    chunk_size: int
-    chunk_overlap: int
     splitter: str
     batch_size: int
     chunk_refiner: Optional[Dict[str, Any]] = None  # 动态配置
     metadata_enricher: Optional[Dict[str, Any]] = None  # 动态配置
+    pipeline_version: str = "structured_v2"
+    figures: Optional[Dict[str, Any]] = None
+    captions: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None
+    budget: Optional[Dict[str, Any]] = None
+    hierarchy: Optional[Dict[str, Any]] = None
+    domain_tokenizer: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.pipeline_version != "structured_v2":
+            raise SettingsError("Unknown ingestion.pipeline_version")
+        defaults = {
+            'budget': {'tokenizer_path':'data/tokenizers/qwen3-embedding',
+                'tokenizer_revision':'1d8ad4ca9b3dd8059ad90a75d4983776a23d44af',
+                'min_tokens':100,'target_tokens':384,'max_tokens':500,'overlap_tokens':0},
+            'context': {'mode':'deterministic','max_tokens':64},
+            'captions': {'max_tokens':180}, 'figures': {'crop_logical_regions':True},
+            'hierarchy': {'enabled':False}, 'domain_tokenizer': {'terms':[],'min_keyword_length':1},
+        }
+        for key, value in defaults.items():
+            if getattr(self,key) is None:
+                object.__setattr__(self,key,value)
+        if self.pipeline_version == "structured_v2":
+            budget = self.budget or {}
+            if self.splitter != "structural" or not budget.get("tokenizer_path") or not budget.get("tokenizer_revision"):
+                raise SettingsError("Structured profile requires structural splitter and pinned tokenizer")
+            if not 1<=budget.get("target_tokens",384)<=budget.get("max_tokens",500)<=500:
+                raise SettingsError("Invalid strict structured token budget")
+            if not 0 <= budget.get('min_tokens', 0) <= budget.get('target_tokens', 384):
+                raise SettingsError('Invalid structured minimum token target')
+            if not 0<=(self.context or {}).get("max_tokens",64)<budget.get("max_tokens",500):
+                raise SettingsError("Context exceeds structured token budget")
 
 
 @dataclass(frozen=True)
@@ -244,12 +324,14 @@ class Settings:
         if "ingestion" in data:
             ingestion = _require_mapping(data, "ingestion", "settings")
             ingestion_settings = IngestionSettings(
-                chunk_size=_require_int(ingestion, "chunk_size", "ingestion"),
-                chunk_overlap=_require_int(ingestion, "chunk_overlap", "ingestion"),
                 splitter=_require_str(ingestion, "splitter", "ingestion"),
                 batch_size=_require_int(ingestion, "batch_size", "ingestion"),
                 chunk_refiner=ingestion.get("chunk_refiner"),  # 可选配置
                 metadata_enricher=ingestion.get("metadata_enricher"),  # 可选配置
+                pipeline_version=ingestion.get("pipeline_version","structured_v2"),
+                figures=ingestion.get("figures"), captions=ingestion.get("captions"),
+                context=ingestion.get("context"), budget=ingestion.get("budget"), hierarchy=ingestion.get("hierarchy"),
+                domain_tokenizer=ingestion.get("domain_tokenizer"),
             )
 
         vision_llm_settings = None
@@ -309,6 +391,10 @@ class Settings:
                 provider=_require_str(rerank, "provider", "rerank"),
                 model=_require_str(rerank, "model", "rerank"),
                 top_k=_require_int(rerank, "top_k", "rerank"),
+                llm=RerankLLMSettings(**rerank["llm"]) if rerank.get("llm") else None,
+                max_candidates=rerank.get("max_candidates",20),max_input_chars=rerank.get("max_input_chars",30000),
+                min_relevance_score=rerank.get("min_relevance_score",2),strict=rerank.get("strict",False),
+                cache_dir=rerank.get("cache_dir","data/cache/rerank"),
             ),
             evaluation=EvaluationSettings(
                 enabled=_require_bool(evaluation, "enabled", "evaluation"),

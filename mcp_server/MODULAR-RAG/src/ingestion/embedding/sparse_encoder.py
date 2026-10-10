@@ -7,7 +7,7 @@ Design Principles:
 - Stateless Processing: No internal state between encode() calls
 - Observable: Accepts TraceContext for future observability integration
 - Deterministic: Same inputs produce same term statistics
-- Clear Contracts: Well-defined output structure for downstream BM25Indexer
+- Clear Contracts: Well-defined output structure for downstream SQLiteBM25
 """
 
 from typing import List, Dict, Optional, Any
@@ -23,7 +23,7 @@ class SparseEncoder:
     """Encodes text chunks into BM25 term statistics.
     
     This encoder prepares term-level statistics needed for BM25 indexing.
-    The actual index construction is handled by BM25Indexer (C12).
+    The actual index construction is handled by SQLiteBM25 (C12).
     
     Output Structure:
         For each chunk, produces:
@@ -53,6 +53,7 @@ class SparseEncoder:
         self,
         min_term_length: int = 2,
         lowercase: bool = True,
+        tokenizer=None,
     ):
         """Initialize SparseEncoder.
         
@@ -68,6 +69,7 @@ class SparseEncoder:
         
         self.min_term_length = min_term_length
         self.lowercase = lowercase
+        self.tokenizer = tokenizer
     
     def encode(
         self,
@@ -144,10 +146,14 @@ class SparseEncoder:
         Returns:
             List of valid terms
         """
+        if self.tokenizer is not None:
+            return self.tokenizer.tokenize(text)
+
         tokens: List[str] = []
 
         # Use jieba to segment the text (handles both Chinese and English)
         raw_tokens = jieba.lcut(text)
+        raw_tokens += re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+\b", text)
 
         # Clean tokens: keep only alphanumeric and Chinese characters
         for token in raw_tokens:
@@ -174,7 +180,7 @@ class SparseEncoder:
     ) -> Dict[str, Any]:
         """Calculate corpus-level statistics from encoded chunks.
         
-        Utility method for BM25Indexer to compute:
+        Utility method for SQLiteBM25 to compute:
         - Average document length
         - Document frequency (how many docs contain each term)
         - Total number of documents

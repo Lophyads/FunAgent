@@ -8,7 +8,7 @@ nomic-embed-text, mxbai-embed-large, etc. on local hardware.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from src.libs.embedding.base_embedding import BaseEmbedding
 

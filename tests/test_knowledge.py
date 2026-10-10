@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from agentcore import (
     AttemptContext, CancellationToken, KnowledgeConfig, KnowledgeMcpConfig, LeaseLostError,
-    Message, NormalizedProviderError, OpenAIHttpTransport, RunBudgetExceeded, TurnCancelled, WireRequest,
+    Message, NormalizedModelResponse, NormalizedProviderError, OpenAIHttpTransport, RunBudgetExceeded, TurnCancelled, WireRequest,
 )
 from agentcore.models import AgentConfig
 from knowledge.mcp import decode_result
@@ -18,7 +18,10 @@ from knowledge.models import (
     KnowledgeContext, KnowledgeItem, KnowledgePlan, KnowledgePlanningError,
     KnowledgeRequest, KnowledgeRetrievalError,
 )
-from knowledge.planner import RetrievalPlanner, parse_plan, request_from_messages
+from knowledge.planner import (
+    KNOWLEDGE_PLANNING_PROMPT, MEMORY_PLANNING_PROMPT, PLANNING_PROMPT,
+    RetrievalPlanner, build_planning_prompt, parse_plan, request_from_messages,
+)
 from knowledge.provider import RetrievalKnowledgeProvider, render_knowledge, select_evidence
 from conftest import ScriptedTransport, scripted_provider_stack
 
@@ -44,6 +47,82 @@ def test_plan_accepts_only_complete_strict_json():
             parse_plan(invalid)
 
 
+@pytest.mark.parametrize("memory,knowledge", [(False, False), (True, False), (False, True), (True, True)])
+def test_prompt_and_model_input_only_describe_program_enabled_sources(config_factory, memory, knowledge):
+    request = KnowledgeRequest("当前问题", memory_enabled=memory, knowledge_enabled=knowledge)
+    prompt = build_planning_prompt(request)
+    assert prompt.startswith(PLANNING_PROMPT)
+    assert (MEMORY_PLANNING_PROMPT in prompt) == memory
+    assert (KNOWLEDGE_PLANNING_PROMPT in prompt) == knowledge
+    assert ("need_memory" in prompt) == memory
+    assert ("memory_query" in prompt) == memory
+    assert ("need_knowledge" in prompt) == knowledge
+    assert "memory_enabled" not in prompt and "knowledge_enabled" not in prompt
+    assert "mode=" not in prompt and "always" not in prompt
+    output = {"reason": "测试"}
+    if memory:
+        output.update(need_memory=True, memory_query="项目 决定")
+    if knowledge:
+        output.update(need_knowledge=True, query="制度", query_variants=[])
+    config = config_factory()
+    transport = ScriptedTransport(NormalizedModelResponse(content=json.dumps(output, ensure_ascii=False)))
+    resolver, modes, _ = scripted_provider_stack(config, {"primary": transport}, initialize_tools=False)
+    try:
+        planner = RetrievalPlanner(route=config.routes[0], runtime=resolver.resolve(config.routes[0]),
+                                   adapter=modes.get("scripted"), config=KnowledgeConfig(source_description="制度库"))
+        result = planner.plan(request, runtime_for(config)[0], deadline=time.monotonic() + 20,
+                              check_active=lambda: None)
+        assert result.need_memory == memory and result.need_knowledge == knowledge
+        assert transport.requests[0].body["messages"][0]["content"] == prompt
+        payload = json.loads(transport.requests[0].body["messages"][-1]["content"])
+        assert set(payload) == ({"question", "history", "source_description"}
+                                if knowledge else {"question", "history"})
+    finally:
+        resolver.close()
+
+
+@pytest.mark.parametrize("memory,knowledge", [(False, False), (True, False), (False, True)])
+def test_model_cannot_enable_sources_omitted_by_program(memory, knowledge):
+    request = KnowledgeRequest("问题", memory_enabled=memory, knowledge_enabled=knowledge)
+    result = parse_plan(plan(need_memory=True, memory_query="项目 决定").model_dump_json(), request=request)
+    assert result.need_memory == memory and result.need_knowledge == knowledge
+    if not memory:
+        assert result.memory_query == ""
+    if not knowledge:
+        assert result.query == "" and result.query_variants == ()
+
+
+def test_source_normalization_preserves_validation_for_enabled_fields():
+    request = KnowledgeRequest("问题", memory_enabled=True, knowledge_enabled=False)
+    for output in (
+        '{"need_memory":"true","memory_query":"项目","reason":"测试"}',
+        '{"need_memory":true,"memory_query":"","reason":"测试"}',
+        '{"need_memory":false,"memory_query":"项目","reason":"测试"}',
+        '[]', 'invalid json',
+    ):
+        with pytest.raises(KnowledgePlanningError):
+            parse_plan(output, request=request)
+
+
+@pytest.mark.parametrize("memory,knowledge", [(True, False), (False, True)])
+def test_execution_guard_blocks_disabled_source_even_if_custom_planner_requests_it(config_factory, memory, knowledge):
+    memory_search, knowledge_search = FixedRetriever(), FixedRetriever()
+    provider = RetrievalKnowledgeProvider(
+        planner=FixedPlanner(plan(need_memory=True, memory_query="项目 决定")),
+        memory_retriever=memory_search if memory else None,
+        retriever=knowledge_search if knowledge else None, config=KnowledgeConfig(),
+    )
+    provider.prepare(KnowledgeRequest("问题"), runtime_for(config_factory())[0])
+    assert bool(memory_search.queries) == memory and bool(knowledge_search.queries) == knowledge
+
+
+def test_no_enabled_sources_skip_planning_entirely(config_factory):
+    planner = FixedPlanner(KnowledgePlanningError("should not run"))
+    provider = RetrievalKnowledgeProvider(planner=planner, config=KnowledgeConfig())
+    assert provider.prepare(KnowledgeRequest("问题"), runtime_for(config_factory())[0]) == KnowledgeContext()
+    assert planner.calls == 0
+
+
 def test_config_supports_inherited_and_explicit_routes(config_factory):
     base = config_factory()
     assert base.knowledge.planner is None and not base.knowledge.enabled
@@ -53,7 +132,7 @@ def test_config_supports_inherited_and_explicit_routes(config_factory):
     })
     assert selected.knowledge.planner.model == selected.routes[0].model
     for values in (
-        {"planner": base.routes[0].model_dump()}, {"unexpected": True},
+        {"planner": base.routes[0].model_dump()}, {"unexpected": True}, {"mode": "auto"},
         {"timeout_seconds": 1, "planner_timeout_seconds": 2},
         {"planner": planner.model_copy(update={"max_attempts": 2}).model_dump()},
     ):
@@ -173,15 +252,15 @@ def runtime_for(config):
     return runtime, events
 
 
-@pytest.mark.parametrize("mode,expected_calls", [("auto", 0), ("always", 1)])
-def test_skip_or_force_uses_one_plan(config_factory, mode, expected_calls):
-    config = KnowledgeConfig(mode=mode)
-    planner = FixedPlanner(plan(need_knowledge=False, query="", query_variants=()))
+@pytest.mark.parametrize("need_knowledge", [False, True])
+def test_knowledge_search_follows_one_plan(config_factory, need_knowledge):
+    config = KnowledgeConfig()
+    planner = FixedPlanner(plan() if need_knowledge else plan(need_knowledge=False, query="", query_variants=()))
     retriever = FixedRetriever()
     provider = RetrievalKnowledgeProvider(planner=planner, retriever=retriever, config=config)
     result = provider.prepare(KnowledgeRequest("原问题"), runtime_for(config_factory())[0])
-    assert planner.calls == 1 and len(retriever.queries) == expected_calls
-    assert result.status == ("skipped" if mode == "auto" else "empty")
+    assert planner.calls == 1 and bool(retriever.queries) == need_knowledge
+    assert result.status == ("empty" if need_knowledge else "skipped")
 
 
 def test_planner_fallback_does_not_expand_or_retry(config_factory):

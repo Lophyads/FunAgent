@@ -7,7 +7,6 @@ a lightweight, open-source embedding database designed for local-first deploymen
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 try:
@@ -18,6 +17,7 @@ except ImportError:
     CHROMADB_AVAILABLE = False
 
 from src.core.settings import resolve_path
+from src.libs.vector_store.metadata_codec import MetadataCodec
 from src.libs.vector_store.base_vector_store import BaseVectorStore
 
 if TYPE_CHECKING:
@@ -268,7 +268,7 @@ class ChromaStore(BaseVectorStore):
                     'id': record_id,
                     'score': max(0.0, score),  # Clamp to [0, 1]
                     'text': documents[i] if documents[i] else '',  # Include text from documents
-                    'metadata': metadatas[i] if metadatas[i] else {}
+                    'metadata': MetadataCodec.decode(metadatas[i])
                 })
         
         logger.debug(f"Query returned {len(output)} results")
@@ -398,6 +398,8 @@ class ChromaStore(BaseVectorStore):
         Returns:
             Sanitized metadata dict.
         """
+        if str(metadata.get("schema_version", "")) == "2":
+            return MetadataCodec.encode(metadata)
         sanitized = {}
         for key, value in metadata.items():
             if isinstance(value, (str, int, float, bool)):
@@ -515,7 +517,7 @@ class ChromaStore(BaseVectorStore):
                 id_to_result[record_id] = {
                     'id': record_id,
                     'text': documents[i] if documents and documents[i] else '',
-                    'metadata': metadatas[i] if metadatas and metadatas[i] else {}
+                    'metadata': MetadataCodec.decode(metadatas[i] if metadatas else {})
                 }
         
         # Return results in the same order as input ids
@@ -529,3 +531,13 @@ class ChromaStore(BaseVectorStore):
         
         logger.debug(f"Retrieved {len([r for r in output if r])} of {len(ids)} records by IDs")
         return output
+
+    def close(self):
+        """Release public Chroma resources, including Windows HNSW file handles."""
+        self.client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()

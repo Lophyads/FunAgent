@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 # Set UTF-8 encoding for Windows console
-if sys.platform == "win32":
+if sys.platform == "win32" and __name__ == '__main__':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
@@ -71,19 +71,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip retrieval (evaluate with mock chunks for testing).",
     )
+    parser.add_argument('--labels',help='Evidence labels JSON for structured evaluation')
+    parser.add_argument('--build-id')
+    parser.add_argument('--profile')
+    parser.add_argument('--rerank',action='store_true')
+    parser.add_argument('--min-grade',type=float,default=2)
+    parser.add_argument('--output')
     return parser.parse_args()
 
 
 def main() -> int:
     """Main entry point."""
     args = parse_args()
+    from src.core.settings import resolve_path
+    test_data=json.loads(resolve_path(args.test_set).read_text(encoding='utf-8'))
+    if test_data.get('schema_version') == '2':
+        if args.no_search:
+            raise ValueError('Structured evidence evaluation requires actual retrieval')
+        if not args.labels:
+            raise ValueError('--labels is required for structured evidence evaluation')
+        from scripts.evaluate_structured import run
+        args.profile=args.profile or 'config/profiles/structured_v2.yaml'
+        args.collection=args.collection or 'server'
+        args.query_id=None
+        args.resume=False
+        report,path=run(args)
+        print(json.dumps(report if args.json else {'report':str(path),'status':report['status'],
+              'formal_quality_status':report['formal_quality_status']},ensure_ascii=False,indent=2))
+        return 0
 
     try:
         from src.core.settings import load_settings
         from src.libs.evaluator.evaluator_factory import EvaluatorFactory
         from src.observability.evaluation.eval_runner import EvalRunner
 
-        settings = load_settings()
+        settings = load_settings(args.profile)
     except Exception as exc:
         print(f"❌ Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -96,47 +118,8 @@ def main() -> int:
         print(f"❌ Failed to create evaluator: {exc}", file=sys.stderr)
         return 2
 
-    # Create HybridSearch (unless --no-search)
-    hybrid_search = None
-    if not args.no_search:
-        try:
-            from src.core.query_engine.query_processor import QueryProcessor
-            from src.core.query_engine.hybrid_search import create_hybrid_search
-            from src.core.query_engine.dense_retriever import create_dense_retriever
-            from src.core.query_engine.sparse_retriever import create_sparse_retriever
-            from src.ingestion.storage.bm25_indexer import BM25Indexer
-            from src.libs.embedding.embedding_factory import EmbeddingFactory
-            from src.libs.vector_store.vector_store_factory import VectorStoreFactory
-
-            collection = args.collection or "default"
-
-            vector_store = VectorStoreFactory.create(
-                settings, collection_name=collection,
-            )
-            embedding_client = EmbeddingFactory.create(settings)
-            dense_retriever = create_dense_retriever(
-                settings=settings,
-                embedding_client=embedding_client,
-                vector_store=vector_store,
-            )
-            bm25_indexer = BM25Indexer(index_dir=f"data/db/bm25/{collection}")
-            sparse_retriever = create_sparse_retriever(
-                settings=settings,
-                bm25_indexer=bm25_indexer,
-                vector_store=vector_store,
-            )
-            sparse_retriever.default_collection = collection
-
-            query_processor = QueryProcessor()
-            hybrid_search = create_hybrid_search(
-                settings=settings,
-                query_processor=query_processor,
-                dense_retriever=dense_retriever,
-                sparse_retriever=sparse_retriever,
-            )
-            print(f"✅ HybridSearch initialized for collection: {collection}")
-        except Exception as exc:
-            print(f"⚠️  Failed to initialize search (running without retrieval): {exc}")
+    from src.core.query_engine.query_entrypoint import StructuredSearchAdapter
+    hybrid_search = None if args.no_search else StructuredSearchAdapter(settings, args.collection or 'default')
 
     # Create and run EvalRunner
     runner = EvalRunner(
@@ -158,6 +141,9 @@ def main() -> int:
     except Exception as exc:
         print(f"❌ Evaluation failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if isinstance(hybrid_search, StructuredSearchAdapter):
+            hybrid_search.close()
 
     # Output results
     if args.json:

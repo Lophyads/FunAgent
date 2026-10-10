@@ -86,7 +86,7 @@ class MemoryReviewScheduler:
 
     def schedule(self, snapshot: TurnSnapshot) -> None:
         if (not self.every_turns or snapshot.result.status != "completed" or snapshot.trigger_kind != "user"
-                or snapshot.context is None or "memory" not in snapshot.context.entries_by_name):
+                or snapshot.context is None):
             return
         count = self.progress.observe_turn(snapshot.result.session_id, snapshot.result.turn_id, len(snapshot.messages))
         if count and count % self.every_turns == 0:

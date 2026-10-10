@@ -67,7 +67,9 @@ def _run_ingestion(
         if result.success:
             skipped = result.stages.get("integrity", {}).get("skipped", False)
             progress_bar.progress(1.0, text="⏭️ Already ingested" if skipped else "✅ Complete")
-            status_text.success(f"Successfully ingested **{uploaded_file.name}** into collection **{collection}**.")
+            status_text.success(f"已更新 **{uploaded_file.name}**，集合 **{collection}** 中已可查询。")
+            if result.degraded:
+                status_text.warning('部分模型处理已降级：' + '；'.join(result.warnings))
         else:
             status_text.error(f"Ingestion failed: {result.error}")
     except Exception as exc:
@@ -95,7 +97,7 @@ def render() -> None:
     with col1:
         uploaded = st.file_uploader(
             "Select a file to ingest",
-            type=["pdf", "txt", "md", "docx"],
+            type=["pdf", "md", "markdown"],
             key="ingest_uploader",
         )
     with col2:
@@ -110,7 +112,7 @@ def render() -> None:
     st.divider()
 
     # ── Document management section ────────────────────────────────
-    st.subheader("🗑️ Manage Documents")
+    st.subheader("🗑️ 已发布文档")
 
     try:
         svc = DataService()
@@ -133,7 +135,7 @@ def render() -> None:
     if not docs:
         st.info(
             "**No documents ingested yet.** "
-            "Upload a PDF, TXT, MD, or DOCX file above and click \"Start Ingestion\" to begin."
+            "Upload a PDF or Markdown file above and click \"Start Ingestion\" to begin."
         )
         return
 
@@ -147,7 +149,7 @@ def render() -> None:
                 f"images: {doc['image_count']}"
             )
         with col_btn:
-            if st.button("🗑️ Delete", key=f"del_{selected}_{idx}"):
+            if doc.get("can_delete", True) and st.button("🗑️ Delete", key=f"del_{selected}_{idx}"):
                 try:
                     result = svc.delete_document(
                         source_path=doc["source_path"],

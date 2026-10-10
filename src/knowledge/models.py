@@ -28,6 +28,8 @@ class KnowledgeRequest:
     turn_id: str = ""
     permissions: frozenset[str] = frozenset()
     capabilities: frozenset[str] = frozenset()
+    memory_enabled: bool = False
+    knowledge_enabled: bool = True
 
 
 class KnowledgePlan(BaseModel):
@@ -37,8 +39,10 @@ class KnowledgePlan(BaseModel):
     query: StrictStr = Field(max_length=512)
     query_variants: tuple[StrictStr, ...] = Field(max_length=1)
     reason: StrictStr = Field(max_length=240)
+    need_memory: StrictBool = False
+    memory_query: StrictStr = Field(default="", max_length=512)
 
-    @field_validator("query", "reason")
+    @field_validator("query", "reason", "memory_query")
     @classmethod
     def _strip_text(cls, value: str) -> str:
         return value.strip()
@@ -56,6 +60,10 @@ class KnowledgePlan(BaseModel):
             raise ValueError("retrieval requires a query")
         if not self.need_knowledge and (self.query or self.query_variants):
             raise ValueError("skip requires an empty query and no variants")
+        if self.need_memory and not self.memory_query:
+            raise ValueError("memory retrieval requires a query")
+        if not self.need_memory and self.memory_query:
+            raise ValueError("skipping memory requires an empty query")
         return self
 
 
@@ -77,3 +85,5 @@ class KnowledgeContext:
     queries: tuple[str, ...] = ()
     items: tuple[KnowledgeItem, ...] = ()
     warnings: tuple[str, ...] = ()
+    memory_status: Literal["skipped", "retrieved", "empty", "failed"] = "skipped"
+    memory_items: tuple[KnowledgeItem, ...] = ()

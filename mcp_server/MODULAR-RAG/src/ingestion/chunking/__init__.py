@@ -1,9 +1,4 @@
-"""Chunking module - document splitting adapter layer.
+"""Section-preserving evidence grouping."""
+from src.ingestion.chunking.structured_chunker import StructuredChunker
 
-This module provides the business adapter for text splitting, transforming
-Document objects into Chunk objects with proper metadata and traceability.
-"""
-
-from src.ingestion.chunking.document_chunker import DocumentChunker
-
-__all__ = ["DocumentChunker"]
+__all__ = ['StructuredChunker']

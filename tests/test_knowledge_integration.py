@@ -28,6 +28,11 @@ def planning_response(need=True):
     }, ensure_ascii=False), usage={"total_tokens": 7})
 
 
+def latest_user(request):
+    return next(message["content"] for message in reversed(request.body["messages"])
+                if message["role"] == "user")
+
+
 class FakeMcp:
     def __init__(self):
         self.calls = []
@@ -114,7 +119,8 @@ def test_same_model_plans_once_and_keeps_evidence_out_of_history(knowledge_stack
     for request in transport.requests[1:3]:
         names = {tool["function"]["name"] for tool in request.body["tools"]}
         assert "mcp__rag__echo" in names and "mcp__rag__query_knowledge_hub" not in names
-        assert "200 元" in request.body["messages"][0]["content"]
+        assert "200 元" in latest_user(request)
+        assert request.body["messages"][0]["content"] == config.system_prompt
     assert transport.requests[1].body["messages"][0] == transport.requests[2].body["messages"][0]
     assert transport.requests[4].body["messages"][0]["content"] == config.system_prompt
     assert [call[1] for call in client.calls].count("query_knowledge_hub") == 3
@@ -122,8 +128,9 @@ def test_same_model_plans_once_and_keeps_evidence_out_of_history(knowledge_stack
     with sqlite3.connect(config.database_path) as db:
         prompt, = db.execute("SELECT system_prompt_bytes FROM sessions WHERE id='s'").fetchone()
         assert prompt.decode() == config.system_prompt
-        persisted = db.execute("SELECT content FROM messages WHERE session_id='s'").fetchall()
-        assert all("need_knowledge" not in (content or "") for content, in persisted)
+        persisted = db.execute("SELECT content, api_content FROM messages WHERE session_id='s'").fetchall()
+        assert all("need_knowledge" not in (content or "") and "<retrieved_knowledge>" not in (content or "")
+                   and "<retrieved_knowledge>" not in (api_content or "") for content, api_content in persisted)
     plan_events = [event for event in events if event.name == "knowledge.plan_completed"]
     assert len(plan_events) == 2 and all(event.payload["role"] == "knowledge_planner" for event in plan_events)
     assert all(event.payload["usage"]["total"] == 7 for event in plan_events)
@@ -144,6 +151,46 @@ def test_guessed_hidden_tool_cannot_execute(knowledge_stack, agent_factory):
         result = agent.run_turn_blocking("hello", session_id="hidden")
     assert result.status == "completed" and not client.calls
     assert "unknown_tool" in json.dumps(result.model_dump(), ensure_ascii=False)
+
+
+def test_memory_and_modular_rag_share_one_real_planning_call(knowledge_stack, agent_factory):
+    from test_knowledge import FixedRetriever
+    config, client = knowledge_stack
+    memory = FixedRetriever((KnowledgeItem("m", "memory:note", "项目 A 曾决定使用统一预算。"),))
+    response = planning_response()
+    data = json.loads(response.content)
+    data.update(need_memory=True, memory_query="项目 A 预算 决定")
+    transport = ScriptedTransport(NormalizedModelResponse(content=json.dumps(data, ensure_ascii=False)),
+                                  NormalizedModelResponse(content="回答"))
+    with agent_factory(config, transports={"primary": transport}, memory_retriever=memory) as agent:
+        assert agent.run_turn_blocking("项目 A 的历史预算决定和报销制度是什么？").status == "completed"
+    assert len(transport.requests) == 2 and len(client.calls) == 3
+    assert memory.queries == ["项目 A 预算 决定"]
+    flags = json.loads(transport.requests[0].body["messages"][-1]["content"])
+    assert "memory_enabled" not in flags and "knowledge_enabled" not in flags
+    prompt = transport.requests[0].body["messages"][0]["content"]
+    assert "need_memory" in prompt and "need_knowledge" in prompt
+    assert "统一预算" in latest_user(transport.requests[1]) and "200 元" in latest_user(transport.requests[1])
+    assert transport.requests[1].body["messages"][0]["content"] == config.system_prompt
+
+
+def test_planner_can_skip_knowledge_while_recalling_memory(knowledge_stack, agent_factory):
+    from test_knowledge import FixedRetriever
+    config, client = knowledge_stack
+    memory = FixedRetriever((KnowledgeItem("m", "memory:note", "项目 A 曾决定使用统一预算。"),))
+    data = json.loads(planning_response(False).content)
+    data.update(need_memory=True, memory_query="项目 A 预算 决定")
+    transport = ScriptedTransport(NormalizedModelResponse(content=json.dumps(data, ensure_ascii=False)),
+                                  NormalizedModelResponse(content="回答"))
+    with agent_factory(config, transports={"primary": transport}, memory_retriever=memory) as agent:
+        assert agent.run_turn_blocking("项目 A 此前的预算决定是什么？").status == "completed"
+    assert len(transport.requests) == 2 and not client.calls
+    assert memory.queries == ["项目 A 预算 决定"]
+    prompt = transport.requests[0].body["messages"][0]["content"]
+    payload = json.loads(transport.requests[0].body["messages"][-1]["content"])
+    assert "always" not in prompt and "mode=" not in prompt and "mode" not in payload
+    current = latest_user(transport.requests[1])
+    assert "统一预算" in current and "<retrieved_knowledge>" not in current
 
 
 def test_knowledge_denies_override_explicit_enables_without_hiding_other_mcp_tools(knowledge_stack, agent_factory):
@@ -168,7 +215,7 @@ def test_knowledge_denies_override_explicit_enables_without_hiding_other_mcp_too
     for request in transport.requests[1:]:
         names = {item["function"]["name"] for item in request.body["tools"]}
         assert not hidden.intersection(names) and "mcp__rag__echo" in names
-        assert "200 元" in request.body["messages"][0]["content"]
+        assert "200 元" in latest_user(request)
 
 
 def test_dedicated_same_model_route_is_not_a_main_fallback(knowledge_stack):
@@ -213,7 +260,7 @@ def test_guard_denial_prevents_background_mcp_call(knowledge_stack, agent_factor
     with agent_factory(config, transports={"primary": transport}, guard=Deny()) as agent:
         result = agent.run_turn_blocking("q")
     assert result.status == "completed" and not client.calls
-    assert "failed" in transport.requests[1].body["messages"][0]["content"]
+    assert "failed" in latest_user(transport.requests[1])
 
 
 def test_transient_loop_defaults_to_noop_even_when_config_enabled(knowledge_stack, agent_factory):
@@ -311,8 +358,8 @@ def test_effective_permissions_are_checked_each_turn(knowledge_stack, agent_fact
         )
     assert denied.status == allowed.status == "completed"
     assert len(client.calls) == 3
-    assert "failed" in transport.requests[1].body["messages"][0]["content"]
-    assert "200 元" in transport.requests[3].body["messages"][0]["content"]
+    assert "failed" in latest_user(transport.requests[1])
+    assert "200 元" in latest_user(transport.requests[3])
 
 
 def test_cancel_during_planning_never_starts_retrieval(knowledge_stack, agent_factory):
@@ -354,7 +401,7 @@ def test_guard_wait_is_bounded_by_knowledge_phase(knowledge_stack, agent_factory
             release.set()
         elapsed = time.monotonic() - started
     assert result.status == "completed" and elapsed < 2.5 and not client.calls
-    assert "failed" in transport.requests[1].body["messages"][0]["content"]
+    assert "failed" in latest_user(transport.requests[1])
 
 
 def test_explicit_provider_needs_no_default_model_or_mcp(config_factory, agent_factory):
@@ -369,7 +416,7 @@ def test_explicit_provider_needs_no_default_model_or_mcp(config_factory, agent_f
     with agent_factory(config, transports={"primary": transport}, knowledge_provider=Provider()) as agent:
         result = agent.run_turn_blocking("q")
     assert result.status == "completed" and len(requests) == len(transport.requests) == 1
-    assert "自定义证据" in transport.requests[0].body["messages"][0]["content"]
+    assert "自定义证据" in latest_user(transport.requests[0])
 
 
 def test_concurrent_turns_do_not_share_knowledge(config_factory, agent_factory):
@@ -382,11 +429,11 @@ def test_concurrent_turns_do_not_share_knowledge(config_factory, agent_factory):
                 KnowledgeItem(request.session_id, "docs", f"evidence:{request.question}"),
             ))
     def answer(request):
-        question = request.body["messages"][-1]["content"]
-        prompt = request.body["messages"][0]["content"]
-        assert f"evidence:{question}" in prompt
+        content = latest_user(request)
+        question = content.split("\n\n", 1)[0]
+        assert f"evidence:{question}" in content
         other = "first" if question == "second" else "second"
-        assert f"evidence:{other}" not in prompt
+        assert f"evidence:{other}" not in content
         return NormalizedModelResponse(content=question)
     transport = ScriptedTransport(answer, answer)
     with agent_factory(config_factory(), transports={"primary": transport}, knowledge_provider=Provider()) as agent:

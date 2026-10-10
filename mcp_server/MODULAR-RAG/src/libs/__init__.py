@@ -5,7 +5,7 @@ This package contains the factory pattern implementations for
 pluggable components:
 - LLM clients
 - Embedding services
-- Splitters
+- Structured document loaders
 - Vector stores
 - Rerankers
 - Evaluators

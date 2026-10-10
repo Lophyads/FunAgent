@@ -80,10 +80,17 @@ permissions = ["file.write"]
 Prompt、有限历史、无工具的 JSON 输出和 `planner_timeout_seconds`；也可配置独立
 planner 路由，使用另一个模型或相同型号的不同端点。
 
-每个 Turn 首次回答前只准备一次知识。后台按主要查询、同义表达和原问题检索，
-合并去重后将有来源的证据加入本轮请求；RAG 工具同时从主模型 schema 与 handler
+每个 Turn 首次回答前只准备一次资料。事实记忆和知识库共用一次规划调用，分别判断
+是否检索。程序按启用来源组装规划 Prompt，仅包含对应规则和输出字段；来源开关不交给
+模型判断，输出中的禁用来源字段由程序归零，执行时再次限制可用来源。
+知识库是否检索遵循规划器的 `need_knowledge`，允许跳过；模式信息不进入 Prompt 或模型输入。
+知识库按主要查询、同义表达和原问题检索。合并去重后，有来源的证据
+追加到本轮真实 user 消息的 API 请求副本，system 和原始历史保持稳定；RAG 工具同时从主模型 schema 与 handler
 映射隐藏，复用通用 `disabled_tools` 策略，显式启用 RAG 工具也不会重新暴露。
-规划失败时只用原问题检索一次，证据不写入基础 Prompt 或持久化消息。
+规划失败时，各已启用来源只用原问题检索一次。资料只在本轮请求中出现，工具循环和
+模型重试复用同一结果，下一轮重新准备；证据不写入持久化消息或后台复盘历史。
+恢复执行也基于最近真实用户问题重新检索，不恢复上一次召回快照。临时资料退出后，
+其附加位置之后的 KV 可能需要重算，不保证完整历史缓存命中。
 后台记忆复盘默认使用 NoopKnowledgeProvider。
 
 记忆复盘使用专用 System Prompt、完整会话历史、执行时读取的最新记忆及仅含
@@ -93,7 +100,8 @@ planner 路由，使用另一个模型或相同型号的不同端点。
 完整结构化片段；旧引用 JSON 仍可使用，但会标记 `snippet_only`。实际配置默认
 不自动启用此功能；上线前应评估真实知识库的漏检率、引用质量和调用延迟。
 
-自定义接入可向 `AgentCore(..., knowledge_provider=...)` 注入同步 KnowledgeProvider；
+自定义接入可向 `AgentCore(..., knowledge_provider=...)` 注入同步 KnowledgeProvider，
+该参数替换整个资料准备流程，由自定义 Provider 提供两类来源的结果；
 默认 RetrievalKnowledgeProvider 也可组合自定义 KnowledgeRetriever，复用其规划、
 预算、合并和渲染逻辑。
 
@@ -199,13 +207,13 @@ uv run --extra dev --extra mcp pytest tests/test_mcp_client.py tests/test_mcp_in
 ### 接入本地 Modular RAG
 
 本机 `agentcore.toml` 已启用 `mcp`，并通过 `[tools.mcp_servers.rag]` 接入
-`E:/MODULAR-RAG-MCP-SERVER-main`。迁移到其他机器时，可复制
+`E:/FunAgent/mcp_server/MODULAR-RAG`。迁移到其他机器时，可复制
 `agentcore.toml.example` 中的 Modular RAG 配置并修改路径。
 
 连接使用 RAG 项目自己的 `.venv/Scripts/python.exe`，启动模块
-`src.mcp_server.server`，通过 `PYTHONPATH` 定位源码。该项目的 `main.py` 和
-`mcp-server` 命令目前只检查配置后退出，不能用于 MCP 连接。
-RAG 服务自行读取其 `config/settings.yaml`、`.env` 和既有 Chroma/BM25 索引；
+`src.mcp_server.server`，通过 `PYTHONPATH` 定位源码。同步安装环境后，
+`mcp-server` 命令也启动同一 stdio 服务。
+RAG 服务自行读取其 `config/settings.yaml`、`.env` 和当前注册的结构化索引；
 FunAgent 不需要复制这些文件或安装 RAG 依赖。
 
 当前只允许以下三个知识库读取工具，无需逐次审批：
@@ -236,14 +244,22 @@ uv run --extra mcp agentcore chat --config agentcore.toml
 
 CLI/Web 默认启用本地 SQLite，存放于配置文件旁的 `memories/memory.db`；
 无需云服务或 embedding。`[memory] enabled = false` 可关闭记忆，
-`review_every_turns = 0` 仅关闭后台复盘。默认 toolset 包含 `memory`；
-自定义 `enabled_toolsets` 时也需包含它。数据库是唯一记忆来源：`user` 保存稳定用户事实，
+`review_every_turns = 0` 仅关闭后台复盘。普通对话的模型 schema 和 handler 隐藏
+`memory`，显式启用也不能调用；Web 管理接口和后台复盘继续使用数据库。
+数据库是唯一记忆来源：`user` 保存偏好和稳定个人信息，
 `note` 保存长期笔记，`episode` 保存历史事件。原始对话仍由会话数据库保存。
 
-`memory` 工具支持 `list/search/add/replace/remove`，返回字符串 ID 和整数版本。
-`replace/remove` 按记录版本检查冲突并走现有人工审批。SQLite 关键词检索使用 FTS5/BM25，
-中文等 CJK 词补充子串匹配；这是关键词检索。新会话在 `memory_max_chars` 预算内
-加载 `user/note` 并冻结提示词；历史事件和最新记录通过工具查询。
+Web 支持添加、查询、修改和删除，返回字符串 ID 和整数版本；修改和删除按版本检查冲突。
+新会话在 `memory_max_chars` 预算内仅加载 `user` 并冻结 system；已有会话保留原快照，
+不会自动重写。每轮规划按需召回 `note/episode`，事实查询使用空格分隔的关键词。
+SQLite 使用现有 FTS5/BM25 和 CJK 子串匹配；Supabase 使用现有 embedding 搜索。
+事实召回不依赖 `[knowledge] enabled=true`。
+
+`[agent] memory_recall_top_k=5` 控制每类候选数量及合并后最多注入的条数：保留后端排序，
+交替合并并按 ID 去重。`memory_recall_max_chars=4000` 控制临时事实参考块的字符预算，
+与用户画像预算独立；设为 0 可停止事实召回。资料只追加到请求副本，不增加历史消息，
+重复命中时会在本轮重新提供。准备阶段使用 `knowledge.timeout_seconds`，记忆搜索批次
+使用 `timeouts.memory_seconds`；单源失败保留另一来源，取消及运行预算耗尽会正常中断。
 
 每 10 个成功完成的普通用户轮次排入独立后台复盘，可用 `review_every_turns` 调整。
 复盘只处理尚未完成复盘的区间，允许 `list/search/add`，不改写主会话历史、不调用知识检索。
@@ -265,7 +281,7 @@ uv run agentcore memory export --config agentcore.toml --directory memory-export
 ```
 
 导出拒绝覆盖已有文件。嵌入 `AgentCore` 时使用 `memory.MemoryFeature` 安装工具，
-传入其 `prompt_builder`、`review_scheduler`，在关闭 Agent 后关闭 Feature；
+传入其 `prompt_builder`、`memory_retriever=feature.retriever`、`review_scheduler`，在关闭 Agent 后关闭 Feature；
 Feature 接受注入的 MemoryStore，未来后端只需实现统一协议和工厂分支。
 
 ### Supabase 与本地 embedding

@@ -10,7 +10,7 @@ from typing import Any, Callable, Protocol
 from pydantic import ValidationError
 from knowledge.models import KnowledgeContext
 from knowledge.planner import request_from_messages
-from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider, render_knowledge
+from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider, with_retrieved_context
 from tools.toolsets import ToolsetRequest
 
 from .interfaces import (
@@ -457,10 +457,10 @@ class TurnPhases:
     def _assemble_phase(self) -> FunctionPhase:
         def assemble(runtime: TurnRuntime, state: LoopState) -> PhaseResult:
             context = state.require_context('assemble_request')
-            knowledge_block = render_knowledge(state.knowledge_context)
             state.request = CanonicalModelRequest.build(
-                system_prompt="\n\n".join(filter(None, (context.prompt.text, knowledge_block))),
-                messages=tuple(state.messages),
+                system_prompt=context.prompt.text,
+                messages=with_retrieved_context(tuple(state.messages), state.knowledge_context,
+                                                memory_max_chars=self.config.memory_recall_max_chars),
                 tool_schema_bytes=context.tool_schema_bytes,
             )
             logger.debug(

@@ -34,8 +34,9 @@ def _import_ragas() -> None:
         import ragas  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "The 'ragas' package is required for RagasEvaluator. "
-            "Install it with: pip install ragas datasets"
+            "Ragas evaluation dependencies cannot be imported: "
+            f"{exc}. Check the installed ragas/langchain versions; "
+            "the retrieval and custom evaluation paths remain available."
         ) from exc
 
 
@@ -75,11 +76,8 @@ class RagasEvaluator(BaseEvaluator):
             **kwargs: Additional parameters (reserved).
 
         Raises:
-            ImportError: If ragas is not installed.
             ValueError: If unsupported metric names are requested.
         """
-        _import_ragas()
-
         self.settings = settings
         self.kwargs = kwargs
 
@@ -160,6 +158,7 @@ class RagasEvaluator(BaseEvaluator):
         - Faithfulness / ContextPrecision: (user_input, response, retrieved_contexts)
         - AnswerRelevancy: (user_input, response)
         """
+        _import_ragas()
         from ragas.metrics.collections import (
             Faithfulness,
             AnswerRelevancy,

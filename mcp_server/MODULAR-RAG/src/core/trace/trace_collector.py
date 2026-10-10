@@ -9,7 +9,6 @@ predictable and testable.
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 from src.core.settings import resolve_path
 from src.core.trace.trace_context import TraceContext

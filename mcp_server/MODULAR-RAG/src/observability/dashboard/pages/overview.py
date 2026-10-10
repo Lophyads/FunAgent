@@ -7,7 +7,6 @@ Displays:
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict
 
 import streamlit as st
@@ -16,31 +15,15 @@ from src.observability.dashboard.services.config_service import ConfigService
 
 
 def _safe_collection_stats() -> Dict[str, Any]:
-    """Attempt to load collection statistics from ChromaDB.
-
-    Returns empty dict on failure so the page still renders.
-    """
+    """Count logical published collections through the same browsing service."""
+    from src.observability.dashboard.services.data_service import DataService
+    service = DataService()
     try:
-        from src.core.settings import load_settings, resolve_path
-        import chromadb
-        from chromadb.config import Settings as ChromaSettings
-
-        settings = load_settings()
-        persist_dir = str(
-            resolve_path(settings.vector_store.persist_directory)
-        )
-        client = chromadb.PersistentClient(
-            path=persist_dir,
-            settings=ChromaSettings(anonymized_telemetry=False, allow_reset=True),
-        )
-        stats: Dict[str, Any] = {}
-        for col in client.list_collections():
-            name = col.name if hasattr(col, "name") else str(col)
-            collection = client.get_collection(name)
-            stats[name] = {"chunk_count": collection.count()}
-        return stats
+        return {name: service.get_collection_stats(name) for name in service.list_collections()}
     except Exception:
         return {}
+    finally:
+        service.close()
 
 
 def render() -> None:

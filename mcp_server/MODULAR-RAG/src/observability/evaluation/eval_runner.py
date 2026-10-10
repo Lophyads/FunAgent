@@ -1,6 +1,6 @@
 """Evaluation runner for batch quality assessment.
 
-EvalRunner reads a golden test set, runs HybridSearch for each test case,
+EvalRunner reads a golden test set, runs the captured-snapshot search adapter for each test case,
 optionally generates answers, then invokes the configured Evaluator(s) to
 produce a structured evaluation report.
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -143,7 +143,7 @@ class EvalRunner:
 
     This class orchestrates:
     1. Loading the golden test set
-    2. Running HybridSearch for each query
+    2. Running the captured-snapshot search adapter for each query
     3. Optionally generating answers
     4. Invoking the evaluator to score each result
     5. Aggregating metrics into an EvalReport
@@ -166,13 +166,12 @@ class EvalRunner:
         evaluator: Optional[BaseEvaluator] = None,
         answer_generator: Any = None,
         answer_overrides: Optional[Dict[int, str]] = None,
-        reranker: Any = None,
     ) -> None:
         """Initialize EvalRunner.
 
         Args:
             settings: Application settings.
-            hybrid_search: HybridSearch instance for retrieval.
+            hybrid_search: the captured-snapshot search adapter instance for retrieval.
             evaluator: BaseEvaluator instance for scoring.
             answer_generator: Optional callable(query, chunks) -> str
                 for generating answers. If None, a simple concatenation
@@ -180,14 +179,12 @@ class EvalRunner:
             answer_overrides: Optional dict mapping test case index (0-based)
                 to a user-provided answer string. When present, the override
                 answer is used instead of auto-generation for that test case.
-            reranker: Optional CoreReranker instance for reranking results.
         """
         self.settings = settings
         self.hybrid_search = hybrid_search
         self.evaluator = evaluator
         self.answer_generator = answer_generator
         self.answer_overrides = answer_overrides or {}
-        self.reranker = reranker
 
     def run(
         self,
@@ -227,7 +224,7 @@ class EvalRunner:
             test_set_path=str(test_set_path),
         )
 
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
 
         for idx, tc in enumerate(test_cases):
             logger.info("Evaluating [%d/%d]: %s", idx + 1, len(test_cases), tc.query[:60])
@@ -239,7 +236,7 @@ class EvalRunner:
             )
             report.query_results.append(qr)
 
-        report.total_elapsed_ms = (time.monotonic() - t0) * 1000.0
+        report.total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
         report.aggregate_metrics = self._aggregate_metrics(report.query_results)
 
         logger.info(
@@ -269,7 +266,7 @@ class EvalRunner:
         Returns:
             QueryResult with metrics for this test case.
         """
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         qr = QueryResult(query=test_case.query)
 
         # Step 1: Retrieve chunks
@@ -305,7 +302,7 @@ class EvalRunner:
             logger.warning("Evaluation failed for '%s': %s", test_case.query[:40], exc)
             qr.metrics = {}
 
-        qr.elapsed_ms = (time.monotonic() - t0) * 1000.0
+        qr.elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return qr
 
     def _retrieve(
@@ -314,29 +311,20 @@ class EvalRunner:
         top_k: int,
         collection: Optional[str],
     ) -> List[Any]:
-        """Retrieve chunks using HybridSearch + optional Reranking.
+        """Retrieve chunks using the captured-snapshot search adapter + optional Reranking.
 
         Falls back to an empty list if search is not configured.
         """
         if self.hybrid_search is None:
-            logger.warning("No HybridSearch configured; returning empty results.")
+            logger.warning("No the captured-snapshot search adapter configured; returning empty results.")
             return []
 
         try:
-            # Retrieve more candidates if reranker is enabled
-            has_reranker = self.reranker is not None and getattr(self.reranker, 'is_enabled', False)
-            initial_top_k = top_k * 2 if has_reranker else top_k
-
             results = self.hybrid_search.search(
                 query=query,
-                top_k=initial_top_k,
+                top_k=top_k,
             )
             results = results if isinstance(results, list) else results.results
-
-            # Apply reranking if enabled
-            if has_reranker and results:
-                rerank_result = self.reranker.rerank(query=query, results=results, top_k=top_k)
-                results = rerank_result.results
 
             return results
         except Exception as exc:

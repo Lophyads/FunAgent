@@ -112,6 +112,8 @@ class MemoryFeature:
         self.settings = settings
         self.store = (store if store is not None else create_store(settings)) if settings.enabled else None
         self.prompt_builder = MemoryPromptBuilder(StaticSystemPromptBuilder(agent_config.system_prompt), self.store, agent_config.memory_max_chars) if self.store is not None else None
+        from .retrieval import MemoryKnowledgeRetriever
+        self.retriever = MemoryKnowledgeRetriever(self.store) if self.store is not None else None
         self.runner = self.queue = None
         self.review_scheduler = NoopReviewScheduler()
         self._protected = ()

@@ -11,7 +11,7 @@
   - data/mldr_eval_meta.json  {"queries": {qid: text}, "qrels": {qid: [docid]}}
 
 用法：
-  python scripts/prepare_mldr_docs.py --num-queries 10 --max-negatives 20
+  python scripts/prepare_mldr_docs.py --data /path/to/dev.jsonl.gz --num-queries 10 --max-negatives 20
 """
 from __future__ import annotations
 
@@ -30,14 +30,13 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_DATA = Path(r"C:/Users/ql136/WorkBuddy/2026-10-05-21-22-48/rag_eval/data/mldr/dev.jsonl.gz")
 DOCS_DIR = _REPO_ROOT / "data" / "mldr_eval_docs"
 META_PATH = _REPO_ROOT / "data" / "mldr_eval_meta.json"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=str(DEFAULT_DATA), help="MLDR dev.jsonl.gz 路径")
+    ap.add_argument("--data", required=True, help="MLDR dev.jsonl.gz 路径")
     ap.add_argument("--num-queries", type=int, default=10, help="选几个 query（= 正例文档数）")
     ap.add_argument("--max-negatives", type=int, default=20, help="负例文档数上限")
     args = ap.parse_args()
@@ -87,8 +86,8 @@ def main():
     lens = [len(t) for t in all_docs.values()]
     print(f"       文档长度: 最小 {min(lens)} / 最大 {max(lens)} / 平均 {sum(lens)//len(lens)} 字")
     print(f"       写入 {DOCS_DIR}")
-    print(f"下一步摄入：")
-    print(f"  python scripts/ingest_mmmarco_batch.py --docs-dir {DOCS_DIR} --collection mldr_eval")
+    print("下一步摄入：")
+    print(f"  python scripts/ingest.py --path {DOCS_DIR} --collection mldr_eval")
 
 
 if __name__ == "__main__":

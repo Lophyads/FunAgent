@@ -112,7 +112,8 @@ def _chat(args) -> int:
         gateway = GatewayRuntime(
             config, interaction_mode="poll", recovery_policy="attached",
             **({"prompt_builder": feature.prompt_builder,
-                "review_scheduler": feature.review_scheduler} if feature.settings.enabled else {}),
+                "review_scheduler": feature.review_scheduler,
+                "memory_retriever": feature.retriever} if feature.settings.enabled else {}),
         )
         gateway.start_blocking()
         return _chat_loop(gateway, args.session)
@@ -189,7 +190,8 @@ def _web(args) -> int:
         feature = MemoryFeature(load_memory_config(args.config), config)
         feature.install_tool(get_tool_registry())
         host = WebHost(config, memory=feature.store, memory_settings=feature.settings,
-            **({"prompt_builder": feature.prompt_builder, "review_scheduler": feature.review_scheduler}
+            **({"prompt_builder": feature.prompt_builder, "review_scheduler": feature.review_scheduler,
+                "memory_retriever": feature.retriever}
                if feature.settings.enabled else {}))
         host.start()
         server = WebServer(host, args.port)

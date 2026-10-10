@@ -6,8 +6,7 @@ for the Overview page.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from src.core.settings import Settings, load_settings
@@ -96,7 +95,7 @@ class ConfigService:
         cards.append(ComponentInfo(
             name="Reranker",
             provider=s.rerank.provider if s.rerank.enabled else "disabled",
-            model=s.rerank.model if s.rerank.enabled else "-",
+            model=(s.rerank.llm.model if getattr(s.rerank,"llm",None) else s.llm.model) if s.rerank.enabled else "-",
             extra={"enabled": s.rerank.enabled, "top_k": s.rerank.top_k},
         ))
 
@@ -115,11 +114,13 @@ class ConfigService:
                 name="Ingestion",
                 provider=s.ingestion.splitter,
                 model="-",
-                extra={
-                    "chunk_size": s.ingestion.chunk_size,
-                    "chunk_overlap": s.ingestion.chunk_overlap,
+                extra=({
+                    "target_tokens": (s.ingestion.budget or {}).get("target_tokens", 384),
+                    "max_tokens": (s.ingestion.budget or {}).get("max_tokens", 500),
+                    "min_tokens": (s.ingestion.budget or {}).get("min_tokens", 100),
+                    "context_tokens": (s.ingestion.context or {}).get("max_tokens", 64),
                     "batch_size": s.ingestion.batch_size,
-                },
+                }),
             ))
 
         return cards

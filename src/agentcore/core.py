@@ -9,10 +9,12 @@ import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
 from contextvars import copy_context
+from dataclasses import replace
 from functools import partial
 from typing import Any, Callable, Sequence, TypeVar
 
-from knowledge.provider import KnowledgeProvider, NoopKnowledgeProvider, RetrievalKnowledgeProvider
+from knowledge.provider import KnowledgeProvider, KnowledgeRetriever, NoopKnowledgeProvider, RetrievalKnowledgeProvider
+from tools.toolsets import ToolsetRequest
 
 from .conversation_loop import ConversationLoop
 from .turn_persistence import TurnPersistence
@@ -90,6 +92,7 @@ class AgentCore:
         delivery_destination: str | None = None,
         max_recovery_attempts: int = 3,
         knowledge_provider: KnowledgeProvider | None = None,
+        memory_retriever: KnowledgeRetriever | None = None,
     ) -> None:
         if max_recovery_attempts < 1:
             raise ValueError("max_recovery_attempts must be positive")
@@ -115,6 +118,7 @@ class AgentCore:
         self._knowledge_provider = (
             knowledge_provider if knowledge_provider is not None else NoopKnowledgeProvider()
         )
+        self._memory_retriever = memory_retriever
         self._store = store or SQLiteStore(
             config.database_path,
             tool_result_max_chars=config.tool_result_max_chars,
@@ -122,7 +126,7 @@ class AgentCore:
         self._lease_store = lease_store or SQLiteTurnLeaseStore(self._store)
         self._validate_sync_extensions()
         self._validate_provider_routes()
-        if knowledge_provider is None and config.knowledge.enabled:
+        if knowledge_provider is None and (config.knowledge.enabled or memory_retriever is not None):
             try:
                 self._knowledge_provider = self._build_knowledge_provider()
             except BaseException:
@@ -228,6 +232,8 @@ class AgentCore:
             (self._lease_store, "assert_current", "TurnLeaseStore"),
             (self._lease_store, "release", "TurnLeaseStore"),
         ]
+        if self._memory_retriever is not None:
+            targets.append((self._memory_retriever, "search", "KnowledgeRetriever"))
         for target, method, label in targets:
             callback = getattr(target, method, None)
             if callback is None or not callable(callback):
@@ -266,7 +272,7 @@ class AgentCore:
         from knowledge.planner import RetrievalPlanner
 
         config = self._config.knowledge
-        if config.mcp is None or not config.source_description.strip():
+        if config.enabled and (config.mcp is None or not config.source_description.strip()):
             raise ValueError("enabled knowledge requires mcp binding and nonblank source_description")
         route = config.planner or self._config.routes[0]
         adapter = self._api_modes.get(route.api_mode)
@@ -279,10 +285,11 @@ class AgentCore:
         retriever = McpKnowledgeRetriever(
             config=config.mcp, registry=self._tool_registry,
             services=self._tool_services, guard=self._guard,
-        )
+        ) if config.enabled else None
         return RetrievalKnowledgeProvider(
             planner=RetrievalPlanner(route=route, runtime=binding, adapter=adapter, config=config),
-            retriever=retriever, config=config, hidden_model_tools=retriever.hidden_model_tools,
+            retriever=retriever, memory_retriever=self._memory_retriever, config=config,
+            hidden_model_tools=retriever.hidden_model_tools if retriever is not None else frozenset(),
         )
 
     def __enter__(self) -> "AgentCore":
@@ -485,11 +492,18 @@ class AgentCore:
             session_id=session_id, owner_id=self._owner_id, turn_id=turn_id,
             policy=self._config.lease,
         )
-        prepare = partial(
+        prepare_stored = partial(
             prepare_stored_turn, store=self._store, contexts=self._session_contexts,
             persistence=persistence, user_input=user_input, request=session_request,
             host_context=host_context, recovery=recovery,
         )
+
+        def prepare(runtime):
+            prepared = prepare_stored(runtime)
+            return replace(prepared, context=prepared.context.with_tool_policy(ToolsetRequest(
+                enabled_toolsets=(), disabled_tools=("memory",),
+            )))
+
         return ConversationLoop(
             config=self._config, user_input=user_input,
             session_id=session_id, turn_id=turn_id,

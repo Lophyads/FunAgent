@@ -11,7 +11,7 @@
   - data/mmmarco_eval_meta.json   {"queries": {qid: text}, "qrels": {qid: [doc_id,...]}}
 
 用法：
-  python scripts/prepare_mmmarco_docs.py --num-queries 300 --pool-size 2000
+  python scripts/prepare_mmmarco_docs.py --data-dir /path/to/dataset --num-queries 300 --pool-size 2000
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_DATA_DIR = Path(r"C:/Users/ql136/WorkBuddy/2026-10-05-21-22-48/rag_eval/data")
 DOCS_DIR = _REPO_ROOT / "data" / "mmmarco_eval_docs"
 META_PATH = _REPO_ROOT / "data" / "mmmarco_eval_meta.json"
 
@@ -58,7 +57,7 @@ def load_raw(data_dir: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    ap.add_argument("--data-dir", type=Path, required=True)
     ap.add_argument("--num-queries", type=int, default=300, help="评测查询数")
     ap.add_argument("--pool-size", type=int, default=2000, help="语料池大小（正例+随机负例）")
     ap.add_argument("--seed", type=int, default=42)

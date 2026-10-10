@@ -13,6 +13,8 @@ from memory.embedding import EmbeddingClient
 from memory.sqlite import SqliteMemoryStore
 from memory.store import MemoryBackendError, MemoryDraft, MemoryError, MemoryPatch, MemoryQuery, MemorySearch, MemoryVersionConflict
 from memory.supabase import SupabaseMemoryStore
+from memory.retrieval import MemoryKnowledgeRetriever
+from knowledge.models import KnowledgeRequest
 
 
 def config(**changes):
@@ -58,6 +60,23 @@ class Embedder:
 
     def close(self):
         self.closed += 1
+
+
+def test_factual_retriever_reuses_supabase_embedding_search_without_profile():
+    note = row("note", kind="note", content="Cache migration uses dual writes")
+    episode = row("episode", kind="episode", content="Migration approved", event_at="2026-10-06")
+    client, embed = RpcClient({"entries": [note]}, {"entries": [episode]}), Embedder()
+    store = SupabaseMemoryStore(config(), client=client, embedding=embed)
+    try:
+        values = MemoryKnowledgeRetriever(store).search(
+            "缓存 迁移", request=KnowledgeRequest("q"), top_k=5, runtime=None, check_active=lambda: None,
+        )
+        assert [item.id for item in values] == ["note", "episode"]
+        assert [params["p_kind"] for _, params in client.calls[1:]] == ["note", "episode"]
+        assert all(params["p_limit"] == 5 for _, params in client.calls[1:])
+        assert embed.calls == [(["缓存 迁移"], "query"), (["缓存 迁移"], "query")]
+    finally:
+        store.close()
 
 
 def sdk(response):

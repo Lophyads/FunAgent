@@ -106,13 +106,14 @@ class QueryProcessor:
         ['配置', 'Azure', 'OpenAI']
     """
     
-    def __init__(self, config: Optional[QueryProcessorConfig] = None):
+    def __init__(self, config: Optional[QueryProcessorConfig] = None, *, domain_tokenizer=None):
         """Initialize QueryProcessor.
         
         Args:
             config: Optional configuration. Uses defaults if not provided.
         """
         self.config = config or QueryProcessorConfig()
+        self.domain_tokenizer = domain_tokenizer
     
     def process(self, query: str) -> ProcessedQuery:
         """Process a user query into structured format.
@@ -220,10 +221,13 @@ class QueryProcessor:
         Returns:
             List of tokens
         """
+        if self.domain_tokenizer is not None:
+            return self.domain_tokenizer.tokenize(text)
         tokens: List[str] = []
 
         # Use jieba to segment (handles Chinese + keeps English intact)
         raw_tokens = jieba.lcut(text)
+        raw_tokens += re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+\b", text)
 
         for token in raw_tokens:
             token = token.strip()
@@ -262,7 +266,7 @@ class QueryProcessor:
                 continue
             
             # Skip stopwords (check both original and lowercase)
-            if token in self.config.stopwords or token_lower in self.config.stopwords:
+            if self.domain_tokenizer is None and (token in self.config.stopwords or token_lower in self.config.stopwords):
                 continue
             
             # Skip if too short

@@ -32,7 +32,7 @@ class TraceContext:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # internal monotonic clock for accurate elapsed calculation
-    _start_mono: float = field(default_factory=time.monotonic, repr=False)
+    _start_mono: float = field(default_factory=time.perf_counter, repr=False)
     _finish_mono: Optional[float] = field(default=None, repr=False)
     _stage_timings: Dict[str, float] = field(default_factory=dict, repr=False)
 
@@ -67,7 +67,7 @@ class TraceContext:
 
     def finish(self) -> None:
         """Mark the trace as finished and record wall-clock end time."""
-        self._finish_mono = time.monotonic()
+        self._finish_mono = time.perf_counter()
         self.finished_at = datetime.now(timezone.utc).isoformat()
 
     # ---- timing helpers -----------------------------------------------
@@ -92,7 +92,7 @@ class TraceContext:
                 raise KeyError(f"Stage '{stage_name}' has no recorded timing")
             return self._stage_timings[stage_name]
 
-        end = self._finish_mono if self._finish_mono is not None else time.monotonic()
+        end = self._finish_mono if self._finish_mono is not None else time.perf_counter()
         return (end - self._start_mono) * 1000.0
 
     # ---- serialisation ------------------------------------------------
@@ -113,20 +113,4 @@ class TraceContext:
             "metadata": dict(self.metadata),
         }
 
-    # ---- backwards-compat helper used in C5 / C6 -----------------------
 
-    def get_stage_data(self, stage_name: str) -> Optional[Dict[str, Any]]:
-        """Retrieve recorded data for a specific stage.
-
-        Searches stages list (last-write-wins for duplicate names).
-
-        Args:
-            stage_name: Name of the stage to retrieve.
-
-        Returns:
-            The ``data`` dict of the matching stage, or *None*.
-        """
-        for entry in reversed(self.stages):
-            if entry.get("stage") == stage_name:
-                return entry.get("data")
-        return None

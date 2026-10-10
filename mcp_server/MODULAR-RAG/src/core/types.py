@@ -15,67 +15,16 @@ Design Principles:
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List, Optional
 
+from src.core.index_registry import IndexSnapshot as IndexSnapshot
+from src.core.structured_types import (
+    DocumentElement as DocumentElement, SectionNode as SectionNode,
+    SourceSpan as SourceSpan, FigureAsset as FigureAsset,
+    FigureOccurrence as FigureOccurrence, FigureAnnotation as FigureAnnotation,
+    EvidenceRecord as EvidenceRecord, SearchUnit as SearchUnit,
+    DocumentBundle as DocumentBundle, QueryResultBundle as QueryResultBundle,
+)
 
-@dataclass
-class Document:
-    """Represents a raw document loaded from source.
-    
-    This is the output of Loaders (e.g., PDF Loader) before splitting.
-    
-    Attributes:
-        id: Unique identifier for the document (e.g., file hash or path-based ID)
-        text: Document content in standardized Markdown format.
-              Images are represented as placeholders: [IMAGE: {image_id}]
-        metadata: Document-level metadata including:
-            - source_path (required): Original file path
-            - doc_type: Document type (e.g., 'pdf', 'markdown')
-            - title: Document title extracted or inferred
-            - page_count: Total pages (if applicable)
-            - images: List of image references (see Images Field Specification below)
-            - Any other custom metadata
-    
-    Images Field Specification (metadata.images):
-        Structure: List[{"id": str, "path": str, "page": int, "text_offset": int, 
-                        "text_length": int, "position": dict}]
-        Fields:
-            - id: Unique image identifier (format: {doc_hash}_{page}_{seq})
-            - path: Image file storage path (convention: data/images/{collection}/{image_id}.png)
-            - page: Page number in original document (optional, for paginated docs like PDF)
-            - text_offset: Starting character position of placeholder in Document.text (0-based)
-            - text_length: Length of placeholder string (typically len("[IMAGE: {image_id}]"))
-            - position: Physical position info in original doc (optional, e.g., PDF coords, pixel position)
-        Note: text_offset and text_length enable precise placeholder location, 
-              supporting scenarios where the same image appears multiple times
-    
-    Example:
-        >>> doc = Document(
-        ...     id="doc_abc123",
-        ...     text="# Title\\n\\nContent...",
-        ...     metadata={
-        ...         "source_path": "data/documents/report.pdf",
-        ...         "doc_type": "pdf",
-        ...         "title": "Annual Report 2025"
-        ...     }
-        ... )
-    """
-    
-    id: str
-    text: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    
-    def __post_init__(self):
-        """Validate required metadata fields."""
-        if "source_path" not in self.metadata:
-            raise ValueError("Document metadata must contain 'source_path'")
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Document":
-        """Create Document from dictionary."""
-        return cls(**data)
+
 
 
 @dataclass
@@ -267,12 +216,12 @@ class ProcessedQuery:
 class RetrievalResult:
     """Represents a single retrieval result from Dense/Sparse retrievers.
     
-    This is the output of DenseRetriever, SparseRetriever, and HybridSearch,
+    This is the output of QueryService,
     providing a unified contract for retrieval results across all search methods.
     
     Attributes:
         chunk_id: Unique identifier for the retrieved chunk
-        score: Relevance score (higher = more relevant, normalized to [0, 1])
+        score: Algorithm-specific score; RRF and relevance grades are not probabilities
         text: The actual text content of the retrieved chunk
         metadata: Associated metadata (source_path, chunk_index, title, etc.)
     

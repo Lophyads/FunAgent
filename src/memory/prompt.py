@@ -26,9 +26,9 @@ def format_entry(entry) -> str:
     return f"{entry.kind} id={entry.id} v{entry.version}{subject}: {entry.content}"
 
 
-def core_blocks(store: MemoryStore, max_chars: int) -> tuple[str, ...]:
+def core_blocks(store: MemoryStore, max_chars: int, *, kinds=("user", "note")) -> tuple[str, ...]:
     remaining, blocks = max(0, max_chars), []
-    for kind in ("user", "note"):
+    for kind in kinds:
         if remaining <= 0:
             break
         for entry in iter_entries(store, kind):
@@ -48,7 +48,7 @@ class MemoryPromptBuilder:
     def build(self, request: PromptBuildRequest):
         available = max(0, self.max_chars - sum(map(len, request.bootstrap_memory)))
         try:
-            blocks = core_blocks(self.store, available)
+            blocks = core_blocks(self.store, available, kinds=("user",))
         except MemoryError as exc:
             logger.warning("memory.bootstrap_failed error_type=%s", type(exc).__name__)
             blocks = ()

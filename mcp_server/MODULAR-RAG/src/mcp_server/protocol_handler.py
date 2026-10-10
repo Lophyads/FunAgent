@@ -165,7 +165,7 @@ class ProtocolHandler:
                 ],
                 isError=True,
             )
-        except Exception as e:
+        except Exception:
             # Internal error - don't leak stack trace
             self._logger.exception("Internal error executing tool %s", name)
             return types.CallToolResult(
@@ -197,22 +197,25 @@ def _register_default_tools(protocol_handler: ProtocolHandler) -> None:
     """
     # Import and register query_knowledge_hub tool
     from src.mcp_server.tools.query_knowledge_hub import register_tool as register_query_tool
-    register_query_tool(protocol_handler)
+    if 'query_knowledge_hub' not in protocol_handler.tools:
+        register_query_tool(protocol_handler)
     
     # Import and register list_collections tool
     from src.mcp_server.tools.list_collections import register_tool as register_list_tool
-    register_list_tool(protocol_handler)
+    if 'list_collections' not in protocol_handler.tools:
+        register_list_tool(protocol_handler)
     
     # Import and register get_document_summary tool
     from src.mcp_server.tools.get_document_summary import register_tool as register_summary_tool
-    register_summary_tool(protocol_handler)
+    if 'get_document_summary' not in protocol_handler.tools:
+        register_summary_tool(protocol_handler)
 
 
 def create_mcp_server(
     server_name: str,
     server_version: str,
     protocol_handler: Optional[ProtocolHandler] = None,
-    register_tools: bool = True,
+    register_tools: Optional[bool] = None,
 ) -> Server:
     """Create and configure an MCP server with the protocol handler.
 
@@ -224,7 +227,7 @@ def create_mcp_server(
         server_version: Version string.
         protocol_handler: Optional pre-configured protocol handler.
             If None, a new one will be created.
-        register_tools: Whether to register default tools (default: True).
+        register_tools: None registers defaults for an empty handler; True adds missing defaults.
 
     Returns:
         Configured Server instance ready to run.
@@ -235,7 +238,9 @@ def create_mcp_server(
             server_version=server_version,
         )
 
-    # Register default tools if requested
+    # Preserve a caller's preconfigured tools; an empty handler gets defaults.
+    if register_tools is None:
+        register_tools = not bool(protocol_handler.tools)
     if register_tools:
         _register_default_tools(protocol_handler)
 

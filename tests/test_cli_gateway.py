@@ -502,6 +502,7 @@ def test_cli_cleanup_preserves_business_error_and_attempts_all_steps(monkeypatch
         settings = SimpleNamespace(enabled=True)
         prompt_builder = object()
         review_scheduler = object()
+        retriever = object()
         def __init__(self, *args):
             pass
         def install_tool(self, registry):
