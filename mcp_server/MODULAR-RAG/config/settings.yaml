@@ -1,0 +1,52 @@
+# Modular RAG MCP Server — default configuration
+# Auto-generated to satisfy the dashboard's ConfigService (Overview page).
+# Adjust provider/model values to match your actual deployment.
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  temperature: 0.0
+  max_tokens: 4096
+  api_key_env: OPENAI_API_KEY
+
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+  api_key_env: EMBEDDING_API_KEY
+
+vector_store:
+  provider: chroma
+  persist_directory: data/chroma_db
+  collection_name: default
+
+retrieval:
+  dense_top_k: 10
+  sparse_top_k: 10
+  fusion_top_k: 10
+  rrf_k: 60
+
+rerank:
+  enabled: false
+  provider: none
+  model: none
+  top_k: 10
+
+evaluation:
+  enabled: false
+  provider: ragas
+  metrics:
+    - faithfulness
+    - answer_relevancy
+
+observability:
+  log_level: INFO
+  trace_enabled: true
+  trace_file: logs/traces.jsonl
+  structured_logging: true
+
+ingestion:
+  chunk_size: 512
+  chunk_overlap: 64
+  splitter: recursive
+  batch_size: 32

@@ -4,10 +4,11 @@ from uuid import uuid4
 import json
 import time
 
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import ControlError, DomainError, RunResult, Message, RunInput, thaw
-from ..model import ModelRuntime, ModelStrategy, FallbackRule
-from ..persistence import DbMgr
+from ..model.model_runtime import ModelRuntime
+from ..model.protocols import ModelStrategy, FallbackRule
+from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import ReviewStore
 from .prompt import Evidence
 from .contracts import MemoryQuery
@@ -30,7 +31,7 @@ class MemoryReviewStrategy(ModelStrategy):
 class ReviewProcess:
     @staticmethod
     def Run(job, context):
-        from . import MemoryMgr
+        from .memory_mgr import MemoryMgr
         store: ReviewStore = DbMgr.GetInstance()
         try:
             context.CheckCancelled()

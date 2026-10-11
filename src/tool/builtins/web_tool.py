@@ -1,5 +1,5 @@
 from ...frame.contracts import ToolDefinition
-from ..registry import ToolEntry
+from ..tool_registrar import ToolEntry
 from ..backends.handler import BackendHandler
 
 

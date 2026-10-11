@@ -60,7 +60,7 @@ def RequiredBackends(conf):
 
 
 def Create(conf, conf_dir, own, *, backends=None):
-    from .manager import MemoryManager
+    from .memory_manager import MemoryManager
     stores = {}
     for name, settings in conf.Memory().Sources().items():
         if settings["store"] == "callback" and settings["callback_id"] == "mcp":

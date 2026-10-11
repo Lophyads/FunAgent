@@ -8,7 +8,7 @@ import json
 from .contracts import DomainError, thaw
 from ..model.contracts import RunEvent
 from .protocols import TaskEventReader, RunEventWriter
-from .display import WebProjection
+from .web_projection import WebProjection
 
 
 class EventAccess(TaskEventReader, RunEventWriter, Protocol):

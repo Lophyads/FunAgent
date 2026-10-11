@@ -8,12 +8,12 @@ from threading import Lock
 
 from ..frame.contracts import ControlError, DomainError, RunContext, ToolCall, ToolDefinition, ToolResult, thaw
 
-from ..frame.schema import ToolValidator
-from ..frame.interaction import InteractionMgr
+from ..frame.tool_validator import ToolValidator
+from ..frame.interaction_mgr import InteractionMgr
 from .contracts import ToolFailure, ToolSelection, ToolSelectionRequest
 from .protocols import ToolHandler
 from .policy import Available, Decide, BindApproval, RequestedNames
-from .registry import ToolEntry
+from .tool_registrar import ToolEntry
 
 
 class ToolRegistry:

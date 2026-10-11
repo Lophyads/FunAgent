@@ -8,7 +8,7 @@ from urllib.parse import quote, urlencode
 from ..frame.contracts import ControlError, DomainError
 from ..tool.contracts import BackendResult
 from ..tool.protocols import KnowledgeBackend
-from ..frame.schema import ToolValidator
+from ..frame.tool_validator import ToolValidator
 
 
 class MCPMemoryQuery:

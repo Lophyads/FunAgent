@@ -1,6 +1,6 @@
 """Workspace file tools use one policy and one bounded filesystem implementation."""
 from ...frame.contracts import ToolDefinition, ToolResult
-from ..registry import ToolEntry
+from ..tool_registrar import ToolEntry
 from ..policy import ActionPolicy
 from ..contracts import ToolDecision
 from .. import files

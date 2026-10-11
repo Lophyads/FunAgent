@@ -3,7 +3,8 @@ from pathlib import Path
 import json
 import os
 from ..frame.contracts import DomainError
-from ..memory import MemoryOperationsMgr, MemoryListQuery
+from ..memory.memory_operations_mgr import MemoryOperationsMgr
+from ..memory.contracts import MemoryListQuery
 
 
 def Export(source_id, filename):

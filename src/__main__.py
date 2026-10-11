@@ -1,3 +1,3 @@
-from .frame.global_server import main
+from .app.main import main
 
 raise SystemExit(main())

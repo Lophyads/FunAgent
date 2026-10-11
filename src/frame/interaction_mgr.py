@@ -8,7 +8,7 @@ import time
 from .contracts import ApprovalBinding, ControlError, DomainError, Interaction, RunContext
 from .protocols import InteractionAccess
 from .clarification import ValidateQuestions, ValidateAnswers
-from .events import Emit
+from .event_mgr import Emit
 
 
 @dataclass

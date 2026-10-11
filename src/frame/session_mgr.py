@@ -4,7 +4,7 @@ from pathlib import Path
 import time
 import logging
 
-from ..persistence import DbMgr
+from ..persistence.db_mgr import DbMgr
 from .contracts import DomainError, ControlError, SessionCreate, PageQuery, HistoryQuery
 
 
@@ -44,8 +44,8 @@ class SessionMgr:
         session = SessionMgr.Load(session_id).session
         if session.prompt is not None:
             return session.prompt
-        from .conf import ConfMgr
-        from ..memory import MemoryMgr
+        from .conf_mgr import ConfMgr
+        from ..memory.memory_mgr import MemoryMgr
         from ..memory.protocols import ProfileReader
         from ..memory.prompt import Evidence
         conf = ConfMgr.GetInstance()

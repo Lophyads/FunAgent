@@ -1,7 +1,7 @@
 """Only the optional table-specific persistence port is exposed to the browser."""
 import re
 from ..frame.contracts import DomainError
-from ..persistence import DbMgr
+from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import DataReadStore
 
 

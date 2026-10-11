@@ -1,6 +1,6 @@
 from ...frame.contracts import ToolDefinition
-from ..registry import ToolEntry
-from ..workspace import ReadWorkspaceHandler
+from ..tool_registrar import ToolEntry
+from ..read_workspace_handler import ReadWorkspaceHandler
 import ast
 import math
 import operator

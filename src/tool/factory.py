@@ -1,6 +1,6 @@
 """Construct one candidate from explicit declarations, then return it to startup."""
 from ..frame.contracts import DomainError, RunContext, ToolResult
-from .registry import ToolRegistrar
+from .tool_registrar import ToolRegistrar
 from .discovery import Discover, AddRemote
 from .policy import RequestedNames
 from .backends.factory import Create as CreateBackend
@@ -34,7 +34,7 @@ def _backend_check(backend, original, required):
 
 
 def Create(conf, own=None, *, required_backends=(), bind_backend=None):
-    from .dispatch import ToolRegistry
+    from .tool_registry import ToolRegistry
     candidate = ToolRegistrar()
     Discover(TOOL_PACKAGES, candidate)
     entries = {entry.definition.name: entry for entry in candidate.Entries()}

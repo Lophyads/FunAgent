@@ -5,11 +5,11 @@ from threading import Condition, Thread
 from uuid import uuid4
 import time
 from ..frame.contracts import CancelResult, DomainError, RunContext, RunResult, PageQuery
-from ..persistence import DbMgr
+from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import TaskStore
-from ..frame.interaction import InteractionMgr
+from ..frame.interaction_mgr import InteractionMgr
 from .protocols import TaskExecutor
-from ..frame.events import Emit
+from ..frame.event_mgr import Emit
 
 
 class TaskQueue:

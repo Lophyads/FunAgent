@@ -3,18 +3,19 @@ from threading import Event
 import json
 import sys
 import shlex
-from . import DiagnosticsMgr
+from .diagnostics_mgr import DiagnosticsMgr
 
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery
-from ..frame.session import SessionMgr
-from ..task import TaskMgr
-from ..frame.review import ReviewScheduler
-from ..frame.interaction import InteractionMgr
+from ..frame.session_mgr import SessionMgr
+from ..task.task_mgr import TaskMgr
+from ..frame.review_scheduler import ReviewScheduler
+from ..frame.interaction_mgr import InteractionMgr
 from ..frame.clarification import QuestionData
-from ..memory import MemoryOperationsMgr, MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
-from . import diagnostics
-from .export import Export
+from ..memory.memory_operations_mgr import MemoryOperationsMgr
+from ..memory.contracts import MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
+from . import diagnostic_service
+from .memory_export import Export
 
 
 class CLIController:
@@ -176,13 +177,13 @@ class CLIController:
             return
         command = parts[0]
         if command == "tools" and parts[1:] == ["doctor"]:
-            tools = diagnostics.Read("tools")["tools"]
-            connections = diagnostics.Read("connections")["connections"]
+            tools = diagnostic_service.Read("tools")["tools"]
+            connections = diagnostic_service.Read("connections")["connections"]
             healthy = all(item["available"] for item in connections if item["selected"])
             healthy = healthy and all(item["selected"] for item in tools if item["requested"])
             print(json.dumps({"healthy": healthy, "tools": tools, "connections": connections}, ensure_ascii=False), file=output)
-        elif command in diagnostics.KINDS and len(parts) == 1:
-            print(json.dumps(diagnostics.Read(command), ensure_ascii=False), file=output)
+        elif command in diagnostic_service.KINDS and len(parts) == 1:
+            print(json.dumps(diagnostic_service.Read(command), ensure_ascii=False), file=output)
         elif command == "help" and len(parts) == 1:
             print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
         elif command == "new":

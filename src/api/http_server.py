@@ -8,16 +8,16 @@ import re
 import socket
 import time
 
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, thaw
-from ..frame.session import SessionMgr
-from ..task import TaskMgr
-from ..frame.interaction import InteractionMgr
+from ..frame.session_mgr import SessionMgr
+from ..task.task_mgr import TaskMgr
+from ..frame.interaction_mgr import InteractionMgr
 from ..frame.clarification import QuestionData
-from ..frame.events import EventMgr
-from .validation import Fields as _fields, Text as _text
-from . import management, diagnostics, data
-from ..frame.display import TaskView
+from ..frame.event_mgr import EventMgr
+from .request_validation import Fields as _fields, Text as _text
+from . import memory_routes, diagnostic_service, data_routes
+from ..frame.web_projection import TaskView
 
 
 ERRORS = {
@@ -97,11 +97,11 @@ class HTTPController:
                 raise DomainError("INVALID_REQUEST", "Unexpected query")
             if method != "GET":
                 raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
-            return 200, diagnostics.Read(route.removeprefix("/diagnostics/"))
+            return 200, diagnostic_service.Read(route.removeprefix("/diagnostics/"))
         if route.startswith("/memory/"):
-            return management.Handle(method, route, query, body)
+            return memory_routes.Handle(method, route, query, body)
         if route.startswith("/data/"):
-            return data.Handle(method, route, query)
+            return data_routes.Handle(method, route, query)
         if route == "/sessions":
             if method == "POST":
                 _fields(body, {"title"})

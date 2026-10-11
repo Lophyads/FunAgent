@@ -5,12 +5,12 @@ import unicodedata
 from dataclasses import replace
 
 from ...frame.contracts import ControlError, DomainError, ToolDefinition, ToolResult
-from ...memory import MemoryMgr
+from ...memory.memory_mgr import MemoryMgr
 from ...memory.contracts import MemoryDraft, MemoryListQuery, MemoryPatch, MemoryQuery, MemoryRef, UNSET
 from ...memory.policy import Outcome
 from ...memory.prompt import RecordData
 from ...memory.protocols import MemoryReader, MemoryWriter
-from ..registry import ToolEntry
+from ..tool_registrar import ToolEntry
 from ..contracts import ToolDecision
 
 

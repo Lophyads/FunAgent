@@ -1,8 +1,8 @@
 """Structured clarification through the shared human interaction broker."""
 import json
 from ...frame.contracts import ClarificationQuestion, ControlError, DomainError, ToolDefinition, ToolResult, thaw
-from ...frame.interaction import InteractionMgr
-from ..registry import ToolEntry
+from ...frame.interaction_mgr import InteractionMgr
+from ..tool_registrar import ToolEntry
 
 
 CLARIFY_DEFINITION = ToolDefinition("clarify", "Ask one to five questions with stable IDs", {

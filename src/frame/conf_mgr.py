@@ -253,6 +253,11 @@ def _validate(docs):
                     _text(variable, "tool.backends.env")
         if backend["kind"] == "computer_use":
             _text(backend["endpoint"], "tool.backends.endpoint")
+        if backend["kind"] == "treg_web":
+            _require(not backend.get("discover", False), "tool.backends.discover")
+            _require(not backend.get("allow_private", False), "tool.backends.allow_private")
+            _require(backend.get("endpoint", "https://treg.to/mcp/") == "https://treg.to/mcp/",
+                     "tool.backends.endpoint")
     for definition in definitions.values():
         _require(isinstance(definition, dict) and set(definition) <= {"requires_approval", "backend_id"}, "tool.tools")
         if "requires_approval" in definition:

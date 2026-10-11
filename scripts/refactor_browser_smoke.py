@@ -22,7 +22,7 @@ def main():
     args = parser.parse_args()
     if not args.installed:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from src.frame import global_server
+    from src.app import application
     from src.model.demo import DemoProvider
     from src.model import ModelError
     from src.frame.contracts import ModelReply, ToolCall
@@ -41,7 +41,7 @@ def main():
                 raise ModelError("AUTH")
             return super().Send(request, context)
 
-    print(f"Application package: {Path(global_server.__file__).resolve()}", flush=True)
+    print(f"Application package: {Path(application.__file__).resolve()}", flush=True)
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="funagent-browser-") as temporary:
@@ -58,7 +58,7 @@ def main():
         from src.model import factory as model_factory
         original = model_factory.PROVIDERS["demo"]
         model_factory.PROVIDERS["demo"] = SmokeProvider
-        from src.api.http import _Handler
+        from src.api.http_server import _Handler
         original_post = _Handler.do_POST
         def controls(handler):
             if handler.path == '/test/expire-management':
@@ -68,8 +68,8 @@ def main():
                     operations._pending = {key: (0, *value[1:]) for key, value in operations._pending.items()}
                 handler._send(200, {'expired': True})
             elif handler.path == '/test/reset-display':
-                from src.frame.events import EventMgr
-                from src.frame.display import WebProjection
+                from src.frame.event_mgr import EventMgr
+                from src.frame.web_projection import WebProjection
                 service = EventMgr.GetInstance()
                 with service._condition:
                     service._web = WebProjection()
@@ -79,12 +79,12 @@ def main():
                 original_post(handler)
         _Handler.do_POST = controls
         try:
-            global_server.Start(conf)
+            application.Start(conf)
             command = [args.node, str(root / "scripts/refactor_browser_smoke.cjs"), args.playwright,
                        args.browser, f"http://127.0.0.1:{port}", str(args.artifact_dir.resolve())]
             result = subprocess.run(command, timeout=180).returncode
         finally:
-            global_server.Stop()
+            application.Stop()
             model_factory.PROVIDERS["demo"] = original
             _Handler.do_POST = original_post
         assert not any(t.name.startswith("funagent-") for t in threading.enumerate())

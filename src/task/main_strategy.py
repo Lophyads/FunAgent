@@ -1,5 +1,5 @@
-from ..frame.conf import ConfMgr
-from ..model import ModelStrategy, FallbackRule
+from ..frame.conf_mgr import ConfMgr
+from ..model.protocols import ModelStrategy, FallbackRule
 
 class MainStrategy(ModelStrategy):
     @staticmethod

@@ -1,8 +1,9 @@
 """Management routes parse values; the shared memory use case owns authority."""
 import re
 from ..frame.contracts import DomainError
-from ..memory import MemoryOperationsMgr, MemoryQuery, MemoryListQuery, MemoryRef, MemoryPatch, MemoryDraft
-from .validation import Fields, Text
+from ..memory.memory_operations_mgr import MemoryOperationsMgr
+from ..memory.contracts import MemoryQuery, MemoryListQuery, MemoryRef, MemoryPatch, MemoryDraft
+from .request_validation import Fields, Text
 
 FILTERS = {"type", "subject", "origin", "event_from", "event_to"}
 

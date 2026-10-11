@@ -21,8 +21,8 @@ def main():
     sys.path.insert(0, str(root / 'tests_refactor'))
     import httpx
     from pytest import MonkeyPatch
-    from src.api.http import _Handler
-    from src.frame import global_server
+    from src.api.http_server import _Handler
+    from src.app import application
     from test_http_sse import streaming_app
     from test_model_streaming import ByteStream, chunk, frame
     retry, finish = Event(), Event()
@@ -74,7 +74,7 @@ def main():
         finally:
             retry.set()
             finish.set()
-            global_server.Stop()
+            application.Stop()
     assert not any(t.name.startswith('funagent-') for t in threads())
     print('Real SDK streaming, Chromium, SQLite and all worker/subscriber resources verified.')
 

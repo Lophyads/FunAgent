@@ -2,20 +2,20 @@
 from dataclasses import replace
 import logging
 
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import (ControlError, DomainError, RecordScope,
                          RunContext, RunInput, RunResult)
-from ..model import ModelRuntime
-from ..persistence import DbMgr
+from ..model.model_runtime import ModelRuntime
+from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import TaskStore
-from ..frame.session import SessionMgr
-from ..memory import MemoryPrepareRequest
+from ..frame.session_mgr import SessionMgr
+from ..memory.contracts import MemoryPrepareRequest
 from ..memory.prompt import AttachRecall
-from ..memory.prepare import MemoryPrepare
-from ..frame.review import ReviewScheduler
-from ..frame.events import EventMgr, Emit
+from ..memory.memory_prepare import MemoryPrepare
+from ..frame.review_scheduler import ReviewScheduler
+from ..frame.event_mgr import EventMgr, Emit
 from ..model.contracts import RunEvent
-from .strategy import MainStrategy
+from .main_strategy import MainStrategy
 
 
 logger = logging.getLogger("funagent.task")

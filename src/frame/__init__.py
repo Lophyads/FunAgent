@@ -1,1 +1,1 @@
-"""Application configuration, contracts and lifecycle services."""
+"""Shared configuration, contracts, sessions and lifecycle support services."""

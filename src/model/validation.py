@@ -4,7 +4,7 @@ from dataclasses import replace
 from math import isfinite
 
 from ..frame.contracts import ModelReply, ToolCall, thaw
-from ..frame.schema import ToolValidator
+from ..frame.tool_validator import ToolValidator
 from .protocols import ModelError
 
 

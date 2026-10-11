@@ -4,10 +4,10 @@ from threading import Condition, Thread
 from uuid import uuid4
 import time
 
-from .conf import ConfMgr
+from .conf_mgr import ConfMgr
 from .contracts import DomainError, ReviewJob, RunContext, RunResult, freeze
 from .protocols import ReviewExecutor, ReviewQueue
-from ..persistence import DbMgr
+from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import ReviewStore
 
 

@@ -2,12 +2,12 @@
 from dataclasses import replace
 from uuid import uuid4
 import time
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, ControlError
 from .contracts import MemoryContext, MemoryBranch, MemoryQuery, RetrievalPlan
 from .common import normalize
-from . import MemoryMgr
-from .planner import MemoryPlanner
+from .memory_mgr import MemoryMgr
+from .memory_planner import MemoryPlanner
 from .prompt import FitBranch
 from .protocols import MemoryReader
 

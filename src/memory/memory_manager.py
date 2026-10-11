@@ -3,7 +3,7 @@ from dataclasses import replace
 from types import MappingProxyType
 import time
 
-from ..frame.conf import ConfMgr
+from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import ControlError, DomainError
 from .common import text, validate_query
 from .contracts import MemoryQuery, MemoryRecord, MemorySearchResult

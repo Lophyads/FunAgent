@@ -24,15 +24,15 @@ import time
 from urllib.request import Request, urlopen
 
 import src
-from src.frame import global_server
-from src.api.cli import CLIController
-from src.frame.conf import ConfMgr
+from src.app import application
+from src.api.cli_controller import CLIController
+from src.frame.conf_mgr import ConfMgr
 from src.frame.contracts import DomainError
-from src.frame.interaction import InteractionMgr
+from src.frame.interaction_mgr import InteractionMgr
 from src.memory import MemoryMgr
 from src.model import ModelRuntime
 from src.persistence import DbMgr
-from src.frame.review import ReviewScheduler
+from src.frame.review_scheduler import ReviewScheduler
 from src.task import TaskMgr
 from src.tool import ToolMgr
 from src.tool.contracts import ToolSelectionRequest
@@ -90,7 +90,7 @@ for mode in ("cli", "web", "both"):
         port = reserve.getsockname()[1]
     (conf / "serv.conf").write_text(original.replace('mode = "cli"', f'mode = "{mode}"').replace('port = 8080', f'port = {port}'))
     try:
-        global_server.Start(conf)
+        application.Start(conf)
         selection = ToolMgr.GetInstance().Select(ToolSelectionRequest(toolsets=("demo",),
             enable=("read_workspace",), disable=("read_workspace",)), RunContext())
         assert selection.allowed_names == ("echo",) and selection.registry_id
@@ -148,7 +148,7 @@ for mode in ("cli", "web", "both"):
         result = command(f"wait {task}") if mode == "cli" else finish(task)["result"]["final"]
         assert "blue" in result and "Memory evidence" in result
     finally:
-        global_server.Stop()
+        application.Stop()
     for resource in (ConfMgr, DbMgr, ModelRuntime, ToolMgr, MemoryMgr, TaskMgr, ReviewScheduler, InteractionMgr):
         try:
             resource.GetInstance()
@@ -203,21 +203,26 @@ def main():
         assert all(name.startswith("src/") or ".dist-info/" in name for name in names)
         assert not any("__pycache__/" in name or name.endswith(".pyc") for name in names)
         assert "src/frame/__init__.py" in names
-        assert all(name in names for name in ("src/frame/environment.py", "src/frame/logging.py", "src/frame/lifecycle.py",
+        assert {"src/app/__init__.py", "src/app/application.py", "src/app/main.py"} <= set(names)
+        assert {
+            "src/api/diagnostics_mgr.py", "src/memory/memory_mgr.py", "src/memory/memory_operations_mgr.py",
+            "src/model/model_runtime.py", "src/persistence/db_mgr.py", "src/task/task_mgr.py", "src/tool/tool_mgr.py",
+        } <= set(names)
+        assert all(name in names for name in ("src/frame/environment.py", "src/frame/log_session.py", "src/frame/lifecycle.py",
                                              "src/persistence/factory.py", "src/model/factory.py", "src/memory/factory.py", "src/tool/factory.py"))
-        assert all(name in names for name in ("src/memory/planner.py", "src/memory/search.py", "src/memory/prompt.py", "src/memory/prepare.py"))
+        assert all(name in names for name in ("src/memory/memory_planner.py", "src/memory/search.py", "src/memory/prompt.py", "src/memory/memory_prepare.py"))
         assert not any(Path(name).name.startswith(".env") or any(suffix in Path(name).name for suffix in (".sqlite", ".db", ".log")) for name in names)
         metadata = next(name for name in names if name.endswith("/METADATA"))
         assert "Requires-Dist: python-dotenv" in archive.read(metadata).decode()
         entry = next(name for name in names if name.endswith("/entry_points.txt"))
         entries = ConfigParser()
         entries.read_string(archive.read(entry).decode())
-        assert dict(entries["console_scripts"]) == {"funagent": "src.frame.global_server:main"}
+        assert dict(entries["console_scripts"]) == {"funagent": "src.app.main:main"}
         assets = ('index.html','api.js','app.js','store.js','style.css','tokens.css','overview.css','favicon.svg',
                   'components/chat.js','components/ui.js','pages/overview.js','pages/overview-model.js',
                   'pages/memory.js','pages/data.js','pages/catalog.js')
         assert all("src/api/web/" + name in names for name in assets)
-        assert {"src/frame/events.py", "src/model/streaming.py"} <= set(names)
+        assert {"src/frame/event_mgr.py", "src/model/chat_accumulator.py"} <= set(names)
         assert {"src/memory/embedding.py", "src/memory/supabase.py", "src/memory/transport.py", "src/memory/deployment.py"} <= set(names)
         migrations = [name for name in names if name.startswith("src/memory/assets/supabase/migrations/") and name.endswith(".sql")]
         assert migrations
@@ -227,8 +232,8 @@ def main():
                 "src/tool/backends/computer.py", "src/tool/backends/web.py", "src/memory/mcp_query.py",
                 "src/tool/builtins/file_tool.py", "src/tool/builtins/computer_use_tool.py"} <= set(names)
         assert all(f'Provides-Extra: {extra}' in archive.read(metadata).decode() for extra in ("mcp", "web"))
-        assert {"src/memory/operations.py", "src/api/management.py", "src/api/diagnostics.py",
-                "src/api/logs.py", "src/api/export.py", "src/api/validation.py"} <= set(names)
+        assert {"src/memory/memory_operations.py", "src/api/memory_routes.py", "src/api/diagnostic_service.py",
+                "src/api/log_reader.py", "src/api/memory_export.py", "src/api/request_validation.py"} <= set(names)
         assert b'confirmAction' in archive.read('src/api/web/api.js')
         assert "src/frame/distribution.py" in names
         assert all(f"src/frame/assets/examples/{example}/{name}.conf" in names

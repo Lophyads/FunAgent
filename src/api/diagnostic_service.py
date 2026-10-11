@@ -1,6 +1,6 @@
 """Explicit safe projections of effective configuration and bound capabilities."""
 from ..frame.contracts import DomainError, RunContext, thaw
-from . import DiagnosticsMgr
+from .diagnostics_mgr import DiagnosticsMgr
 from ..model.protocols import ModelDiagnostics
 from ..tool.protocols import ToolDiagnostics
 from ..task.protocols import TaskDiagnostics

@@ -61,7 +61,7 @@ def _query(query, scope, maximum):
     except (ValueError, TypeError, UnicodeError):
         raise DomainError("INVALID_REQUEST", "Invalid page cursor") from None
 
-
+#Todo 优化: 添加本地缓存数据，读优先读缓存数据
 class SQLiteStore:
     def __init__(self, database):
         self._lock = RLock()

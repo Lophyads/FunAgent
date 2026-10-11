@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from ...frame.contracts import ControlError, DomainError, RunContext, thaw
 from ..contracts import Availability, BackendResult, RemoteToolSpec, ToolDecision
-from ...frame.schema import ToolValidator
+from ...frame.tool_validator import ToolValidator
 from .diagnostics import SDKDiagnostics
 
 

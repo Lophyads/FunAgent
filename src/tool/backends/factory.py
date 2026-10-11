@@ -6,6 +6,7 @@ from ...frame.contracts import DomainError
 BACKENDS = {"mcp": ("src.tool.backends.mcp", "MCPBackend"),
             "terminal": ("src.tool.backends.terminal", "TerminalBackend")}
 BACKENDS["web"] = ("src.tool.backends.web", "WebBackend")
+BACKENDS["treg_web"] = ("src.tool.backends.treg", "TregWebBackend")
 BACKENDS["computer_use"] = ("src.tool.backends.computer", "ComputerBackend")
 
 

@@ -4,7 +4,7 @@ from pkgutil import iter_modules
 from ..frame.contracts import DomainError
 from ..frame.contracts import ToolDefinition
 from .contracts import RemoteToolSpec
-from .registry import ToolEntry
+from .tool_registrar import ToolEntry
 from .policy import ActionPolicy
 import re
 

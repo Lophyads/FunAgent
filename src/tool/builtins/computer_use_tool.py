@@ -1,6 +1,6 @@
 """The migrated text-only AX action contract."""
 from ...frame.contracts import ToolDefinition
-from ..registry import ToolEntry
+from ..tool_registrar import ToolEntry
 from ..backends.handler import BackendHandler
 from ..contracts import ToolDecision, ComputerReadOnly
 import re

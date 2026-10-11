@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 import re
 
 from ..frame.contracts import DomainError, ToolDefinition, freeze
-from ..frame.schema import ToolValidator
+from ..frame.tool_validator import ToolValidator
 from .protocols import ToolPolicy
 
 

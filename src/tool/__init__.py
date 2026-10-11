@@ -1,30 +1,8 @@
-"""Startup-bound dispatch entry; importing it never constructs a registry."""
+"""Public tool contracts, protocols and startup binding."""
+
 from ..frame.contracts import DomainError
+from .tool_mgr import ToolMgr
 from .contracts import ToolFailure
 from .protocols import ToolDispatch, ToolHandler
 
-
-class ToolMgr:
-    _instance: ToolDispatch | None = None
-
-    @classmethod
-    def Initialize(cls, dispatch: ToolDispatch) -> None:
-        if cls._instance is not None:
-            raise DomainError("ALREADY_INITIALIZED", "Tool registry already initialized")
-        cls._instance = dispatch
-
-    @classmethod
-    def GetInstance(cls) -> ToolDispatch:
-        if cls._instance is None:
-            raise DomainError("NOT_READY", "Tool registry not initialized")
-        return cls._instance
-
-    @classmethod
-    def Close(cls) -> None:
-        try:
-            if cls._instance is not None:
-                close = getattr(cls._instance, "Close", None)
-                if close is not None:
-                    close()
-        finally:
-            cls._instance = None
+__all__ = ["DomainError", "ToolDispatch", "ToolFailure", "ToolHandler", "ToolMgr"]

@@ -85,7 +85,7 @@ class OpenAIChatAdapter(Adapter):
 
     @staticmethod
     def NewStream():
-        from .streaming import ChatAccumulator
+        from .chat_accumulator import ChatAccumulator
         return ChatAccumulator(OpenAIChatAdapter)
 
 
