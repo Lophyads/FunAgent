@@ -28,5 +28,6 @@ memory/assets
 *.conf
 *.sql
 sql/supabase/
+tests/
 scripts/
 TREG_INTEGRATION.md

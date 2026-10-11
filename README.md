@@ -73,7 +73,6 @@ FunAgent/
 │       ├── builtins/              # 内置工具及 handler
 │       └── backends/              # MCP、terminal、web、computer、treg 等
 ├── mcp_server/MODULAR-RAG/         # 独立 RAG 项目，不进入主应用发行包
-├── tests/                         # 当前入口、模块边界与 treg 回归测试
 ├── docs/                          # 架构图、API、迁移说明与验收记录
 └── pyproject.toml                  # 项目依赖与构建配置
 ```
@@ -520,14 +519,7 @@ quit
 
 `request_key` 在会话内唯一：相同键和相同内容返回原任务，异内容返回 `409 CONFLICT`。刷新页面可从数据库读取会话历史与任务状态；运行过程通过有界 SSE 快照校准。详细参数、游标、错误码和人工答复格式见 [API 参考](docs/api-reference.md)。
 
-## 开发与验证
-
-当前工作区的测试位于 `tests/`，包含应用入口与重启、模块边界、treg 行为和本地 MCP 协议回归。安装测试依赖并运行：
-
-```powershell
-uv sync --locked --extra dev --extra mcp
-uv run --no-sync pytest tests
-```
+## 构建
 
 构建 wheel 与 sdist：
 
