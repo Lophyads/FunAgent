@@ -78,10 +78,8 @@ FunAgent/
 │       └── backends/              # MCP、terminal、web、computer、treg 等
 ├── mcp_server/MODULAR-RAG/         # 独立 RAG 项目，不进入主应用发行包
 ├── tests/                         # 当前入口、模块边界与 treg 回归测试
-├── scripts/                       # 发布、浏览器及迁移验收脚本
-├── sql/supabase/                   # 可选 Supabase 记忆部署说明
 ├── docs/                          # 架构图、API、迁移说明与验收记录
-└── architecture/                  # 架构设计及历史决策
+└── pyproject.toml                  # 项目依赖与构建配置
 ```
 
 建议按 `src/__main__.py → src/app/main.py → src/app/application.py` 阅读应用入口，再沿 `TaskQueue → TaskProcess → Runtime.Run` 阅读主执行链路。详细文件职责与导入约定见 [源码导航](src/README.md)。
@@ -396,7 +394,7 @@ bash start.sh
 
 凭据放在所选配置目录的 `.env` 或进程环境中，配置文件保存环境变量名。当前根配置每 **3** 个已完成轮次触发复盘，自动知识召回关闭，主模型仍可直接调用 RAG 工具。
 
-`--check-config` 只校验配置结构和静态引用，不创建模型客户端或工具后端；它不能验证凭据、外部服务连通性或 MCP 动态工具。正式启动会装配所选驱动。Supabase 部署步骤见 [SQL / RPC 说明](sql/supabase/README.md)，联网接入见 [TREG_INTEGRATION.md](TREG_INTEGRATION.md)。
+`--check-config` 只校验配置结构和静态引用，不创建模型客户端或工具后端；它不能验证凭据、外部服务连通性或 MCP 动态工具。正式启动会装配所选驱动。使用 Supabase 事实记忆前，需在选定数据库自行部署相应的 SQL / RPC。
 
 ## 配置与能力扩展
 
@@ -543,7 +541,7 @@ uv build --out-dir dist
 
 也可从构建后的 wheel 安装，通过 `funagent --conf-dir <配置目录>` 或 `python -m src --conf-dir <配置目录>` 启动。
 
-`scripts/` 提供发布、浏览器、流式展示和隔离 Supabase 验收工具。浏览器验收需要 Node、Playwright 和 Chrome / Chromium；真实数据库合同需要显式隔离的测试环境。历史完整迁移与发布验收见 [迁移验收记录](docs/migration-acceptance.md)，运行其中脚本前需检查它们要求的示例、测试资源和外部依赖。
+历史完整迁移与发布验收见 [迁移验收记录](docs/migration-acceptance.md)，运行其中命令前需检查它们要求的示例、测试资源和外部依赖。
 
 ## 使用边界与常见问题
 
@@ -569,8 +567,5 @@ uv build --out-dir dist
 | [源码导航](src/README.md) | 组件职责、阅读顺序与扩展约定 |
 | [架构图说明](docs/架构图说明.md) | 四层架构、模块映射及实现边界 |
 | [API 参考](docs/api-reference.md) | 公共业务入口、HTTP / SSE、管理接口与错误语义 |
-| [Supabase SQL / RPC](sql/supabase/README.md) | 记忆部署、权限、向量化与真实合同验收 |
-| [treg 联网接入](TREG_INTEGRATION.md) | 固定搜索 / 提取端点、报价检查及调用边界 |
-| [精简设计](architecture/lean-design.md) | 核心设计与职责约束 |
 | [Web 迁移记录](docs/web-migration.md) | 页面迁移与浏览器验收 |
 | [迁移验收记录](docs/migration-acceptance.md) | 历史迁移范围、验收命令及限制 |

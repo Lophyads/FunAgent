@@ -43,7 +43,7 @@ packages = ["src"]
 
 [tool.hatch.build.targets.sdist]
 ignore-vcs = true
-include = ["/src", "/sql", "/tests", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/TREG_INTEGRATION.md", "/docs/*.md", "/architecture/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
+include = ["/src", "/tests", "/tests_refactor", "/examples/refactor*", "/README.md", "/docs/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
 
 [tool.pytest.ini_options]
 addopts = "-q -m 'not supabase_integration'"

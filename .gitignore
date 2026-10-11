@@ -27,3 +27,6 @@ tmp/
 memory/assets
 *.conf
 *.sql
+sql/supabase/
+scripts/
+TREG_INTEGRATION.md
