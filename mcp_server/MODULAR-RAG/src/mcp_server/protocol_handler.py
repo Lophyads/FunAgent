@@ -242,19 +242,27 @@ def create_mcp_server(
     # Create low-level server
     server = Server(server_name)
 
-    # Register tools/list handler
-    @server.list_tools()
-    async def handle_list_tools() -> List[types.Tool]:
-        """Handle tools/list request."""
-        return protocol_handler.get_tool_schemas()
+    if hasattr(server, "list_tools"):
+        # MCP SDK 1.x exposes decorator-based low-level handlers.
+        @server.list_tools()
+        async def handle_list_tools() -> List[types.Tool]:
+            return protocol_handler.get_tool_schemas()
 
-    # Register tools/call handler
-    @server.call_tool()
-    async def handle_call_tool(
-        name: str, arguments: Dict[str, Any]
-    ) -> types.CallToolResult:
-        """Handle tools/call request."""
-        return await protocol_handler.execute_tool(name, arguments)
+        @server.call_tool()
+        async def handle_call_tool(
+            name: str, arguments: Dict[str, Any]
+        ) -> types.CallToolResult:
+            return await protocol_handler.execute_tool(name, arguments)
+    else:
+        # MCP SDK 2.x registers typed request handlers directly.
+        async def handle_list_tools(context, params):
+            return types.ListToolsResult(tools=protocol_handler.get_tool_schemas())
+
+        async def handle_call_tool(context, params):
+            return await protocol_handler.execute_tool(params.name, params.arguments or {})
+
+        server.add_request_handler("tools/list", types.PaginatedRequestParams, handle_list_tools)
+        server.add_request_handler("tools/call", types.CallToolRequestParams, handle_call_tool)
 
     # Store protocol handler on server for access
     server._protocol_handler = protocol_handler  # type: ignore[attr-defined]

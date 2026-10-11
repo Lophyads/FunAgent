@@ -20,3 +20,10 @@ logs/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+architecture/
+examples/
+tests_refactor/
+tmp/
+memory/assets
+*.conf
+*.sql

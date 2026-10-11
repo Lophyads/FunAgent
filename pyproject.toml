@@ -30,7 +30,7 @@ web = [
 ]
 
 [project.scripts]
-funagent = "src.frame.global_server:main"
+funagent = "src.app.main:main"
 
 [tool.hatch.build]
 exclude = ["**/.env", "**/.env.*", "**/*.db", "**/*.db-*", "**/*.sqlite", "**/*.sqlite-*", "**/*.sqlite3", "**/*.sqlite3-*", "**/*.log", "**/*.log.*"]
@@ -43,10 +43,10 @@ packages = ["src"]
 
 [tool.hatch.build.targets.sdist]
 ignore-vcs = true
-include = ["/src", "/sql", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/docs/*.md", "/architecture/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
+include = ["/src", "/sql", "/tests", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/TREG_INTEGRATION.md", "/docs/*.md", "/architecture/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
 
 [tool.pytest.ini_options]
 addopts = "-q -m 'not supabase_integration'"
 markers = ["supabase_integration: requires an explicitly configured isolated Supabase database and RPC endpoint; missing environment is an error"]
-testpaths = ["tests_refactor"]
+testpaths = ["tests", "tests_refactor"]
 pythonpath = ["."]
