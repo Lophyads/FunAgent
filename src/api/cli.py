@@ -1,17 +1,20 @@
 """Commands use application APIs; execution stays on the main worker."""
 from threading import Event
-from uuid import uuid4
 import json
 import sys
+import shlex
+from . import DiagnosticsMgr
 
-from ..conf import ConfMgr
-from ..contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, RunContext
-from ..session import SessionMgr
+from ..frame.conf import ConfMgr
+from ..frame.contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery
+from ..frame.session import SessionMgr
 from ..task import TaskMgr
-from ..review import ReviewScheduler
-from ..interaction import InteractionMgr
-from ..memory import MemoryMgr, MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
-from ..memory.retrieval import RecordData
+from ..frame.review import ReviewScheduler
+from ..frame.interaction import InteractionMgr
+from ..frame.clarification import QuestionData
+from ..memory import MemoryOperationsMgr, MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
+from . import diagnostics
+from .export import Export
 
 
 class CLIController:
@@ -27,6 +30,8 @@ class CLIController:
     @staticmethod
     def _show_interaction(request, output):
         print(f"pending {request.interaction_id} {request.kind}: {request.prompt}", file=output, flush=True)
+        for question in request.questions:
+            print(json.dumps(QuestionData(question), ensure_ascii=False), file=output, flush=True)
 
     @staticmethod
     def _resolve(request, text):
@@ -36,28 +41,52 @@ class CLIController:
             if value not in {"yes", "y", "no", "n"}:
                 raise DomainError("INVALID_REQUEST", "Approval answer must be yes or no")
             answer = value in {"yes", "y"}
+        elif request.kind == "clarify":
+            try:
+                answer = json.loads(text)
+            except (TypeError, ValueError):
+                raise DomainError("INVALID_REQUEST", "Clarification answer must be structured JSON") from None
         InteractionMgr.GetInstance().Resolve(request.interaction_id, answer,
                                             task_id=request.task_id, run_id=request.run_id)
+
+    @staticmethod
+    def _read_clarification(request, read_answer):
+        answers = []
+        for question in request.questions:
+            text = read_answer(f"{question.question_id} ({question.kind})> ")
+            if text.strip() == "/cancel":
+                return text
+            if question.kind == "multiple":
+                try:
+                    value = json.loads(text)
+                except ValueError:
+                    raise DomainError("INVALID_REQUEST", "Multiple choice answer must be a JSON array") from None
+            else:
+                value = text
+            answers.append({"question_id": question.question_id, "value": value})
+        return json.dumps({"answers": answers}, ensure_ascii=False)
 
     @staticmethod
     def _memory(line, output):
         parts = line.strip().split(maxsplit=2)
         if len(parts) < 3:
-            raise DomainError("INVALID_REQUEST", "Use memory search/list/write/update/delete with a source")
+            raise DomainError("INVALID_REQUEST", "Use memory search/list/write/update/delete/confirm/export")
         _, operation, rest = parts
-        sources = ConfMgr.GetInstance().Memory().Sources()
-        # CLI is a local administrative entry; grants come from trusted config.
-        access = frozenset(token for name, settings in sources.items() for token in (
-            settings.get("read_access", f"memory.{name}.read"), settings.get("write_access", f"memory.{name}.write")))
-        context = RunContext(run_id=uuid4().hex, purpose="management", access=access)
-        manager = MemoryMgr.GetInstance()
-        if operation == "search":
+        manager = MemoryOperationsMgr.GetInstance()
+        if operation == "export":
+            try:
+                fields = [value.strip('"') for value in shlex.split(rest, posix=False)]
+            except ValueError:
+                raise DomainError("INVALID_REQUEST", "Invalid export command") from None
+            if len(fields) != 2 or not all(fields):
+                raise DomainError("INVALID_REQUEST", "Use memory export <source> <new-file.jsonl>")
+            value = Export(fields[0], fields[1])
+        elif operation == "search":
             fields = rest.split(maxsplit=1)
             if len(fields) != 2:
                 raise DomainError("INVALID_REQUEST", "Use memory search <source|*> <text>")
             source, query = fields
-            result = manager.Search(MemoryQuery(query, () if source == "*" else (source,)), context)
-            value = {"records": [RecordData(r) for r in result.records], "source_status": dict(result.source_status), "warnings": result.warnings}
+            value = manager.Search(MemoryQuery(query, () if source == "*" else (source,)))
         elif operation == "list":
             fields = rest.split()
             if len(fields) not in {1, 2}:
@@ -65,9 +94,9 @@ class CLIController:
             # Stream all pages through the same stable Store cursor.
             records, cursor = [], None
             while True:
-                page = manager.List(MemoryListQuery(fields[0], fields[1] if len(fields) == 2 else None, cursor=cursor), context)
-                records.extend(RecordData(r) for r in page.items)
-                cursor = page.next_cursor
+                page = manager.List(MemoryListQuery(fields[0], fields[1] if len(fields) == 2 else None, cursor=cursor))
+                records.extend(page["records"])
+                cursor = page["next_cursor"]
                 if cursor is None:
                     break
             value = {"records": records}
@@ -75,22 +104,52 @@ class CLIController:
             fields = rest.split(maxsplit=2)
             if len(fields) != 3:
                 raise DomainError("INVALID_REQUEST", "Use memory write <source> <type> <content>")
-            action = "cli:" + context.run_id
-            value = RecordData(manager.Write(MemoryDraft(fields[0], fields[2], action, (action,), fields[1]), context))
+            value = manager.Write(MemoryDraft(fields[0], fields[2], "", (), fields[1]))
         elif operation == "update":
             fields = rest.split(maxsplit=3)
             if len(fields) != 4:
                 raise DomainError("INVALID_REQUEST", "Use memory update <source> <record_id> <version> <content>")
-            value = RecordData(manager.Update(MemoryRef(fields[0], fields[1]), MemoryPatch(fields[3], ("cli:" + context.run_id,)), fields[2], context))
+            value = manager.Request("replace", MemoryRef(fields[0], fields[1]), fields[2], MemoryPatch(fields[3], ()))
         elif operation == "delete":
             fields = rest.split()
             if len(fields) != 3:
                 raise DomainError("INVALID_REQUEST", "Use memory delete <source> <record_id> <version>")
-            manager.Delete(MemoryRef(fields[0], fields[1]), fields[2], context)
-            value = {"deleted": True}
+            value = manager.Request("remove", MemoryRef(fields[0], fields[1]), fields[2])
+        elif operation == "confirm":
+            fields = rest.split()
+            if len(fields) != 3 or fields[2].lower() not in {"yes", "no"}:
+                raise DomainError("INVALID_REQUEST", "Use memory confirm <challenge_id> <digest> <yes|no>")
+            value = manager.Confirm(fields[0], fields[1], fields[2].lower() == "yes")
         else:
             raise DomainError("INVALID_REQUEST", "Unknown memory command")
         print(json.dumps(value, ensure_ascii=False), file=output)
+
+    @staticmethod
+    def _logs(line, output):
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            raise DomainError("INVALID_REQUEST", "Invalid log command") from None
+        if len(parts) < 2 or parts[1] not in {"tail", "follow"}:
+            raise DomainError("INVALID_REQUEST", "Use logs tail/follow [--lines N] [--filter text] [--source normal|error] [--seconds N]")
+        values = {}
+        rest = parts[2:]
+        if len(rest) % 2:
+            raise DomainError("INVALID_REQUEST", "Log options require values")
+        for key, value in zip(rest[::2], rest[1::2]):
+            if key not in {"--lines", "--filter", "--source", "--seconds"} or key in values:
+                raise DomainError("INVALID_REQUEST", "Invalid log option")
+            values[key] = value
+        try:
+            limit = int(values.get("--lines", "50"))
+            seconds = float(values.get("--seconds", "10" if parts[1] == "follow" else "0"))
+        except ValueError:
+            raise DomainError("INVALID_REQUEST", "Invalid log bounds") from None
+        if parts[1] == "tail" and seconds != 0:
+            raise DomainError("INVALID_REQUEST", "Tail does not follow")
+        for line in DiagnosticsMgr.GetInstance().Logs(source=values.get("--source", "normal"), limit=limit,
+                 contains=values.get("--filter", ""), follow_seconds=seconds):
+            print(line, file=output, flush=True)
 
     @staticmethod
     def Execute(line, output=None, read_answer=None):
@@ -98,6 +157,8 @@ class CLIController:
         read_answer = read_answer or input
         if line.strip().split(maxsplit=1)[:1] == ["memory"]:
             return CLIController._memory(line, output)
+        if line.strip().split(maxsplit=1)[:1] == ["logs"]:
+            return CLIController._logs(line, output)
         answer_parts = line.strip().split(maxsplit=3)
         if answer_parts and answer_parts[0] == "answer":
             if len(answer_parts) != 4:
@@ -114,8 +175,16 @@ class CLIController:
         if not parts:
             return
         command = parts[0]
-        if command == "help" and len(parts) == 1:
-            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | memory search/list/write/update/delete | quit", file=output)
+        if command == "tools" and parts[1:] == ["doctor"]:
+            tools = diagnostics.Read("tools")["tools"]
+            connections = diagnostics.Read("connections")["connections"]
+            healthy = all(item["available"] for item in connections if item["selected"])
+            healthy = healthy and all(item["selected"] for item in tools if item["requested"])
+            print(json.dumps({"healthy": healthy, "tools": tools, "connections": connections}, ensure_ascii=False), file=output)
+        elif command in diagnostics.KINDS and len(parts) == 1:
+            print(json.dumps(diagnostics.Read(command), ensure_ascii=False), file=output)
+        elif command == "help" and len(parts) == 1:
+            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
         elif command == "new":
             title = line.strip().partition(" ")[2].strip() or "New session"
             workspace = ConfMgr.GetInstance().Serv().Options()["workspace"]
@@ -133,7 +202,13 @@ class CLIController:
                 if cursor is None:
                     break
         elif command == "submit" and len(parts) == 3:
-            print(TaskMgr.GetInstance().Submit(TurnRequest(parts[1], parts[2])), file=output)
+            text, key = parts[2], None
+            if text.startswith("--request-key "):
+                fields = text.split(maxsplit=2)
+                if len(fields) != 3:
+                    raise DomainError("INVALID_REQUEST", "Use submit <session_id> --request-key <key> <text>")
+                _, key, text = fields
+            print(TaskMgr.GetInstance().Submit(TurnRequest(parts[1], text, key)), file=output)
         elif command in {"get", "wait", "cancel", "history", "pending"} and len(parts) == 2:
             identifier = parts[1]
             if command == "pending":
@@ -162,7 +237,8 @@ class CLIController:
                     for request in InteractionMgr.GetInstance().Pending(identifier):
                         CLIController._show_interaction(request, output)
                         try:
-                            answer = read_answer("answer (yes/no for approval; /cancel to cancel)> ")
+                            answer = (CLIController._read_clarification(request, read_answer) if request.kind == "clarify"
+                                      else read_answer("answer (yes/no for approval; /cancel to cancel)> "))
                             if answer.strip() == "/cancel":
                                 TaskMgr.GetInstance().Cancel(identifier)
                             else:

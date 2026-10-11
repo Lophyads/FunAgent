@@ -1,42 +1,47 @@
 """A bounded, independent queue; only pending jobs may coalesce."""
 from collections import OrderedDict
-from dataclasses import dataclass
 from threading import Condition, Thread
 from uuid import uuid4
 import time
 
 from .conf import ConfMgr
-from .contracts import DomainError, RunContext, RunResult, freeze
-from .persistence import DbMgr
-from .memory.review import ReviewProcess
-
-
-@dataclass(frozen=True)
-class ReviewJob:
-    session_id: str
-    through_message_id: int
+from .contracts import DomainError, ReviewJob, RunContext, RunResult, freeze
+from .protocols import ReviewExecutor, ReviewQueue
+from ..persistence import DbMgr
+from ..persistence.protocols import ReviewStore
 
 
 class ReviewScheduler:
     _instance = None
 
     @classmethod
-    def Initialize(cls, capacity=16):
+    def Initialize(cls, capacity=16, *, executor: ReviewExecutor, start_worker=True):
         if cls._instance is not None:
             raise DomainError("ALREADY_INITIALIZED", "Review already initialized")
         if type(capacity) is not int or capacity <= 0:
             raise DomainError("INVALID_REQUEST", "Review capacity must be positive")
         instance = cls()
+        instance._executor = executor
+        instance._store: ReviewStore = DbMgr.GetInstance()
+        instance._timeout = ConfMgr.GetInstance().Memory().Policy("review").get("timeout", 30)
         instance._condition = Condition()
         instance._capacity, instance._pending = capacity, OrderedDict()
         instance._status, instance._running = {}, None
         instance._accepting = True
         instance._worker = Thread(target=instance._work, name="funagent-review")
-        instance._worker.start()
         cls._instance = instance
+        if start_worker:
+            try:
+                instance.Start()
+            except Exception:
+                cls.Close()
+                raise
+
+    def Start(self):
+        self._worker.start()
 
     @classmethod
-    def GetInstance(cls):
+    def GetInstance(cls) -> ReviewQueue:
         if cls._instance is None:
             raise DomainError("NOT_READY", "Review not initialized")
         return cls._instance
@@ -54,7 +59,7 @@ class ReviewScheduler:
     def Schedule(self, session_id, through_message_id):
         if type(through_message_id) is not int or through_message_id <= 0:
             raise DomainError("INVALID_REQUEST", "Review requires a complete Turn")
-        store = DbMgr.GetInstance()
+        store = self._store
         # Validate before publication, never changing an executing job.
         store.ReviewRange(session_id, 0, through_message_id)
         with self._condition:
@@ -75,8 +80,10 @@ class ReviewScheduler:
             self._condition.notify_all()
 
     def GetStatus(self, session_id):
+        trigger = self._store.ReviewTrigger(session_id)
         with self._condition:
             status = dict(self._status.get(session_id, {"state": "idle", "through_message_id": 0, "error_code": None, "cancelled_through": None}))
+            status.update(trigger)
             running = self._running[0] if self._running else None
             pending = self._pending.get(session_id)
             status["running_through"] = running.through_message_id if running and running.session_id == session_id else None
@@ -94,12 +101,11 @@ class ReviewScheduler:
                 if not self._pending:
                     return
                 session_id, job = self._pending.popitem(last=False)
-                policy = ConfMgr.GetInstance().Memory().Policy("review")
                 context = RunContext(run_id=uuid4().hex, purpose="review", session_id=session_id,
-                                     deadline=time.monotonic() + policy.get("timeout", 30))
+                                     deadline=time.monotonic() + self._timeout)
                 self._running = job, context
             try:
-                result = ReviewProcess.Run(job, context)
+                result = self._executor.Run(job, context)
             except Exception:
                 result = RunResult("failed", reason="REVIEW_FAILED", error_code="REVIEW_FAILED")
             with self._condition:
@@ -122,4 +128,8 @@ class ReviewScheduler:
 
     def Stop(self):
         self.RequestStop()
-        self._worker.join()
+        if self._worker.ident is not None:
+            self._worker.join()
+
+    def IsStopped(self):
+        return not self._worker.is_alive()

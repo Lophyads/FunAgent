@@ -5,7 +5,10 @@ from threading import Event, Lock
 from uuid import uuid4
 import time
 
-from .contracts import ControlError, DomainError, Interaction, RunContext
+from .contracts import ApprovalBinding, ControlError, DomainError, Interaction, RunContext
+from .protocols import InteractionAccess
+from .clarification import ValidateQuestions, ValidateAnswers
+from .events import Emit
 
 
 @dataclass
@@ -13,7 +16,7 @@ class _Waiter:
     request: Interaction
     context: RunContext
     event: Event = field(default_factory=Event)
-    answer: str | bool | None = None
+    answer: object = None
     error: DomainError | None = None
 
 
@@ -34,7 +37,7 @@ class InteractionMgr:
         cls._instance = instance
 
     @classmethod
-    def GetInstance(cls):
+    def GetInstance(cls) -> InteractionAccess:
         if cls._instance is None:
             raise DomainError("NOT_READY", "Interactions not initialized")
         return cls._instance
@@ -62,6 +65,7 @@ class InteractionMgr:
         self._pending.pop(identifier, None)
         waiter.error = error
         waiter.event.set()
+        Emit(waiter.context, 'interaction_cleared', {'interaction_id': identifier})
 
     def _expire(self, identifier, waiter):
         if self._pending.get(identifier) is not waiter:
@@ -74,16 +78,24 @@ class InteractionMgr:
             if time.monotonic() >= waiter.request.expires_at:
                 self._end(identifier, waiter, DomainError("INTERACTION_EXPIRED", "Human request expired"))
 
-    def Wait(self, kind, prompt, context):
+    def Wait(self, kind, prompt, context, *, binding=None, questions=()):
         if context.purpose != "main" or not context.task_id or not context.run_id:
             raise DomainError("INTERACTION_DENIED", "This run cannot request human input")
-        if kind not in {"ask_user", "approval"} or not isinstance(prompt, str) or not prompt.strip():
+        if kind not in {"clarify", "approval"} or not isinstance(prompt, str) or not prompt.strip():
             raise DomainError("INVALID_REQUEST", "Invalid human request")
+        if kind == "clarify":
+            questions = ValidateQuestions(questions)
+        elif questions:
+            raise DomainError("INVALID_REQUEST", "Questions require a clarification request")
+        if binding is not None and (kind != "approval" or not isinstance(binding, ApprovalBinding)
+                or (binding.task_id, binding.run_id) != (context.task_id, context.run_id)
+                or not binding.call_id or not binding.tool_name or not binding.arguments_digest):
+            raise DomainError("INVALID_REQUEST", "Invalid approval binding")
         context.CheckCancelled()
         deadline = time.monotonic() + self._timeout
         if context.deadline is not None:
             deadline = min(deadline, context.deadline)
-        request = Interaction(uuid4().hex, context.task_id, context.run_id, kind, prompt, deadline)
+        request = Interaction(uuid4().hex, context.task_id, context.run_id, kind, prompt, deadline, binding, questions)
         waiter = _Waiter(request, context)
         with self._lock:
             if self._closed:
@@ -92,6 +104,7 @@ class InteractionMgr:
             if any(w.request.task_id == context.task_id for w in self._pending.values()):
                 raise DomainError("INTERACTION_PENDING", "Task already has a human request")
             self._pending[request.interaction_id] = waiter
+        Emit(context, 'interaction_pending', {'interaction_id': request.interaction_id, 'kind': kind})
         try:
             while not waiter.event.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
                 with self._lock:
@@ -119,10 +132,12 @@ class InteractionMgr:
                 raise DomainError("INTERACTION_STALE", "Human request is no longer pending for this run")
             if waiter.request.kind == "approval":
                 valid = type(answer) is bool
-            else:
-                valid = isinstance(answer, str) and bool(answer.strip()) and len(answer) <= 4000
+            elif waiter.request.kind == "clarify":
+                answer = ValidateAnswers(waiter.request.questions, answer)
+                valid = True
             if not valid:
                 raise DomainError("INVALID_REQUEST", "Invalid human answer")
             waiter.answer = answer
             self._pending.pop(interaction_id)
             waiter.event.set()
+            Emit(waiter.context, 'interaction_resolved', {'interaction_id': interaction_id})

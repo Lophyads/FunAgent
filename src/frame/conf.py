@@ -1,7 +1,6 @@
 """Atomic TOML loading; these snapshots never create clients or other managers."""
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from threading import Lock
@@ -9,21 +8,17 @@ from types import MappingProxyType
 import tomllib
 
 from .contracts import DomainError, freeze
-from .schema import ToolValidator
+from ..tool.contracts import ToolSelectionRequest
 
 
-@dataclass(frozen=True)
-class ModelProfile:
-    profile_id: str
-    provider_id: str
-    adapter_id: str
-    model: str
-    timeout: float
-    max_retries: int = 0
-    fallback_profiles: tuple[str, ...] = ()
+from ..model.contracts import ModelProfile
 
 
 class ModelConf(ABC):
+    def Profiles(self) -> Mapping:
+        return {}
+    def Adapters(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(p.adapter_id for p in self.Profiles().values()))
     @abstractmethod
     def Profile(self, profile_id: str) -> ModelProfile: ...
 
@@ -32,11 +27,19 @@ class ModelConf(ABC):
 
 
 class ToolConf(ABC):
+    def AccessMap(self) -> Mapping:
+        return {}
     @abstractmethod
-    def Allowed(self, purpose: str) -> tuple[str, ...]: ...
+    def Selection(self, purpose: str) -> ToolSelectionRequest: ...
 
     @abstractmethod
-    def Definitions(self) -> Mapping: ...
+    def Toolsets(self) -> Mapping: ...
+
+    @abstractmethod
+    def Access(self, session_id: str) -> frozenset[str]: ...
+
+    @abstractmethod
+    def Tools(self) -> Mapping: ...
 
     @abstractmethod
     def Backends(self) -> Mapping: ...
@@ -63,10 +66,11 @@ class ServConf(ABC):
 class _TomlModelConf(ModelConf):
     def __init__(self, data):
         self._providers = freeze(data["providers"])
+        self._adapters = tuple(data['adapters'])
         self._profiles = MappingProxyType({
             key: ModelProfile(key, value["provider_id"], value["adapter_id"],
                               value["model"], value["timeout"], value.get("max_retries", 0),
-                              tuple(value.get("fallback_profiles", ())))
+                              tuple(value.get("fallback_profiles", ())), value.get("streaming", False))
             for key, value in data["profiles"].items()
         })
 
@@ -79,19 +83,37 @@ class _TomlModelConf(ModelConf):
     def Providers(self):
         return self._providers
 
+    def Profiles(self):
+        return self._profiles
+
+    def Adapters(self):
+        return self._adapters
+
 
 class _TomlToolConf(ToolConf):
     def __init__(self, data):
         self._data = freeze(data)
 
-    def Definitions(self):
-        return self._data.get("definitions", MappingProxyType({}))
+    def Tools(self):
+        return self._data.get("tools", MappingProxyType({}))
 
     def Backends(self):
         return self._data.get("backends", MappingProxyType({}))
 
-    def Allowed(self, purpose):
-        return self._data.get("purposes", {}).get(purpose, ())
+    def Selection(self, purpose):
+        value = self._data.get("purposes", {}).get(purpose, ())
+        return (ToolSelectionRequest(**value) if isinstance(value, Mapping)
+                else ToolSelectionRequest(enable=value))
+
+    def Toolsets(self):
+        return self._data.get("toolsets", MappingProxyType({}))
+
+    def Access(self, session_id):
+        permissions = self._data.get("session_access", {})
+        return frozenset(permissions.get(session_id, permissions.get("default", ())))
+
+    def AccessMap(self):
+        return self._data.get('session_access', MappingProxyType({}))
 
 
 class _TomlMemoryConf(MemoryConf):
@@ -102,6 +124,8 @@ class _TomlMemoryConf(MemoryConf):
         return self._data.get("sources", MappingProxyType({}))
 
     def Policy(self, purpose):
+        if purpose in {"profile", "facts", "knowledge"}:
+            return self._data.get("policies", {}).get(purpose, MappingProxyType({"enabled": False, "sources": ()}))
         try:
             return self._data["policies"][purpose]
         except KeyError:
@@ -159,7 +183,7 @@ def _validate(docs):
     model, tool, memory, log, serv = (docs[key] for key in ("model", "tool", "memory", "log", "serv"))
     for key, allowed in (
         ("model", {"adapters", "providers", "profiles"}),
-        ("tool", {"definitions", "backends", "purposes"}),
+        ("tool", {"tools", "toolsets", "backends", "purposes", "session_access"}),
         ("memory", {"sources", "policies"}),
         ("log", {"options"}), ("serv", {"options"}),
     ):
@@ -178,26 +202,74 @@ def _validate(docs):
         _text(profile["model"], "model.profiles.model")
         _number(profile["timeout"], "model.profiles.timeout", strict=True)
         _number(profile.get("max_retries", 0), "model.profiles.max_retries", integer=True)
+        _require(type(profile.get("streaming", False)) is bool, "model.profiles.streaming")
         _refs(_names(profile.get("fallback_profiles", []), "model.profiles.fallback_profiles"),
               profiles, "model.profiles.fallback_profiles")
-    definitions = _table(tool, "definitions", "tool.definitions")
+    definitions = _table(tool, "tools", "tool.tools")
     backends = _table(tool, "backends", "tool.backends")
     for backend in backends.values():
         _require(isinstance(backend, dict), "tool.backends")
         _text(backend["kind"], "tool.backends.kind")
         if "timeout" in backend:
             _number(backend["timeout"], "tool.backends.timeout", strict=True)
+        if "discover" in backend:
+            _require(type(backend["discover"]) is bool, "tool.backends.discover")
+        for field in ("include", "exclude", "hidden", "read_only"):
+            if field in backend:
+                _names(backend[field], "tool.backends." + field)
+        if "server_id" in backend:
+            _text(backend["server_id"], "tool.backends.server_id")
+        for field in ("drain_timeout",):
+            if field in backend:
+                _number(backend[field], "tool.backends." + field, strict=True)
+        for field, maximum in (("max_output", 256000), ("max_bytes", 2000000)):
+            if field in backend:
+                _number(backend[field], "tool.backends." + field, integer=True, strict=True)
+                _require(backend[field] <= maximum, "tool.backends." + field)
+        if "allow_private" in backend:
+            _require(type(backend["allow_private"]) is bool, "tool.backends.allow_private")
+        if "allowed_hosts" in backend:
+            _names(backend["allowed_hosts"], "tool.backends.allowed_hosts")
+        for field in ("endpoint", "search_endpoint", "credential_env", "cwd"):
+            if field in backend:
+                _text(backend[field], "tool.backends." + field)
+        if backend["kind"] == "mcp":
+            transport = backend.get("transport", "stdio")
+            _require(transport in {"stdio", "streamable_http", "sse"}, "tool.backends.transport")
+            if transport == "stdio":
+                _require(("command" in backend) != ("command_env" in backend), "tool.backends.command")
+                _text(backend.get("command", backend.get("command_env")), "tool.backends.command")
+                _require(isinstance(backend.get("args", []), list) and
+                         all(isinstance(a, str) for a in backend.get("args", [])), "tool.backends.args")
+                if "args_env" in backend:
+                    _require("args" not in backend, "tool.backends.args")
+                    _names(backend["args_env"], "tool.backends.args_env")
+            else:
+                _text(backend["endpoint"], "tool.backends.endpoint")
+            if "env" in backend:
+                _require(isinstance(backend["env"], dict), "tool.backends.env")
+                for key, variable in backend["env"].items():
+                    _text(key, "tool.backends.env")
+                    _text(variable, "tool.backends.env")
+        if backend["kind"] == "computer_use":
+            _text(backend["endpoint"], "tool.backends.endpoint")
     for definition in definitions.values():
-        _require(isinstance(definition, dict), "tool.definitions")
-        _text(definition["handler"], "tool.definitions.handler")
-        _require(isinstance(definition["parameters"], dict), "tool.definitions.parameters")
-        ToolValidator(definition["parameters"])
+        _require(isinstance(definition, dict) and set(definition) <= {"requires_approval", "backend_id"}, "tool.tools")
         if "requires_approval" in definition:
             _require(type(definition["requires_approval"]) is bool, "tool.definitions.requires_approval")
         if "backend_id" in definition:
             _refs([definition["backend_id"]], backends, "tool.definitions.backend_id")
     for names in _table(tool, "purposes", "tool.purposes").values():
-        _refs(_names(names, "tool.purposes"), definitions, "tool.purposes")
+        if isinstance(names, dict):
+            _require(set(names) <= {"toolsets", "enable", "disable"}, "tool.purposes")
+            for values in names.values():
+                _names(values, "tool.purposes")
+        else:
+            _names(names, "tool.purposes")
+    for names in _table(tool, "toolsets", "tool.toolsets").values():
+        _names(names, "tool.toolsets")
+    for names in _table(tool, "session_access", "tool.session_access").values():
+        _names(names, "tool.session_access")
     sources = _table(memory, "sources", "memory.sources")
     for source in sources.values():
         _require(isinstance(source, dict), "memory.sources")
@@ -211,6 +283,33 @@ def _validate(docs):
         if source["store"] == "sqlite":
             _require(source["kind"] == "episodic", "memory.sources.kind")
             _text(source["path"], "memory.sources.path")
+        if source["store"] == "supabase":
+            _require(source["kind"] == "episodic", "memory.sources.kind")
+            for field in ("namespace", "endpoint"):
+                _text(source[field], "memory.sources." + field)
+            for field in ("credential_env", "api_key_env"):
+                if field in source:
+                    _text(source[field], "memory.sources." + field)
+            if "similarity_threshold" in source:
+                threshold = source["similarity_threshold"]
+                _require(type(threshold) in (int, float) and isfinite(threshold) and -1 <= threshold <= 1,
+                         "memory.sources.similarity_threshold")
+            embedding = _table(source, "embedding", "memory.sources.embedding", required=True)
+            _require(set(embedding) <= {"kind", "endpoint", "credential_env", "model", "dimensions",
+                                      "query_prefix", "document_prefix", "timeout", "request_dimensions"}, "memory.sources.embedding")
+            for field in ("kind", "endpoint", "model"):
+                _text(embedding[field], "memory.sources.embedding." + field)
+            if "credential_env" in embedding:
+                _text(embedding["credential_env"], "memory.sources.embedding.credential_env")
+            _number(embedding["dimensions"], "memory.sources.embedding.dimensions", integer=True, strict=True)
+            _require(embedding["dimensions"] <= 4096, "memory.sources.embedding.dimensions")
+            for field in ("query_prefix", "document_prefix"):
+                _require(isinstance(embedding.get(field, ""), str) and len(embedding.get(field, "")) <= 2000,
+                         "memory.sources.embedding." + field)
+            if "timeout" in embedding:
+                _number(embedding["timeout"], "memory.sources.embedding.timeout", strict=True)
+            if "request_dimensions" in embedding:
+                _require(type(embedding["request_dimensions"]) is bool, "memory.sources.embedding.request_dimensions")
         if source["store"] == "callback":
             _require(source["kind"] == "semantic" and capabilities == ["search"], "memory.sources.capabilities")
             _text(source["callback_id"], "memory.sources.callback_id")
@@ -218,19 +317,37 @@ def _validate(docs):
                 _text(source["endpoint"], "memory.sources.endpoint")
                 if "credential_env" in source:
                     _text(source["credential_env"], "memory.sources.credential_env")
+            if source["callback_id"] == "mcp":
+                _refs([source["backend_id"]], backends, "memory.sources.backend_id")
+                selected = backends[source["backend_id"]]
+                _require(selected["kind"] == "mcp" and selected.get("discover", False), "memory.sources.backend_id")
+                _require("query_knowledge_hub" not in selected.get("exclude", ()) and
+                         ("include" not in selected or "query_knowledge_hub" in selected["include"]), "memory.sources.backend_id")
+                _text(source["collection"], "memory.sources.collection")
+                _number(source.get("top_k", 5), "memory.sources.top_k", integer=True, strict=True)
+                _require(source.get("top_k", 5) <= 100, "memory.sources.top_k")
         if "timeout" in source:
             _number(source["timeout"], "memory.sources.timeout", strict=True)
+        if "source_description" in source:
+            _require(isinstance(source["source_description"], str) and len(source["source_description"]) <= 2000,
+                     "memory.sources.source_description")
     for purpose, policy in _table(memory, "policies", "memory.policies").items():
         _require(isinstance(policy, dict), "memory.policies")
+        if purpose == "recall":
+            _require(set(policy) <= {"profile", "timeout", "history_max_chars"}, "memory.policies.recall")
+        if purpose in {"profile", "facts", "knowledge"}:
+            _require(set(policy) <= {"enabled", "sources", "max_records", "max_chars", "timeout", "max_queries"}, "memory.policies")
         if "profile" in policy:
             _refs([policy["profile"]], profiles, "memory.policies.profile")
         _refs(_names(policy.get("sources", []), "memory.policies.sources"), sources, "memory.policies.sources")
         if "enabled" in policy:
             _require(type(policy["enabled"]) is bool, "memory.policies.enabled")
-        if policy.get("enabled", True) and policy.get("sources"):
+        if purpose in {"recall", "review"} and policy.get("enabled", True) and policy.get("sources"):
             _require("profile" in policy, "memory.policies.profile")
         if "capacity" in policy:
             _number(policy["capacity"], "memory.policies.capacity", integer=True, strict=True)
+        if purpose == "review" and "every_turns" in policy:
+            _number(policy["every_turns"], "memory.policies.review.every_turns", integer=True)
         if purpose == "review" and policy.get("enabled", False):
             _require(bool(policy.get("sources")), "memory.policies.review.sources")
             _require(all(sources[name]["kind"] == "episodic" and "write" in sources[name].get("capabilities", ())
@@ -240,18 +357,47 @@ def _validate(docs):
         for key in ("max_records", "max_iterations", "timeout", "max_chars"):
             if key in policy:
                 _number(policy[key], f"memory.policies.{key}", strict=True, integer=key != "timeout")
+        if purpose in {"profile", "facts", "knowledge"}:
+            _require(all(sources[name]["kind"] == ("semantic" if purpose == "knowledge" else "episodic")
+                         for name in policy.get("sources", ())), "memory.policies.sources")
+            if policy.get("enabled", False):
+                from ..memory.prompt import MinimumBranchBudget
+                _require(policy.get("max_chars", 16000) >= MinimumBranchBudget(purpose, policy.get("sources", ())),
+                         "memory.policies.max_chars")
+        if "max_queries" in policy:
+            _number(policy["max_queries"], "memory.policies.max_queries", strict=True, integer=True)
+            _require(policy["max_queries"] <= 3, "memory.policies.max_queries")
+        if "history_max_chars" in policy:
+            _number(policy["history_max_chars"], "memory.policies.history_max_chars", integer=True, minimum=256)
+    policies = memory.get("policies", {})
+    if any(policies.get(branch, {}).get("enabled", False) and policies.get(branch, {}).get("sources") for branch in ("facts", "knowledge")):
+        _require("profile" in policies.get("recall", {}), "memory.policies.recall.profile")
     log_options = _table(log, "options", "log.options", required=True)
     _require(log_options["level"] in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, "log.options.level")
     for key in ("max_bytes", "backup_count"):
         if key in log_options:
             _number(log_options[key], f"log.options.{key}", integer=True)
+    for key in ("file", "error_file", "format"):
+        if key in log_options:
+            _text(log_options[key], f"log.options.{key}")
+    for key in ("redact", "console"):
+        if key in log_options:
+            _require(type(log_options[key]) is bool, f"log.options.{key}")
     serv_options = _table(serv, "options", "serv.options", required=True)
     _require(serv_options["mode"] in {"cli", "web", "both"}, "serv.options.mode")
     _number(serv_options["capacity"], "serv.options.capacity", integer=True, strict=True)
     _number(serv_options["port"], "serv.options.port", integer=True, strict=True)
     _require(serv_options["port"] <= 65535, "serv.options.port")
-    for key in ("host", "workspace", "database"):
+    for key in ("host", "workspace"):
         _text(serv_options[key], f"serv.options.{key}")
+    if "persistence" in serv_options:
+        selected = _table(serv_options, "persistence", "serv.options.persistence")
+        _text(selected["kind"], "serv.options.persistence.kind")
+        settings = _table(selected, "settings", "serv.options.persistence.settings")
+        if selected["kind"] == "sqlite":
+            _text(settings["path"], "serv.options.persistence.settings.path")
+    else:
+        _text(serv_options["database"], "serv.options.database")
     _refs([serv_options["model_profile"]], profiles, "serv.options.model_profile")
     for key in ("max_iterations", "task_timeout", "interaction_timeout"):
         if key in serv_options:

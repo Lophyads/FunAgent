@@ -1,1 +1,1 @@
-"""The independent FunAgent refactor package."""
+"""FunAgent application package."""

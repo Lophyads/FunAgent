@@ -41,6 +41,7 @@ class ToolCall:
     call_id: str
     name: str
     args: Mapping = field(default_factory=dict)
+    argument_error: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "args", freeze(self.args))
@@ -73,6 +74,7 @@ class Message:
     status: str | None = None
     effect: str | None = None
     message_id: int = 0
+    task_id: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "calls", tuple(self.calls))
@@ -100,11 +102,9 @@ class ModelReply:
 class RunInput:
     messages: tuple[Message, ...]
     system_prompt: str = ""
-    evidence: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "messages", tuple(self.messages))
-        object.__setattr__(self, "evidence", tuple(self.evidence))
 
 
 @dataclass(frozen=True)
@@ -119,6 +119,14 @@ class RunContext:
     task_id: str = ""
     session_id: str = ""
     review_evidence: tuple[str, ...] = ()
+    memory_evidence: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        # The Event is intentionally shared for cooperative parent cancellation;
+        # permission/evidence collections are copied at this trusted boundary.
+        object.__setattr__(self, "access", frozenset(self.access))
+        object.__setattr__(self, "review_evidence", tuple(self.review_evidence))
+        object.__setattr__(self, "memory_evidence", tuple(self.memory_evidence))
 
     def CheckCancelled(self):
         if self.cancel.is_set():
@@ -154,6 +162,12 @@ class RecordScope:
 
 
 @dataclass(frozen=True)
+class ReviewJob:
+    session_id: str
+    through_message_id: int
+
+
+@dataclass(frozen=True)
 class SessionCreate:
     title: str = "New session"
     workspace: str = "."
@@ -179,6 +193,7 @@ class SessionSnapshot:
 class TurnRequest:
     session_id: str
     text: str
+    request_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,13 +221,34 @@ class PageQuery:
 
 @dataclass(frozen=True)
 class HistoryQuery(PageQuery):
-    pass
+    direction: str = "forward"
 
 
 @dataclass(frozen=True)
 class Page:
     items: tuple
     next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalBinding:
+    task_id: str
+    run_id: str
+    call_id: str
+    tool_name: str
+    action: str
+    arguments_digest: str
+
+
+@dataclass(frozen=True)
+class ClarificationQuestion:
+    question_id: str
+    prompt: str
+    kind: str = "text"
+    options: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "options", tuple(self.options))
 
 
 @dataclass(frozen=True)
@@ -223,6 +259,11 @@ class Interaction:
     kind: str
     prompt: str
     expires_at: float
+    approval: ApprovalBinding | None = None
+    questions: tuple[ClarificationQuestion, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "questions", tuple(self.questions))
 
 
 @contextmanager

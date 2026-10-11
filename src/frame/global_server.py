@@ -2,49 +2,39 @@
 import argparse
 from pathlib import Path
 import sys
+import logging
 
 from .conf import ConfMgr
-from .api.http import HttpServer
-from .contracts import DomainError, ToolDefinition
-from .model import ModelRuntime
-from .model.demo import DemoAdapter, DemoProvider, EchoHandler
-from .model.openai_chat import OpenAIChatAdapter, OpenAIProvider
-from .persistence import DbMgr, SQLiteStore
-from .task import TaskMgr
-from .tool import ToolMgr
-from .tool.workspace import ReadWorkspaceHandler
-from .tool.human import AskUserHandler
+from .environment import Environment
+from .logging import LogSession
+from .lifecycle import Lifecycle
+from .events import EventMgr, TaskEvents
+from ..api.http import HttpServer
+from ..api import DiagnosticsMgr
+from ..api.diagnostics import DiagnosticService
+from ..api.logs import LogReader
+from .contracts import DomainError
+from ..model import ModelRuntime
+from ..model.factory import Create as CreateModel
+from ..persistence import DbMgr
+from ..persistence.factory import Create as CreatePersistence
+from ..task import TaskMgr
+from ..task.queue import TaskQueue
+from ..task.process import TaskProcess
+from ..tool import ToolMgr
+from ..tool.factory import Create as CreateTools
 from .interaction import InteractionMgr
-from .memory import MemoryMgr, SQLiteMemoryStore, CallbackMemoryStore
-from .memory.http_query import HTTPMemoryQuery
-from .memory.retrieval import MemorySearchHandler, SEARCH_DEFINITION
-from .memory.review import REVIEW_DEFINITIONS, MemoryWriteHandler, MemoryUpdateHandler, MemoryDeleteHandler
+from ..memory import MemoryMgr, MemoryOperationsMgr
+from ..memory.operations import MemoryOperations
+from ..memory.factory import Create as CreateMemory, RequiredBackends
+from ..memory.review import ReviewProcess
 from .review import ReviewScheduler
 
 
-PROVIDERS = {"demo": DemoProvider, "openai": OpenAIProvider}
-ADAPTERS = {"demo": DemoAdapter, "openai_chat": OpenAIChatAdapter}
-HANDLERS = {"echo": EchoHandler, "read_workspace": ReadWorkspaceHandler, "ask_user": AskUserHandler,
-            "memory_search": MemorySearchHandler}
-MEMORY_QUERIES = {"http_json": HTTPMemoryQuery}
-
 # The entry owns one HTTP listener; controllers share the business managers.
 _http_server = None
-
-
-def _sqlite_memory(source_id, settings, conf_dir):
-    path = Path(settings["path"])
-    return SQLiteMemoryStore(path if path.is_absolute() else conf_dir / path, source_id, settings["kind"])
-
-
-def _callback_memory(source_id, settings, conf_dir):
-    factory = MEMORY_QUERIES.get(settings["callback_id"])
-    if factory is None:
-        raise DomainError("DRIVER_UNAVAILABLE", "Selected memory query callback is unavailable")
-    return CallbackMemoryStore(source_id, factory(settings), settings["kind"])
-
-
-MEMORY_STORES = {"sqlite": _sqlite_memory, "callback": _callback_memory}
+_lifecycle = None
+logger = logging.getLogger("funagent.startup")
 
 
 def Initialize(conf_dir):
@@ -54,98 +44,60 @@ def Initialize(conf_dir):
 
 
 def Start(conf_dir):
-    global _http_server
-    conf = Initialize(conf_dir)
-    providers, bound = {}, False
-    store = None
-    database_bound = False
-    memories, memory_bound = {}, False
+    global _http_server, _lifecycle
     try:
+        ConfMgr.GetInstance()
+    except DomainError as error:
+        if error.code != "NOT_READY":
+            raise
+    else:
+        raise DomainError("ALREADY_INITIALIZED", "Application already initialized")
+    if _lifecycle is not None:
+        raise DomainError("ALREADY_INITIALIZED", "Application still owns resources")
+    conf_dir = Path(conf_dir).resolve()
+    owner = _lifecycle = Lifecycle()
+    try:
+        owner.Own(Environment(conf_dir))
+        owner.Own(ConfMgr, ConfMgr.Close)
+        conf = Initialize(conf_dir)
+        logs = owner.Own(LogSession(conf, conf_dir))
         options = conf.Serv().Options()
-        profiles = {}
-        pending = [options["model_profile"]]
         review = conf.Memory().Policy("review")
-        if review.get("enabled", False) and review.get("sources"):
-            pending.append(review["profile"])
-        recall = conf.Memory().Policy("recall")
-        if recall.get("enabled", True) and recall.get("sources"):
-            pending.append(recall["profile"])
-        while pending:
-            name = pending.pop()
-            if name not in profiles:
-                profiles[name] = conf.Model().Profile(name)
-                pending.extend(profiles[name].fallback_profiles)
-        for profile in profiles.values():
-            if profile.adapter_id not in ADAPTERS:
-                raise DomainError("DRIVER_UNAVAILABLE", "Selected model adapter is unavailable")
-            if profile.provider_id not in providers:
-                settings = conf.Model().Providers()[profile.provider_id]
-                factory = PROVIDERS.get(settings["kind"])
-                if factory is None:
-                    raise DomainError("DRIVER_UNAVAILABLE", "Selected model provider is unavailable")
-                providers[profile.provider_id] = factory(settings)
-        definitions = {}
-        handlers = {}
-        for name, settings in conf.Tool().Definitions().items():
-            if settings["handler"] not in HANDLERS or settings.get("backend_id") is not None:
-                raise DomainError("DRIVER_UNAVAILABLE", "Selected tool handler is unavailable")
-            definitions[name] = ToolDefinition(name, settings.get("description", ""), settings["parameters"])
-            handlers[name] = HANDLERS[settings["handler"]]
-        # Internal memory tool definitions are fixed at startup; strategies
-        # choose which operations each purpose may dispatch.
-        if "memory_search" in definitions and (definitions["memory_search"] != SEARCH_DEFINITION or
-                                               handlers["memory_search"] is not MemorySearchHandler):
-            raise DomainError("CONFIG_INVALID", "The retrieval tool definition is fixed")
-        definitions["memory_search"] = SEARCH_DEFINITION
-        handlers["memory_search"] = MemorySearchHandler
-        for name, handler in (("memory_write", MemoryWriteHandler), ("memory_update", MemoryUpdateHandler), ("memory_delete", MemoryDeleteHandler)):
-            if name in definitions and (definitions[name] != REVIEW_DEFINITIONS[name] or handlers[name] is not handler):
-                raise DomainError("CONFIG_INVALID", "The review tool definition is fixed")
-            definitions[name], handlers[name] = REVIEW_DEFINITIONS[name], handler
-        approval_names = tuple(name for name, settings in conf.Tool().Definitions().items()
-                               if settings.get("requires_approval", False))
-        ToolMgr.Initialize(definitions, handlers, approval_names=approval_names)
+        store = owner.Own(CreatePersistence(options, conf_dir))
+        owner.Bind(DbMgr, store)
+        owner.Bind(EventMgr, TaskEvents())
+        backends = {}
+        required = RequiredBackends(conf)
+        tools = (CreateTools(conf, owner.Own, required_backends=required,
+                 bind_backend=lambda key, value: backends.__setitem__(key, value)) if required else CreateTools(conf, owner.Own))
+        owner.Bind(ToolMgr, tools)
+        owner.Bind(ModelRuntime, CreateModel(conf, owner.Own, tool_dispatch=ToolMgr.GetInstance(), journal=store,
+                                            events=EventMgr.GetInstance()))
+        owner.Own(InteractionMgr, InteractionMgr.Close)
         InteractionMgr.Initialize(options.get("interaction_timeout", 120))
-        ModelRuntime.Initialize(profiles, providers, ADAPTERS)
-        bound = True
-        database = Path(options["database"])
-        if not database.is_absolute():
-            database = Path(conf_dir).resolve() / database
-        store = SQLiteStore(database)
-        DbMgr.Initialize(store)
-        database_bound = True
-        for name, settings in conf.Memory().Sources().items():
-            factory = MEMORY_STORES.get(settings["store"])
-            if factory is None:
-                raise DomainError("DRIVER_UNAVAILABLE", "Selected memory store is unavailable")
-            memories[name] = factory(name, settings, Path(conf_dir).resolve())
-        MemoryMgr.Initialize(memories)
-        memory_bound = True
+        memory = (CreateMemory(conf, conf_dir, owner.Own, backends=backends) if required else CreateMemory(conf, conf_dir, owner.Own))
+        owner.Bind(MemoryMgr, memory)
+        owner.Bind(MemoryOperationsMgr, MemoryOperations(memory, conf))
         if review.get("enabled", False) and review.get("sources"):
-            ReviewScheduler.Initialize(review.get("capacity", 16))
-        TaskMgr.Initialize(options["capacity"])
+            owner.Own(ReviewScheduler, ReviewScheduler.Close)
+            ReviewScheduler.Initialize(review.get("capacity", 16), executor=ReviewProcess, start_worker=False)
+            worker = ReviewScheduler.GetInstance()
+            owner.Forget(ReviewScheduler)
+            owner.TrackBinding(ReviewScheduler, worker, worker=True)
+            worker.Start()
+        queue = TaskQueue(options["capacity"], executor=TaskProcess,
+                          timeout=options.get("task_timeout", 60), start_worker=False)
+        owner.Bind(TaskMgr, queue, worker=True)
+        queue.Start()
+        owner.Bind(DiagnosticsMgr, DiagnosticService(conf, tools, ModelRuntime.GetInstance(), queue,
+                                                     logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact))
         if options["mode"] in {"web", "both"}:
-            _http_server = HttpServer(options["host"], options["port"])
+            _http_server = owner.HTTP(HttpServer(options["host"], options["port"]))
             _http_server.Start()
+        logger.info("Application started")
         return TaskMgr.GetInstance()
     except Exception as error:
-        if not memory_bound:
-            for memory in memories.values():
-                try:
-                    memory.Close()
-                except Exception:
-                    pass
-        if store is not None and not database_bound:
-            try:
-                store.Close()
-            except Exception:
-                pass
-        if not bound:
-            for provider in providers.values():
-                try:
-                    provider.Close()
-                except Exception:
-                    pass
+        logger.error("Application startup failed: %s", error.code if isinstance(error, DomainError) else "STARTUP_FAILED")
         try:
             Stop()
         except DomainError:
@@ -156,45 +108,26 @@ def Start(conf_dir):
 
 
 def Stop():
-    global _http_server
-    # Signal both queues before joining either worker: they share connections.
-    for resource in (TaskMgr, ReviewScheduler):
-        try:
-            instance = resource.GetInstance()
-        except DomainError as failure:
-            if failure.code != "NOT_READY":
-                raise
-        else:
-            instance.RequestStop()
-    if _http_server is not None:
-        try:
-            _http_server.Close()
-        except Exception:
-            # HTTP handlers can still borrow application state; retain ownership.
-            raise DomainError("CLOSE_FAILED", "HTTP server close failed") from None
-        _http_server = None
-    error = None
-    for close in (TaskMgr.Close, ReviewScheduler.Close):
-        try:
-            close()
-        except Exception as failure:
-            error = failure if isinstance(failure, DomainError) else DomainError("CLOSE_FAILED", "Worker drain failed")
-    # A failed join must never release connections still borrowed by a worker.
-    for resource in (TaskMgr, ReviewScheduler):
-        try:
-            resource.GetInstance()
-        except DomainError as failure:
-            if failure.code != "NOT_READY":
-                raise
-        else:
-            raise error or DomainError("CLOSE_FAILED", "Application worker is still running")
-    for close in (InteractionMgr.Close, MemoryMgr.Close, DbMgr.Close, ModelRuntime.Close, ToolMgr.Close, ConfMgr.Close):
-        try:
-            close()
-        except Exception:
-            error = DomainError("CLOSE_FAILED", "Application resource close failed")
-    if error is not None:
-        raise error
+    global _http_server, _lifecycle
+    if _lifecycle is None:
+        # Public test/embedding assembly uses the same drain path. Its bound
+        # managers retain their existing ownership of stores and providers.
+        _lifecycle = Lifecycle()
+        for manager in (ConfMgr, ToolMgr, ModelRuntime, DbMgr, MemoryMgr, MemoryOperationsMgr, DiagnosticsMgr, InteractionMgr, EventMgr, ReviewScheduler, TaskMgr):
+            try:
+                instance = manager.GetInstance()
+            except DomainError as error:
+                if error.code != "NOT_READY":
+                    raise
+            else:
+                _lifecycle.TrackBinding(manager, instance, worker=manager in (TaskMgr, ReviewScheduler))
+        if _http_server is not None:
+            _lifecycle.HTTP(_http_server)
+    try:
+        _lifecycle.Stop()
+    finally:
+        if _lifecycle.Empty():
+            _lifecycle = _http_server = None
 
 
 def main(argv=None):
@@ -213,7 +146,7 @@ def main(argv=None):
             if _http_server is not None:
                 print(f"FunAgent Web: {_http_server.url}", flush=True)
             if mode in {"cli", "both"}:
-                from .api.cli import CLIController
+                from ..api.cli import CLIController
                 result = CLIController.Run()
             else:
                 _http_server.Wait()

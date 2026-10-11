@@ -7,8 +7,11 @@ import json
 import base64
 import sqlite3
 import time
+import hashlib
+import re
+import unicodedata
 
-from ..contracts import (DomainError, Message, Session, SessionSnapshot,
+from ..frame.contracts import (DomainError, Message, Session, SessionSnapshot,
                          Task, TurnRequest, ToolCall, ToolResult, RunResult, RecordScope, Page, thaw)
 
 
@@ -16,7 +19,8 @@ from ..contracts import (DomainError, Message, Session, SessionSnapshot,
 
 def _message_json(message):
     return json.dumps({"role": message.role, "content": message.content,
-                       "calls": [{"call_id": c.call_id, "name": c.name, "args": thaw(c.args)}
+                       "calls": [{"call_id": c.call_id, "name": c.name, "args": thaw(c.args),
+                                  "argument_error": c.argument_error}
                                  for c in message.calls], "call_id": message.call_id,
                        "status": message.status, "effect": message.effect}, ensure_ascii=False)
 
@@ -84,9 +88,20 @@ class SQLiteStore:
                     result_message_id INTEGER REFERENCES messages(id), PRIMARY KEY(task_id,call_id));
                 CREATE TABLE IF NOT EXISTS review_watermarks (
                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), through_id INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS review_observed_turns (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id));
+                CREATE TABLE IF NOT EXISTS review_triggers (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id),
+                    completed_turns INTEGER NOT NULL, through_id INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS task_session ON tasks(session_id, seq);
                 CREATE INDEX IF NOT EXISTS message_task ON messages(task_id, id);
             """)
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(tasks)")}
+            for name in ("request_key", "input_fingerprint"):
+                if name not in columns:
+                    self._db.execute("ALTER TABLE tasks ADD COLUMN " + name + " TEXT")
+            self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS task_request ON tasks(session_id,request_key) WHERE request_key IS NOT NULL")
+            self._db.commit()
         except sqlite3.Error:
             if hasattr(self, "_db"):
                 self._db.close()
@@ -119,15 +134,16 @@ class SQLiteStore:
         return Session(row["session_id"], row["title"], row["workspace"], row["prompt"], row["created_at"])
 
     def _task(self, row):
-        return Task(row["task_id"], TurnRequest(row["session_id"], row["text"]), row["status"],
+        return Task(row["task_id"], TurnRequest(row["session_id"], row["text"], row["request_key"]), row["status"],
                     result=_run_result(row["result"]) if row["result"] else None,
                     created_at=row["created_at"], finished_at=row["finished_at"])
 
     def _snapshot(self, db, session_id):
         session = self._session(self._session_row(db, session_id))
-        rows = db.execute("SELECT m.id,m.payload FROM messages m JOIN tasks t ON t.task_id=m.task_id "
+        rows = db.execute("SELECT m.id,m.task_id,m.payload FROM messages m JOIN tasks t ON t.task_id=m.task_id "
                           "WHERE t.session_id=? ORDER BY m.id", (session_id,)).fetchall()
-        return SessionSnapshot(session, tuple(_message(r["payload"]) for r in rows), rows[-1]["id"] if rows else 0)
+        return SessionSnapshot(session, tuple(replace(_message(r["payload"]), message_id=r["id"], task_id=r["task_id"])
+                                               for r in rows), rows[-1]["id"] if rows else 0)
 
     def CreateSession(self, request):
         if not isinstance(request.title, str) or not request.title.strip() or not isinstance(request.workspace, str) or not request.workspace.strip():
@@ -153,14 +169,45 @@ class SQLiteStore:
                 db.execute("UPDATE sessions SET prompt=? WHERE session_id=?", (text, session_id))
             return text
 
-    def RegisterTurn(self, request):
-        if not isinstance(request.text, str) or not request.text.strip():
-            raise DomainError("INVALID_REQUEST", "Turn text must be nonempty")
+    @staticmethod
+    def _fingerprint(request):
+        if not isinstance(request.text, str) or not request.text.strip() or len(request.text) > 16000:
+            raise DomainError("INVALID_REQUEST", "Invalid turn text")
+        if request.request_key is not None and (not isinstance(request.request_key, str) or
+                re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request.request_key) is None):
+            raise DomainError("INVALID_REQUEST", "Invalid request key")
+        canonical = unicodedata.normalize("NFC", request.text.replace("\r\n", "\n").replace("\r", "\n"))
+        return hashlib.sha256(canonical.encode("utf8")).hexdigest()
+
+    def _find_turn(self, db, request, fingerprint):
+        if request.request_key is None:
+            return None
+        row = db.execute("SELECT * FROM tasks WHERE session_id=? AND request_key=?",
+                         (request.session_id, request.request_key)).fetchone()
+        if row is None:
+            return None
+        if row["input_fingerprint"] != fingerprint:
+            raise DomainError("CONFLICT", "Request key already has different content")
+        return self._task(row)
+
+    def FindTurn(self, request):
+        fingerprint = self._fingerprint(request)
         with self._transaction() as db:
+            return self._find_turn(db, request, fingerprint)
+
+    def RegisterTurn(self, request):
+        fingerprint = self._fingerprint(request)
+        with self._transaction() as db:
+            # Independent connections serialize the lookup and unique insertion.
+            db.execute("BEGIN IMMEDIATE")
             self._session_row(db, request.session_id)
+            existing = self._find_turn(db, request, fingerprint)
+            if existing is not None:
+                return existing
             task_id = uuid4().hex
-            db.execute("INSERT INTO tasks(task_id,session_id,text,status,created_at) VALUES(?,?,?,'queued',?)",
-                       (task_id, request.session_id, request.text, time.time()))
+            db.execute("INSERT INTO tasks(task_id,session_id,text,status,created_at,request_key,input_fingerprint) "
+                       "VALUES(?,?,?,'queued',?,?,?)",
+                       (task_id, request.session_id, request.text, time.time(), request.request_key, fingerprint))
             return self._task(self._task_row(db, task_id))
 
     def BeginTurn(self, task_id):
@@ -264,6 +311,10 @@ class SQLiteStore:
             self._session_row(db, session_id)
             maximum = db.execute("SELECT COALESCE(MAX(m.id),0) FROM messages m JOIN tasks t ON t.task_id=m.task_id "
                                  "WHERE t.session_id=? AND t.status NOT IN ('queued','running')", (session_id,)).fetchone()[0]
+            if query.direction not in {"forward", "backward"}:
+                raise DomainError("INVALID_REQUEST", "Invalid history direction")
+            if query.direction == "backward":
+                return self._history_backwards(db, session_id, query, maximum)
             after, through = _query(query, "history:" + session_id, maximum)
             turns = db.execute("SELECT t.seq,t.task_id FROM tasks t JOIN messages m ON m.task_id=t.task_id "
                                "WHERE t.session_id=? AND t.seq>? AND t.status NOT IN ('queued','running') "
@@ -271,12 +322,52 @@ class SQLiteStore:
             items = []
             cursor = None
             for index, turn in enumerate(turns):
-                items.extend(_message(r[0]) for r in db.execute("SELECT payload FROM messages WHERE task_id=? ORDER BY id", (turn["task_id"],)))
+                items.extend(replace(_message(r["payload"]), message_id=r["id"], task_id=turn["task_id"])
+                             for r in db.execute("SELECT id,payload FROM messages WHERE task_id=? ORDER BY id", (turn["task_id"],)))
                 if len(items) >= query.limit:
                     if index + 1 < len(turns):
                         cursor = _cursor("history:" + session_id, turn["seq"], through)
                     break
             return Page(tuple(items), cursor)
+
+    def _history_backwards(self, db, session_id, query, maximum):
+        before, through = _query(query, "history-back:" + session_id, maximum)
+        turns = db.execute("SELECT t.seq,t.task_id FROM tasks t JOIN messages m ON m.task_id=t.task_id "
+                           "WHERE t.session_id=? AND (?=0 OR t.seq<?) AND t.status NOT IN ('queued','running') "
+                           "GROUP BY t.task_id HAVING MAX(m.id)<=? ORDER BY t.seq DESC",
+                           (session_id, before, before, through)).fetchall()
+        groups, count, cursor = [], 0, None
+        for index, turn in enumerate(turns):
+            group = tuple(replace(_message(r["payload"]), message_id=r["id"], task_id=turn["task_id"])
+                          for r in db.execute("SELECT id,payload FROM messages WHERE task_id=? ORDER BY id", (turn["task_id"],)))
+            groups.append(group)
+            count += len(group)
+            if count >= query.limit:
+                if index + 1 < len(turns):
+                    cursor = _cursor("history-back:" + session_id, turn["seq"], through)
+                break
+        return Page(tuple(m for group in reversed(groups) for m in group), cursor)
+
+    def ListTasks(self, session_id, query):
+        with self._transaction() as db:
+            self._session_row(db, session_id)
+            maximum = db.execute("SELECT COALESCE(MAX(seq),0) FROM tasks WHERE session_id=?", (session_id,)).fetchone()[0]
+            before, through = _query(query, "tasks:" + session_id, maximum)
+            rows = db.execute("SELECT * FROM tasks WHERE session_id=? AND seq<=? AND (?=0 OR seq<?) "
+                              "ORDER BY seq DESC LIMIT ?", (session_id, through, before, before, query.limit + 1)).fetchall()
+            page = rows[:query.limit]
+            cursor = _cursor("tasks:" + session_id, page[-1]["seq"], through) if len(rows) > query.limit else None
+            return Page(tuple(self._task(row) for row in page), cursor)
+
+    def DataSchema(self):
+        from .data import Schema
+        with self._transaction() as db:
+            return Schema(db)
+
+    def ReadTable(self, table, query, *, detail=False):
+        from .data import Read
+        with self._transaction() as db:
+            return Read(db, table, query, detail=detail)
 
     def ListSessions(self, query):
         with self._transaction() as db:
@@ -287,6 +378,50 @@ class SQLiteStore:
             page = rows[:query.limit]
             cursor = _cursor("sessions", page[-1]["seq"], through) if len(rows) > query.limit else None
             return Page(tuple(self._session(row) for row in page), cursor)
+
+    def ObserveReviewTurn(self, task_id, every_turns=10):
+        """Observe a committed user Turn and return an outstanding trigger."""
+        if type(every_turns) is not int or every_turns < 0:
+            raise DomainError("INVALID_REQUEST", "Review frequency must be a nonnegative integer")
+        with self._transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = self._task_row(db, task_id)
+            if every_turns == 0:
+                return None
+            session_id = task["session_id"]
+            through = self._completed_review_boundary(db, task)
+            if through and db.execute("INSERT OR IGNORE INTO review_observed_turns(task_id) VALUES(?)", (task_id,)).rowcount:
+                db.execute("INSERT INTO review_triggers(session_id,completed_turns,through_id) VALUES(?,1,0) "
+                           "ON CONFLICT(session_id) DO UPDATE SET completed_turns=completed_turns+1", (session_id,))
+                count = db.execute("SELECT completed_turns FROM review_triggers WHERE session_id=?", (session_id,)).fetchone()[0]
+                if count % every_turns == 0:
+                    db.execute("UPDATE review_triggers SET through_id=MAX(through_id,?) WHERE session_id=?", (through, session_id))
+            return self._review_trigger(db, session_id)["trigger_pending_through"]
+
+    def _completed_review_boundary(self, db, task):
+        # Read only the Turn endpoints, independent of the size of its tool batches.
+        if task["status"] != "completed":
+            return 0
+        first = db.execute("SELECT payload FROM messages WHERE task_id=? ORDER BY id LIMIT 1", (task["task_id"],)).fetchone()
+        last = db.execute("SELECT id,payload FROM messages WHERE task_id=? ORDER BY id DESC LIMIT 1", (task["task_id"],)).fetchone()
+        if not first or _message(first["payload"]).role != "user" or _message(last["payload"]).role != "assistant":
+            return 0
+        if db.execute("SELECT 1 FROM tool_calls WHERE task_id=? AND result_message_id IS NULL", (task["task_id"],)).fetchone():
+            return 0
+        return last["id"]
+
+    def _review_trigger(self, db, session_id):
+        self._session_row(db, session_id)
+        row = db.execute("SELECT completed_turns,through_id FROM review_triggers WHERE session_id=?", (session_id,)).fetchone()
+        watermark = db.execute("SELECT through_id FROM review_watermarks WHERE session_id=?", (session_id,)).fetchone()
+        count, through = (row[0], row[1]) if row else (0, 0)
+        reviewed = watermark[0] if watermark else 0
+        return {"completed_turns": count, "trigger_through": through,
+                "trigger_pending_through": through if through > reviewed else None}
+
+    def ReviewTrigger(self, session_id):
+        with self._transaction() as db:
+            return self._review_trigger(db, session_id)
 
     def ReviewThrough(self, task_id):
         with self._transaction() as db:
@@ -325,6 +460,25 @@ class SQLiteStore:
             self._session_row(db, session_id)
             row = db.execute("SELECT through_id FROM review_watermarks WHERE session_id=?", (session_id,)).fetchone()
             return row[0] if row else 0
+
+    def ReviewAnchors(self, session_id, through_id):
+        """The last two already-reviewed conversation texts, oldest first."""
+        with self._transaction() as db:
+            self._session_row(db, session_id)
+            self._review_boundary(db, session_id, through_id)
+            row = db.execute("SELECT through_id FROM review_watermarks WHERE session_id=?", (session_id,)).fetchone()
+            if through_id > (row[0] if row else 0):
+                raise DomainError("INVALID_REQUEST", "Anchors must already be reviewed")
+            rows = db.execute("SELECT m.id,m.payload FROM messages m JOIN tasks t ON t.task_id=m.task_id "
+                              "WHERE t.session_id=? AND m.id<=? ORDER BY m.id DESC", (session_id, through_id))
+            anchors = []
+            for row in rows:
+                message = _message(row["payload"])
+                if message.role in {"user", "assistant"} and message.content.strip():
+                    anchors.append(Message(message.role, message.content, message_id=row["id"]))
+                    if len(anchors) == 2:
+                        break
+            return tuple(reversed(anchors))
 
     def AdvanceReview(self, session_id, expected_id, through_id):
         with self._transaction() as db:

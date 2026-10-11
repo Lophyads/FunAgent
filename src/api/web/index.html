@@ -1,7 +1,26 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>FunAgent</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
-<body><header><strong>FunAgent</strong><span>会话与任务</span></header><main>
-<aside><form id="new-session"><label for="title">新会话标题</label><input id="title" maxlength="200" placeholder="新会话" value="新会话"><button>新建会话</button></form><label for="sessions">选择会话</label><select id="sessions"><option value="">请选择会话</option></select><button id="refresh">刷新会话</button></aside>
-<section><h1 id="heading">开始一个会话</h1><div id="notice" role="alert"></div><div id="history" aria-label="会话历史"></div>
-<div id="task" role="status"></div><button id="cancel" hidden>取消任务</button><div id="interactions"></div>
-<form id="submit"><label for="message">消息</label><textarea id="message" rows="3" maxlength="16000" required placeholder="输入消息；离线演示可用 tool:、ask:、read:、remember:、memory:"></textarea><button id="send" disabled>发送</button></form></section></main></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light"><title>FunAgent · Workspace</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/overview.css"><script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="#overview"><span class="brand-mark">F</span> FunAgent <span class="muted">/ workspace</span></a>
+    <div class="top-actions"><span id="connection" class="badge">连接中</span><button id="nav-toggle" title="折叠导航" aria-label="折叠导航">☰</button><button id="theme-toggle" title="切换主题" aria-label="切换主题">◐</button><button id="chat-toggle">对话面板</button></div>
+  </header>
+  <main id="shell" class="shell">
+    <nav id="sidebar" aria-label="页面导航"><div class="nav-label">WORKSPACE</div>
+      <a href="#overview" aria-label="Overview" title="Overview"><span>◈</span><span>Overview</span></a><a href="#memory" aria-label="Memory" title="Memory"><span>▤</span><span>Memory</span></a><a href="#data" aria-label="Data" title="Data"><span>▦</span><span>Data</span></a>
+      <div class="nav-label">AGENT</div><a href="#tools" aria-label="工具" title="工具"><span>⚒</span><span>工具</span></a><a href="#connections" aria-label="连接" title="连接"><span>⌁</span><span>连接</span></a><a href="#models" aria-label="模型" title="模型"><span>◇</span><span>模型</span></a><a href="#config" aria-label="配置" title="配置"><span>⚙</span><span>配置</span></a>
+      <footer><span class="online-dot"></span> LOCAL FUNAGENT<br><small>原生 Web · 本机运行</small></footer>
+    </nav>
+    <section id="page" aria-live="polite"></section>
+    <div id="resize" role="separator" aria-label="调整对话面板宽度" aria-orientation="vertical" tabindex="0"></div>
+    <aside id="chat" aria-label="对话面板"></aside>
+  </main>
+  <div id="notifications" role="status" aria-live="polite"></div>
+  <dialog id="detail"><header><h2 id="detail-title">详情</h2><button id="detail-close" aria-label="关闭">×</button></header><div id="detail-body"></div></dialog>
+</body>
+</html>

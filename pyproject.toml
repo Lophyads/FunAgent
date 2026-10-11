@@ -8,22 +8,45 @@ version = "0.2.0"
 description = "A single-process agent with durable tasks, shared memory, CLI and browser access"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = ["jsonschema>=4.18,<5"]
+dependencies = [
+    "jsonschema>=4.18,<5",
+    "python-dotenv>=1.0,<2",
+    "tzdata>=2025.2",
+]
 
 [project.optional-dependencies]
 openai = ["openai>=2.0,<3"]
+embedding = ["httpx==0.28.1"]
+supabase = ["httpx==0.28.1"]
+supabase-test = ["psycopg[binary]==3.3.6"]
 dev = ["pytest>=8.4,<10"]
+mcp = [
+    "mcp==1.30.0",
+]
+web = [
+    "ddgs==9.16.0",
+    "httpx==0.28.1",
+    "pypdf==6.20.0",
+]
 
 [project.scripts]
-funagent = "funagent.global_server:main"
+funagent = "src.frame.global_server:main"
+
+[tool.hatch.build]
+exclude = ["**/.env", "**/.env.*", "**/*.db", "**/*.db-*", "**/*.sqlite", "**/*.sqlite-*", "**/*.sqlite3", "**/*.sqlite3-*", "**/*.log", "**/*.log.*"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/funagent"]
+packages = ["src"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/funagent", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/architecture/p7-implementation.md", "/pyproject.toml", "/uv.lock"]
+ignore-vcs = true
+include = ["/src", "/sql", "/tests_refactor", "/examples/refactor*", "/scripts", "/README.md", "/docs/*.md", "/architecture/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -m 'not supabase_integration'"
+markers = ["supabase_integration: requires an explicitly configured isolated Supabase database and RPC endpoint; missing environment is an error"]
 testpaths = ["tests_refactor"]
-pythonpath = ["src"]
+pythonpath = ["."]

@@ -2,7 +2,7 @@
 from pathlib import Path, PureWindowsPath
 import stat
 
-from ..contracts import ControlError, ToolResult
+from ..frame.contracts import ControlError, ToolResult
 
 
 class ReadWorkspaceHandler:

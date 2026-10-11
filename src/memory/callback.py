@@ -2,9 +2,9 @@
 from collections.abc import Mapping
 from threading import Lock
 
-from ..contracts import ControlError, DomainError
+from ..frame.contracts import ControlError, DomainError
 from .contracts import MemoryRecord, MemoryRef, MemorySearchResult
-from .common import controlled_lock, text, validate_query
+from .common import controlled_lock, text, validate_query, validate_metadata, timestamp
 
 
 class CallbackMemoryStore:
@@ -45,9 +45,19 @@ class CallbackMemoryStore:
                     (row.get("version") is not None and not text(row["version"]))):
                 raise DomainError("MEMORY_PROTOCOL", "Invalid memory evidence")
             seen.add(row["record_id"])
-            if not query.types or row["type"] in query.types:
+            try:
+                subject, event_at, origin = validate_metadata(row.get("subject"), row.get("event_at"), row.get("origin"))
+                created_at, updated_at = timestamp(row.get("created_at")), timestamp(row.get("updated_at"))
+            except DomainError:
+                raise DomainError("MEMORY_PROTOCOL", "Invalid memory metadata") from None
+            if ((not query.types or row["type"] in query.types) and
+                    (query.subject is None or subject == query.subject) and
+                    (query.origin is None or origin == query.origin) and
+                    (query.event_from is None or event_at is not None and event_at >= timestamp(query.event_from)) and
+                    (query.event_to is None or event_at is not None and event_at <= timestamp(query.event_to))):
                 records.append(MemoryRecord(MemoryRef(self.source_id, row["record_id"]), self.kind,
-                                            row["type"], row["content"], row["citation"], row.get("version")))
+                                            row["type"], row["content"], row["citation"], row.get("version"),
+                                            subject=subject, event_at=event_at, created_at=created_at, updated_at=updated_at, origin=origin))
         return MemorySearchResult(tuple(records[:query.limit]), {self.source_id: "ok"})
 
     def Close(self):

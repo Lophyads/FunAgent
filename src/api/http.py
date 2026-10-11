@@ -1,16 +1,23 @@
 """HTTP parses and presents data; main and review workers own all model IO."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Event
 from urllib.parse import parse_qs, urlsplit
 import json
 import re
+import socket
+import time
 
-from ..conf import ConfMgr
-from ..contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, thaw
-from ..session import SessionMgr
+from ..frame.conf import ConfMgr
+from ..frame.contracts import DomainError, SessionCreate, TurnRequest, PageQuery, HistoryQuery, thaw
+from ..frame.session import SessionMgr
 from ..task import TaskMgr
-from ..interaction import InteractionMgr
+from ..frame.interaction import InteractionMgr
+from ..frame.clarification import QuestionData
+from ..frame.events import EventMgr
+from .validation import Fields as _fields, Text as _text
+from . import management, diagnostics, data
+from ..frame.display import TaskView
 
 
 ERRORS = {
@@ -20,6 +27,11 @@ ERRORS = {
     "CAPACITY": (429, "Task capacity reached; try again later."),
     "STOPPING": (503, "Application is stopping."),
     "NOT_READY": (503, "Application is not ready."),
+    "DENIED": (403, "Memory access denied."),
+    "UNSUPPORTED": (400, "Operation is unsupported."),
+    "MANAGEMENT_STALE": (409, "This management change is no longer pending."),
+    "MANAGEMENT_EXPIRED": (409, "This management change has expired."),
+    "MEMORY_STORAGE": (500, "Memory operation failed."),
     "CONFLICT": (409, "Operation conflicts with current state."),
     "INTERACTION_STALE": (409, "This request is no longer pending for this task."),
     "INTERACTION_EXPIRED": (409, "This request has expired."),
@@ -32,22 +44,11 @@ ERRORS = {
 }
 RESULT_CODES = frozenset(ERRORS) | {"CANCELLED", "DEADLINE", "INTERRUPTED", "MAX_ITERATIONS",
     "PROFILES_EXHAUSTED", "TIMEOUT", "TRANSPORT", "PROTOCOL", "TRUNCATED", "PROVIDER_FATAL",
-    "AUTH", "RATE_LIMIT", "SERVER", "CONFIG_REFERENCE", "INVALID_STRATEGY"}
+    "AUTH", "MODEL_NOT_FOUND", "EMPTY_REPLY", "RATE_LIMIT", "SERVER", "CONFIG_REFERENCE", "INVALID_STRATEGY", "UNSUPPORTED"}
 
 
 def _code(value):
     return value if value is None or value in RESULT_CODES else "INTERNAL_ERROR"
-
-
-def _fields(body, allowed, required=()):
-    if not isinstance(body, dict) or body.keys() - set(allowed) or set(required) - body.keys():
-        raise DomainError("INVALID_REQUEST", "Invalid fields")
-
-
-def _text(value, maximum):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise DomainError("INVALID_REQUEST", "Invalid text")
-    return value
 
 
 def _session(session):
@@ -55,13 +56,14 @@ def _session(session):
 
 
 def _message(message):
-    return {"message_id": message.message_id, "role": message.role, "content": message.content,
+    return {"message_id": message.message_id, "task_id": message.task_id, "role": message.role, "content": message.content,
             "calls": [{"call_id": c.call_id, "name": c.name, "args": thaw(c.args)} for c in message.calls],
             "call_id": message.call_id, "status": message.status, "effect": message.effect}
 
 
 def _page(query, kind):
-    if query.keys() - {"limit", "cursor"} or any(len(values) != 1 for values in query.values()):
+    allowed = {"limit", "cursor", "direction"} if kind is HistoryQuery else {"limit", "cursor"}
+    if query.keys() - allowed or any(len(values) != 1 for values in query.values()):
         raise DomainError("INVALID_REQUEST", "Invalid page query")
     try:
         limit = int(query.get("limit", ["50"])[0])
@@ -69,7 +71,8 @@ def _page(query, kind):
         raise DomainError("INVALID_REQUEST", "Invalid limit") from None
     if not 1 <= limit <= 1000:
         raise DomainError("INVALID_REQUEST", "Invalid limit")
-    return kind(limit=limit, cursor=query.get("cursor", [None])[0])
+    options = {"direction": query.get("direction", ["forward"])[0]} if kind is HistoryQuery else {}
+    return kind(limit=limit, cursor=query.get("cursor", [None])[0], **options)
 
 
 class HTTPController:
@@ -89,6 +92,16 @@ class HTTPController:
             if parsed.query:
                 raise DomainError("INVALID_REQUEST", "Unexpected query")
             _fields(body, body.keys() if isinstance(body, dict) else ())
+        if route.startswith("/diagnostics/"):
+            if query:
+                raise DomainError("INVALID_REQUEST", "Unexpected query")
+            if method != "GET":
+                raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
+            return 200, diagnostics.Read(route.removeprefix("/diagnostics/"))
+        if route.startswith("/memory/"):
+            return management.Handle(method, route, query, body)
+        if route.startswith("/data/"):
+            return data.Handle(method, route, query)
         if route == "/sessions":
             if method == "POST":
                 _fields(body, {"title"})
@@ -106,9 +119,13 @@ class HTTPController:
                 page = SessionMgr.ReadHistory(identifier, _page(query, HistoryQuery))
                 return 200, {"items": [_message(m) for m in page.items], "next_cursor": page.next_cursor}
             if operation == "tasks" and method == "POST":
-                _fields(body, {"text"}, {"text"})
-                task_id = TaskMgr.GetInstance().Submit(TurnRequest(identifier, _text(body["text"], 16000)))
+                _fields(body, {"text", "request_key"}, {"text"})
+                key = _text(body["request_key"], 128) if "request_key" in body else None
+                task_id = TaskMgr.GetInstance().Submit(TurnRequest(identifier, _text(body["text"], 16000), key))
                 return 202, {"task_id": task_id}
+            if operation == "tasks" and method == "GET":
+                page = TaskMgr.GetInstance().List(identifier, _page(query, PageQuery))
+                return 200, {"items": [TaskView(t) for t in page.items], "next_cursor": page.next_cursor}
             raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         if query:
             raise DomainError("INVALID_REQUEST", "Unexpected query")
@@ -130,7 +147,11 @@ class HTTPController:
                 manager.Get(identifier)
                 requests = InteractionMgr.GetInstance().Pending(identifier)
                 return 200, {"items": [{"interaction_id": r.interaction_id, "task_id": r.task_id,
-                    "run_id": r.run_id, "kind": r.kind, "prompt": r.prompt} for r in requests]}
+                    "run_id": r.run_id, "kind": r.kind, "prompt": r.prompt, "expires_at": time.time() + max(0, r.expires_at - time.monotonic()),
+                    "questions": [QuestionData(q) for q in r.questions],
+                    "approval": None if r.approval is None else {"call_id": r.approval.call_id,
+                        "tool_name": r.approval.tool_name, "action": r.approval.action,
+                        "arguments_digest": r.approval.arguments_digest}} for r in requests]}
             raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         match = re.fullmatch(r"/interactions/([A-Za-z0-9_-]{1,128})/answer", route)
         if match:
@@ -153,9 +174,12 @@ def _json_object(pairs):
     return result
 
 
-ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
-          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/style.css": ("style.css", "text/css; charset=utf-8")}
+ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "favicon.svg",
+               "components/chat.js", "components/ui.js", "pages/catalog.js", "pages/data.js", "pages/memory.js",
+               "pages/overview.js", "pages/overview-model.js")
+ASSETS = {"/" + name: (name, {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+                              ".svg": "image/svg+xml"}[Path(name).suffix] + "; charset=utf-8") for name in ASSET_NAMES}
+ASSETS["/"] = ASSETS["/index.html"]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -183,7 +207,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _handle(self):
+        body_consumed = False
         try:
+            session_match = re.fullmatch(r'/sessions/([A-Za-z0-9_-]{1,128})/events', self.path)
+            if session_match:
+                if self.command != 'GET':
+                    raise DomainError('METHOD_NOT_ALLOWED', 'Invalid method')
+                self._session_sse(session_match[1])
+                return
+            match = re.fullmatch(r'/tasks/([A-Za-z0-9_-]{1,128})/events', self.path)
+            if match:
+                if self.command != 'GET':
+                    raise DomainError('METHOD_NOT_ALLOWED', 'Invalid method')
+                self._sse(match[1])
+                return
             if self.command == "GET" and self.path in ASSETS:
                 name, content_type = ASSETS[self.path]
                 self._send(200, (Path(__file__).with_name("web") / name).read_bytes(), content_type)
@@ -207,7 +244,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if length > 65536:
                     raise DomainError("PAYLOAD_TOO_LARGE", "Body too large")
                 try:
-                    body = json.loads(self.rfile.read(length), object_pairs_hook=_json_object,
+                    raw = self.rfile.read(length)
+                    body_consumed = True
+                    body = json.loads(raw, object_pairs_hook=_json_object,
                                       parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
                 except (ValueError, UnicodeError):
                     raise DomainError("INVALID_REQUEST", "Invalid JSON") from None
@@ -220,8 +259,110 @@ class _Handler(BaseHTTPRequestHandler):
             status, message = ERRORS[code]
             try:
                 self._send(status, {"error": {"code": code, "message": message}})
+                if self.command == "POST" and not body_consumed:
+                    self._drain_rejected_body()
             except OSError:
                 self.close_connection = True
+
+    def _sse(self, task_id):
+        HTTPController.Handle('GET', f'/tasks/{task_id}')
+        values = self.headers.get_all('Last-Event-ID', [])
+        after = None
+        if values:
+            match = re.fullmatch(re.escape(task_id) + r':([0-9]{1,20})', values[0])
+            if len(values) != 1 or not match:
+                raise DomainError('INVALID_REQUEST', 'Invalid event cursor')
+            after = int(match[1])
+        reader = EventMgr.GetInstance()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        subscription = reader.Subscribe(task_id, after)
+        try:
+            for event in subscription:
+                if self.server.sse_stopped.is_set():
+                    break
+                _, task = HTTPController.Handle('GET', f'/tasks/{task_id}')
+                kind, payload = event.kind, thaw(event.payload)
+                if task['status'] not in {'queued', 'running'}:
+                    kind, payload = 'task_committed', {'task': task}
+                elif kind == 'stream_reset':
+                    payload['task'] = task
+                data = {'task_id': task_id, 'run_id': event.run_id, 'purpose': 'main',
+                        'iteration': event.iteration, 'attempt_id': event.attempt_id, **payload}
+                wire = (f'id: {task_id}:{event.seq}\n' if event.seq else '')
+                wire += f'event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n'
+                self.wfile.write(wire.encode('utf8'))
+                self.wfile.flush()
+                if kind == 'task_committed':
+                    break
+        finally:
+            subscription.close()
+            self.close_connection = True
+
+    def _session_sse(self, sid):
+        manager, reader = TaskMgr.GetInstance(), EventMgr.GetInstance()
+        values = self.headers.get_all('Last-Event-ID', [])
+        cursor = values[0] if values else None
+        if values and (len(values) != 1 or not re.fullmatch(re.escape(sid) + r':[a-f0-9]{32}:[0-9]{1,20}', cursor)):
+            raise DomainError('INVALID_REQUEST', 'Invalid session event cursor')
+        tasks = manager.List(sid, PageQuery(limit=200)).items
+        reader.Reconcile(tasks)
+        signature = tuple((t.task_id, t.status, t.finished_at) for t in tasks)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        subscription = reader.SubscribeSession(sid, cursor)
+        try:
+            for event in subscription:
+                if self.server.sse_stopped.is_set():
+                    break
+                if event['kind'] == 'heartbeat':
+                    tasks = manager.List(sid, PageQuery(limit=200)).items
+                    current = tuple((t.task_id, t.status, t.finished_at) for t in tasks)
+                    if current == signature:
+                        self.wfile.write(b': keep-alive\n\n')
+                        self.wfile.flush()
+                        continue
+                    signature = current
+                    reader.Reconcile(tasks)
+                    event = reader.Snapshot(sid)
+                elif event['kind'] == 'turn.finished':
+                    task = manager.Get(event['turn_id'])
+                    reader.Reconcile((task,))
+                    event = {**event, 'payload': TaskView(task)['result'] or {'status': task.status}}
+                wire = f"id: {sid}:{reader.epoch}:{event['seq']}\nevent: update\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                self.wfile.write(wire.encode('utf8'))
+                self.wfile.flush()
+        finally:
+            subscription.close()
+            self.close_connection = True
+
+    def _drain_rejected_body(self):
+        # Flush the rejection before draining. Closing a socket with unread
+        # request data can reset the connection and discard that response.
+        # Both bytes and total time are bounded even for a stalled sender.
+        try:
+            remaining = min(max(0, int(self.headers.get("Content-Length", "0"))), 65537)
+            if not remaining:
+                return
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            deadline = time.monotonic() + 0.1
+            while remaining and time.monotonic() < deadline:
+                self.connection.settimeout(max(0.001, deadline - time.monotonic()))
+                chunk = self.rfile.read1(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, ValueError):
+            pass
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _handle
 
@@ -230,6 +371,8 @@ class HttpServer:
     """One listening resource, owned exclusively by the startup entry."""
     def __init__(self, host, port):
         self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._server.daemon_threads = False  # server_close must drain real request borrowers.
+        self._server.sse_stopped = Event()
         address, bound_port = self._server.server_address
         public_host = "127.0.0.1" if address == "0.0.0.0" else host
         self.url = f"http://{public_host}:{bound_port}"
@@ -250,6 +393,7 @@ class HttpServer:
             self._thread.join(0.2)
 
     def Close(self):
+        self._server.sse_stopped.set()
         if self._thread.is_alive():
             self._server.shutdown()
             self._thread.join()

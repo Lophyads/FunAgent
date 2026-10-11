@@ -1,4 +1,27 @@
-from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provider, ProviderRequest, ProviderResponse
-from .runtime import ModelRuntime
+"""Startup binds one Runner; importing this entry does not load its implementation."""
+from ..frame.contracts import DomainError
+from .contracts import ModelProfile
+from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provider, ProviderRequest, ProviderResponse, Runner
 
-__all__ = ["Adapter", "FallbackRule", "ModelError", "ModelStrategy", "Provider", "ProviderRequest", "ProviderResponse", "ModelRuntime"]
+class ModelRuntime:
+    _instance: Runner | None = None
+
+    @classmethod
+    def Initialize(cls, runner: Runner) -> None:
+        if cls._instance is not None:
+            raise DomainError("ALREADY_INITIALIZED", "Model runtime already initialized")
+        cls._instance = runner
+
+    @classmethod
+    def GetInstance(cls) -> Runner:
+        if cls._instance is None:
+            raise DomainError("NOT_READY", "Model runtime not initialized")
+        return cls._instance
+
+    @classmethod
+    def Close(cls) -> None:
+        instance, cls._instance = cls._instance, None
+        if instance is not None:
+            close = getattr(instance, "Close", None)
+            if close is not None:
+                close()

@@ -5,7 +5,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ..contracts import ControlError, DomainError
+from ..frame.contracts import ControlError, DomainError
 
 
 class HTTPMemoryQuery:

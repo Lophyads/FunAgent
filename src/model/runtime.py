@@ -1,99 +1,71 @@
 """One ReAct loop. Conversation and counters belong exclusively to each Run."""
 from collections.abc import Mapping
 from dataclasses import replace
-from math import isfinite
 from types import MappingProxyType
 import time
 
-from ..conf import ModelProfile
-from ..contracts import (
-    ControlError, DomainError, Message, ModelReply, ModelRequest,
-    RunContext, RunInput, RunResult, ToolCall, ToolResult, RecordScope,
+from .contracts import ModelProfile, RunEvent
+from ..frame.contracts import (
+    ControlError, DomainError, Message, ModelRequest,
+    RunContext, RunInput, RunResult, ToolResult, RecordScope,
 )
-from ..tool import ToolMgr
-from ..persistence import DbMgr
+from ..tool.protocols import ToolDispatch
+from ..persistence.protocols import RunJournal
 from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provider
+from .retry import Backoff, Wait
+from .validation import ValidateReply
+from ..frame.protocols import RunEventWriter, NullEventWriter
 
 
-def _json_value(value):
-    if value is None or type(value) in (str, bool, int):
-        return True
-    if type(value) is float:
-        return isfinite(value)
-    if isinstance(value, Mapping):
-        return all(isinstance(key, str) and _json_value(item) for key, item in value.items())
-    if isinstance(value, tuple):
-        return all(_json_value(item) for item in value)
-    return False
-
-
-def _validate_reply(reply, seen):
-    if not isinstance(reply, ModelReply):
-        raise ModelError("PROTOCOL")
-    if reply.finish_reason == "length":
-        raise ModelError("TRUNCATED")
-    if reply.finish_reason not in {"stop", "tool_calls"}:
-        raise ModelError("PROTOCOL")
-    if not isinstance(reply.usage, Mapping) or any(
-        not isinstance(key, str) or type(value) is not int or value < 0 for key, value in reply.usage.items()
-    ):
-        raise ModelError("PROTOCOL")
-    if reply.calls:
-        if reply.finish_reason != "tool_calls" or (reply.content is not None and not isinstance(reply.content, str)):
-            raise ModelError("PROTOCOL")
-        batch = set()
-        for call in reply.calls:
-            if not isinstance(call, ToolCall) or not isinstance(call.call_id, str) or not call.call_id.strip():
-                raise ModelError("PROTOCOL")
-            if not isinstance(call.name, str) or not call.name.strip() or not isinstance(call.args, Mapping) or not _json_value(call.args):
-                raise ModelError("PROTOCOL")
-            if call.call_id in seen or call.call_id in batch:
-                raise ModelError("PROTOCOL")
-            batch.add(call.call_id)
-    elif reply.finish_reason != "stop" or not isinstance(reply.content, str) or not reply.content.strip():
-        raise ModelError("PROTOCOL")
-
-
-class ModelRuntime:
-    _instance = None
-
-    @classmethod
-    def Initialize(cls, profiles: Mapping[str, ModelProfile], providers: Mapping[str, Provider],
-                   adapters: Mapping[str, type[Adapter]]) -> None:
-        if cls._instance is not None:
-            raise DomainError("ALREADY_INITIALIZED", "Model runtime already initialized")
+class Runtime:
+    def __init__(self, profiles: Mapping[str, ModelProfile], providers: Mapping[str, Provider],
+                 adapters: Mapping[str, type[Adapter]], *, tool_dispatch: ToolDispatch, journal: RunJournal,
+                 owns_providers=True, events: RunEventWriter | None = None):
         if any(key != value.profile_id or value.provider_id not in providers or value.adapter_id not in adapters
                or not set(value.fallback_profiles) <= set(profiles)
                for key, value in profiles.items()):
             raise DomainError("CONFIG_REFERENCE", "Invalid model bindings")
-        instance = cls()
-        instance._profiles = MappingProxyType(dict(profiles))
-        instance._providers = MappingProxyType(dict(providers))
-        instance._adapters = MappingProxyType(dict(adapters))
-        cls._instance = instance
+        self._profiles = MappingProxyType(dict(profiles))
+        self._providers = MappingProxyType(dict(providers))
+        self._adapters = MappingProxyType(dict(adapters))
+        self._tool_dispatch = tool_dispatch
+        self._journal = journal
+        self._owns_providers = owns_providers
+        self._events = events if events is not None else NullEventWriter()
 
-    @classmethod
-    def GetInstance(cls):
-        if cls._instance is None:
-            raise DomainError("NOT_READY", "Model runtime not initialized")
-        return cls._instance
+    def Inspect(self):
+        return [{"profile_id": profile.profile_id, "provider_id": profile.provider_id,
+                 "adapter_id": profile.adapter_id, "model": profile.model, "timeout": profile.timeout,
+                 "streaming": profile.streaming,
+                 "streaming_available": callable(getattr(self._providers[profile.provider_id], "Stream", None)),
+                 "max_retries": profile.max_retries, "fallback_profiles": list(profile.fallback_profiles)}
+                for profile in self._profiles.values()]
 
-    @classmethod
-    def Close(cls):
-        instance = cls._instance
-        if instance is not None:
-            error = False
-            seen = set()
-            for provider in instance._providers.values():
-                if id(provider) not in seen:
-                    seen.add(id(provider))
-                    try:
-                        provider.Close()
-                    except Exception:
-                        error = True
-            cls._instance = None
-            if error:
-                raise DomainError("CLOSE_FAILED", "Provider close failed") from None
+    def _emit(self, context, counts, kind, payload=None, *, iteration=None):
+        if context.purpose != 'main' or not context.task_id:
+            return
+        try:
+            self._events.Publish(RunEvent(context.task_id, context.run_id, context.purpose,
+                counts['iterations'] + 1 if iteration is None else iteration,
+                counts['attempts'], kind, payload or {}, session_id=context.session_id))
+        except Exception:
+            # Display delivery cannot change a model result or tool effect.
+            pass
+
+    def Close(self):
+        if not self._owns_providers:
+            return
+        error = False
+        seen = set()
+        for provider in self._providers.values():
+            if id(provider) not in seen:
+                seen.add(id(provider))
+                try:
+                    provider.Close()
+                except Exception:
+                    error = True
+        if error:
+            raise DomainError("CLOSE_FAILED", "Provider close failed") from None
 
     def _send(self, request, route, active, rule, context, counts, seen):
         last = None
@@ -117,31 +89,53 @@ class ModelRuntime:
                     attempt_context = replace(context, deadline=deadline)
                     attempt_context.CheckCancelled()
                     counts["attempts"] += 1
+                    self._emit(context, counts, 'attempt_started', {'profile_id': profile.profile_id})
                     try:
-                        response = self._providers[profile.provider_id].Send(encoded, attempt_context)
-                    except (ModelError, ControlError):
+                        provider = self._providers[profile.provider_id]
+                        if profile.streaming:
+                            if not callable(getattr(provider, "Stream", None)) or not callable(getattr(adapter, "NewStream", None)):
+                                raise DomainError("UNSUPPORTED", "Selected model does not support streaming")
+                            accumulator = adapter.NewStream()
+                            with provider.Stream(encoded, attempt_context) as packets:
+                                for packet in packets:
+                                    attempt_context.CheckCancelled()
+                                    text = accumulator.Add(packet)
+                                    if text:
+                                        self._emit(context, counts, 'text_delta', {'text': text})
+                            reply = accumulator.Finish()
+                        else:
+                            response = provider.Send(encoded, attempt_context)
+                    except (DomainError, ControlError):
                         raise
                     except Exception:
                         raise ModelError("PROVIDER_FATAL") from None
                     context.CheckCancelled()
                     attempt_context.CheckCancelled()
                     try:
-                        reply = adapter.Decode(response)
-                        _validate_reply(reply, seen)
+                        if not profile.streaming:
+                            reply = adapter.Decode(response)
+                        reply = ValidateReply(reply, seen, request.tools)
                     except (ModelError, ControlError):
                         raise
                     except Exception:
                         raise ModelError("PROTOCOL") from None
                     context.CheckCancelled()
                     attempt_context.CheckCancelled()
+                    self._emit(context, counts, 'attempt_accepted', {'text': reply.content or '', 'profile_id': profile.profile_id})
                     return reply, index
                 except ControlError:
+                    self._emit(context, counts, 'attempt_reset', {'error_code': 'TIMEOUT'})
                     context.CheckCancelled()
                     last = ModelError("TIMEOUT")
                 except ModelError as error:
+                    self._emit(context, counts, 'attempt_reset', {'error_code': error.code})
                     context.CheckCancelled()
                     last = error
+                if last.code in {"PROTOCOL", "TRUNCATED", "PROVIDER_FATAL", "INVALID_REQUEST"}:
+                    raise last
                 if last.code in rule.retry_codes and retry < profile.max_retries:
+                    if not Wait(Backoff(retry, last.retry_after), context):
+                        raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
                     continue
                 if last.code in rule.fallback_codes:
                     break
@@ -171,9 +165,10 @@ class ModelRuntime:
         if not set(rule.profile_ids) <= set(self._profiles[primary].fallback_profiles):
             raise DomainError("CONFIG_REFERENCE", "Fallback profile not configured")
         route = (primary, *rule.profile_ids)
-        definitions = ToolMgr.GetInstance().Definitions(allowed)
+        dispatch = self._tool_dispatch
+        from ..tool.contracts import ToolSelectionRequest
         messages = list(input.messages)
-        prompt = "\n\n".join(part for part in (input.system_prompt, *input.evidence) if part)
+        prompt = input.system_prompt
         if prompt:
             messages.insert(0, Message("system", prompt))
         results, usage = [], {}
@@ -188,6 +183,9 @@ class ModelRuntime:
                              iterations=counts["iterations"], attempts=counts["attempts"], profile_id=counts["profile_id"])
 
         try:
+            selection = dispatch.Select(allowed if isinstance(allowed, ToolSelectionRequest)
+                                        else ToolSelectionRequest(enable=allowed), context)
+            definitions = selection.definitions
             for _ in range(maximum):
                 context.CheckCancelled()
                 reply, active = self._send(ModelRequest(tuple(messages), definitions), route, active, rule, context, counts, seen)
@@ -196,21 +194,26 @@ class ModelRuntime:
                     usage[key] = usage.get(key, 0) + value
                 if not reply.calls:
                     return finish("completed", final=reply.content)
-                message = Message("assistant", reply.content or "", reply.calls)
+                safe_calls = tuple(replace(call, args={}) if call.argument_error else call for call in reply.calls)
+                message = Message("assistant", reply.content or "", safe_calls)
                 if persistent:
-                    DbMgr.GetInstance().AppendToolCalls(scope, message)
+                    self._journal.AppendToolCalls(scope, message)
                 messages.append(message)
                 seen.update(call.call_id for call in reply.calls)
                 pending = reply.calls
                 for call in reply.calls:
                     context.CheckCancelled()
-                    result = ToolMgr.GetInstance().Execute(call, allowed, context)
+                    self._emit(context, counts, 'tool_started', {'call_id': call.call_id, 'tool_name': call.name},
+                               iteration=counts['iterations'])
+                    result = dispatch.Execute(call, selection, context)
                     results.append(result)
                     pending = pending[1:]
                     if persistent:
-                        DbMgr.GetInstance().AppendToolResult(scope, result)
+                        self._journal.AppendToolResult(scope, result)
                     messages.append(Message("tool", result.content, call_id=result.call_id,
                                             status=result.status, effect=result.effect))
+                    self._emit(context, counts, 'tool_finished', {'call_id': result.call_id,
+                        'status': result.status, 'effect': result.effect}, iteration=counts['iterations'])
                     context.CheckCancelled()
             context.CheckCancelled()
             return finish("limit", reason="MAX_ITERATIONS")
