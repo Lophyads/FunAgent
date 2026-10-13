@@ -36,10 +36,11 @@ def Sanitized(value, key=''):
 
 
 class DiagnosticService:
-    def __init__(self, conf, tools: ToolDiagnostics, models: ModelDiagnostics, tasks: TaskDiagnostics, *, logs, redact):
+    def __init__(self, conf, tools: ToolDiagnostics, models: ModelDiagnostics, tasks: TaskDiagnostics, *, logs, redact, traces=None, observation=None):
         self._conf, self._tools, self._models, self._tasks = conf, tools, models, tasks
         self._redact = redact
         self._logs = logs
+        self._traces, self._observation = traces, observation
         self._closed = False
 
     def Read(self, kind):
@@ -75,7 +76,8 @@ class DiagnosticService:
                        'base_url': Sanitized(thaw(conf.Model().Providers()[profile.provider_id])).get('base_url')}
                        for name, profile in configured.items()] if configured else list(bound.values())}
         if kind == "status":
-            return {"ready": True, "mode": conf.Serv().Options()["mode"], "tasks": self._tasks.Status()}
+            return {"ready": True, "mode": conf.Serv().Options()["mode"], "tasks": self._tasks.Status(),
+                    'observation': self._observation.Health() if self._observation else None}
         options = conf.Serv().Options()
         log = conf.Log().Options()
         return {"effective": Sanitized({'model.conf': {'providers': thaw(conf.Model().Providers()),
@@ -106,6 +108,11 @@ class DiagnosticService:
                           "disable": list(conf.Tool().Selection(purpose).disable),
                           "toolsets": list(conf.Tool().Selection(purpose).toolsets)}
                           for purpose in ("main", "recall", "review")}}}
+
+    def Traces(self):
+        if self._closed or self._traces is None:
+            raise DomainError('NOT_READY', 'Trace review is not initialized')
+        return self._traces
 
     def Logs(self, **options):
         if self._closed:

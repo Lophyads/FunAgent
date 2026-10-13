@@ -13,6 +13,9 @@ export class ApiClient {
     this.historyTimers=new Map();this.historyFlights=new Map();this.closed=false;this.expiryTimer=setInterval(()=>this.interactions().catch(()=>{}),5000);}
   async wire(path,options={}){const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
     let data;try{data=await response.json();}catch{data={};}if(!response.ok){const e=new Error(data.error?.message||`HTTP ${response.status}`);e.status=response.status;e.code=data.error?.code;throw e;}return data;}
+  traceSessions({limit=50,offset=0,signal}={}){return this.wire(`/trace-sessions?limit=${limit}&offset=${offset}`,{signal});}
+  traceOverview({sessionId,unassigned=false,limit=50,offset=0,signal}={}){const query=new URLSearchParams({view:'overview',limit,offset});if(unassigned)query.set('unassigned','1');else if(sessionId)query.set('session_id',sessionId);return this.wire(`/traces?${query}`,{signal});}
+  traceReview(taskId,{signal}={}){return this.wire(`/tasks/${encodeURIComponent(taskId)}/trace`,{signal});}
   async request(path,options={}){
     // Logical page resources are translated here; no legacy HTTP routes exist.
     const memory=path.match(/^\/api\/memory\/(user|note|episode)(?:\?(.*))?$/);

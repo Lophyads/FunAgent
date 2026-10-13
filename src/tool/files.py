@@ -1,4 +1,4 @@
-"""Bounded workspace IO; path checks also reject Windows reparse points."""
+"""Bounded file reads and workspace writes; paths reject links and reparse points."""
 from pathlib import Path, PureWindowsPath
 import os
 import stat
@@ -116,6 +116,30 @@ def Resolve(raw, context):
     return target
 
 
+def ResolveRead(raw, context):
+    """Read absolute paths or paths relative to the workspace, including parents."""
+    context.CheckCancelled()
+    path, windows = Path(raw.replace("\\", os.sep)), PureWindowsPath(raw)
+    if (windows.anchor and not path.is_absolute()
+            or windows.drive and not path.drive
+            or ":" in raw[len(windows.drive):]):
+        raise DomainError("INVALID_REQUEST", "Use a full absolute path or a path relative to the workspace")
+    if not path.is_absolute():
+        path = Path(context.workspace).resolve(strict=True) / path
+    current = Path(path.anchor)
+    # Check components before resolve() follows links, including components before '..'.
+    for part in path.parts[1:]:
+        context.CheckCancelled()
+        if Protected(part):
+            raise DomainError("DENIED", "Protected file path")
+        current /= part
+        if os.path.lexists(current) and Link(current):
+            raise DomainError("DENIED", "File links and reparse points are not allowed")
+    target = current.resolve(strict=True)
+    context.CheckCancelled()
+    return target
+
+
 def ReadText(target, context):
     context.CheckCancelled()
     if not stat.S_ISREG(target.stat().st_mode) or target.stat().st_size > MAX_TEXT_BYTES:
@@ -162,19 +186,26 @@ def Walk(base, context, depth):
 
 
 def ListDirectory(args, context):
-    base = Resolve(args.get("path", "."), context)
+    base = ResolveRead(args.get("path", "."), context)
     rows, bounded = Walk(base, context, args.get("depth", 1))
     start, maximum = args.get("cursor", 0), args.get("max_entries", 100)
     page = rows[start:start + maximum]
-    return {"path": args.get("path", "."), "entries": [
+    return {"path": str(base), "entries": [
         {"name": name, "type": "directory" if directory else "file"} for name, _, directory in page],
         "next_cursor": start + len(page) if start + len(page) < len(rows) else None,
         "truncated": bounded or start + len(page) < len(rows)}
 
 
 def SearchFiles(args, context):
-    base = Resolve(args.get("path", "."), context)
-    rows, truncated = Walk(base, context, args.get("depth", 8))
+    base = ResolveRead(args.get("path", "."), context)
+    kind = base.stat().st_mode
+    single_file = stat.S_ISREG(kind)
+    if single_file:
+        rows, truncated = [(base.name, base, False)], False
+    elif stat.S_ISDIR(kind):
+        rows, truncated = Walk(base, context, args.get("depth", 8))
+    else:
+        raise DomainError("INVALID_REQUEST", "Path must be a regular file or directory")
     matches, unreadable, count = [], 0, 0
     maximum, query = args.get("max_results", 50), args["query"].casefold()
     mode = args.get("mode", "content")
@@ -187,19 +218,21 @@ def SearchFiles(args, context):
             truncated = True
             break
         if mode in {"name", "both"} and query in name.casefold():
-            matches.append({"path": name, "line": None, "text": target.name})
+            matches.append({"path": str(target), "line": None, "text": target.name})
+            if len(matches) >= maximum:
+                return {"matches": matches[:maximum], "truncated": True, "unreadable": unreadable}
         if mode in {"content", "both"}:
             try:
-                lines = ReadText(Resolve(str(target.relative_to(Path(context.workspace).resolve())), context), context).splitlines()
+                lines = ReadText(ResolveRead(str(target), context), context).splitlines()
                 for number, line in enumerate(lines, 1):
                     context.CheckCancelled()
                     if query in line.casefold():
-                        matches.append({"path": name, "line": number, "text": line[:300]})
+                        matches.append({"path": str(target), "line": number, "text": line[:300]})
                         if len(matches) >= maximum:
                             return {"matches": matches[:maximum], "truncated": True, "unreadable": unreadable}
             except (OSError, UnicodeError, DomainError) as error:
                 from ..frame.contracts import ControlError
-                if isinstance(error, ControlError):
+                if single_file or isinstance(error, ControlError):
                     raise
                 unreadable += 1
         if len(matches) >= maximum:
@@ -208,12 +241,13 @@ def SearchFiles(args, context):
 
 
 def ReadFile(args, context):
-    text = ReadText(Resolve(args["path"], context), context)
+    target = ResolveRead(args["path"], context)
+    text = ReadText(target, context)
     lines = text.splitlines()
     start, maximum = args.get("start_line", 1), args.get("max_lines", 200)
     chosen = lines[start - 1:start - 1 + maximum]
     truncated = start - 1 + len(chosen) < len(lines) or any(len(line) > 1000 for line in chosen)
-    return {"path": args["path"], "lines": [{"line": start + i, "text": line[:1000]} for i, line in enumerate(chosen)],
+    return {"path": str(target), "lines": [{"line": start + i, "text": line[:1000]} for i, line in enumerate(chosen)],
             "truncated": truncated, "next_line": start + len(chosen) if start - 1 + len(chosen) < len(lines) else None,
             "sha256": hashlib.sha256(text.encode("utf8")).hexdigest()}
 

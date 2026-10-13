@@ -14,6 +14,8 @@ from .contracts import ToolFailure, ToolSelection, ToolSelectionRequest
 from .protocols import ToolHandler
 from .policy import Available, Decide, BindApproval, RequestedNames
 from .tool_registrar import ToolEntry
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import Definitions, ToolOutput, ToolCall as CallView
 
 
 class ToolRegistry:
@@ -115,17 +117,51 @@ class ToolRegistry:
             raise DomainError("CLOSE_FAILED", "Tool backend close failed")
 
     def Select(self, request, context=None):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('tools.select', input=lambda: dict(enable=request.enable, disable=request.disable,
+                                                         toolsets=request.toolsets) if isinstance(request, ToolSelectionRequest)
+                       else {'enable': request}):
+            result = self._select(request, context)
+            mgr.Complete(output=lambda: dict(allowed_names=result.allowed_names, definitions=Definitions(result.definitions)))
+            return result
+
+    def _select(self, request, context=None):
         if self._closed:
             raise DomainError("NOT_READY", "Tool registry closed")
         request = request if isinstance(request, ToolSelectionRequest) else ToolSelectionRequest(enable=request)
         context = context or RunContext()
         context.CheckCancelled()
         requested = self._requested(request)
-        names = tuple(name for name, entry in self._entries.items()
-                      if name in requested and self._available(name, context))
+        names, excluded = [], []
+        for name in self._entries:
+            if name in requested:
+                if self._available(name, context):
+                    names.append(name)
+                else:
+                    excluded.append({'name': name, 'reason': 'unavailable'})
+        ObservationMgr.GetInstance().Update(excluded=excluded)
         return ToolSelection(tuple(self._definition(name, context) for name in names), names, self._registry_id, request)
 
     def Execute(self, call: ToolCall, allowed_names: tuple[str, ...], context: RunContext) -> ToolResult:
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('tool.policy_and_validation', input=lambda: dict(call=CallView(call), purpose=context.purpose,
+                                                                       access=sorted(context.access))):
+            decision = self._validate(call, allowed_names, context)
+            if isinstance(decision, ToolResult):
+                mgr.Complete(status=decision.status, output=lambda: ToolOutput(decision))
+                return decision
+            mgr.Complete(status=decision.outcome, output={'decision': decision.outcome})
+        if decision.outcome == 'approval':
+            rejection = self._approve(call, context)
+            if rejection is not None:
+                return rejection
+        context.CheckCancelled()
+        with mgr.Scope('tool.handler', input=lambda: CallView(call)):
+            result = self._handle(call, context)
+            mgr.Complete(status=result.status, effect=result.effect, output=lambda: ToolOutput(result))
+            return result
+
+    def _validate(self, call, allowed_names, context):
         context.CheckCancelled()
         if call.name not in self._registry:
             return ToolResult(call.call_id, "invalid", "Unknown tool")
@@ -138,7 +174,7 @@ class ToolRegistry:
                 or call.name not in self._requested(selection.request)
                 or not self._available(call.name, context)):
             return ToolResult(call.call_id, "denied", "Tool not allowed")
-        _, handler, validator = self._registry[call.name]
+        _, _, validator = self._registry[call.name]
         if call.argument_error and not call.args:
             return ToolResult(call.call_id, "invalid", '{"error":"invalid_arguments"}')
         # Deny forbidden actions before schema validation so forged review
@@ -155,38 +191,51 @@ class ToolRegistry:
             valid = False
         if not valid:
             return ToolResult(call.call_id, "invalid", '{"error":"invalid_arguments"}')
-        if decision.outcome == "approval":
-            if context.purpose != "main" or not context.task_id or not context.run_id:
-                return ToolResult(call.call_id, "denied", "This run cannot request approval")
-            try:
-                binding = BindApproval(call, context)
-                if not binding.call_id:
-                    return ToolResult(call.call_id, "invalid", "Approval requires a call identity")
-                prompt = f"Approve {call.name} ({call.call_id}) with arguments: {json.dumps(thaw(call.args), ensure_ascii=False, allow_nan=False)}"
-                key = (context.task_id, context.run_id, call.call_id)
-                with self._approval_lock:
-                    if key in self._approval_calls:
-                        return ToolResult(call.call_id, "denied", "Approval call already consumed")
-                    self._approval_calls.add(key)
-                approved = InteractionMgr.GetInstance().Wait("approval", prompt, context, binding=binding)
-            except ControlError:
-                return ToolResult(call.call_id, "cancelled", "Approval interrupted")
-            except DomainError as error:
-                return ToolResult(call.call_id, "error", str(error))
-            except (TypeError, ValueError):
-                return ToolResult(call.call_id, "invalid", "Invalid approval arguments")
-            if approved is not True:
-                return ToolResult(call.call_id, "denied", "Approval declined")
-            try:
-                unchanged = binding == BindApproval(call, context)
-            except (TypeError, ValueError):
-                unchanged = False
-            if not unchanged:
-                return ToolResult(call.call_id, "denied", "Approval parameters changed")
-            if (not self._available(call.name, context)
-                    or Decide(self._entries[call.name], call, context, call.name in self._approval_names).outcome == "deny"):
-                return ToolResult(call.call_id, "denied", "Operation no longer allowed")
-        context.CheckCancelled()
+        return decision
+
+    def _approve(self, call, context):
+        mgr = ObservationMgr.GetInstance()
+        # The wait belongs to the tool call, after its policy scope has ended.
+        if context.purpose != "main" or not context.task_id or not context.run_id:
+            return ToolResult(call.call_id, "denied", "This run cannot request approval")
+        try:
+            binding = BindApproval(call, context)
+            if not binding.call_id:
+                return ToolResult(call.call_id, "invalid", "Approval requires a call identity")
+            prompt = f"Approve {call.name} ({call.call_id}) with arguments: {json.dumps(thaw(call.args), ensure_ascii=False, allow_nan=False)}"
+            key = (context.task_id, context.run_id, call.call_id)
+            with self._approval_lock:
+                if key in self._approval_calls:
+                    return ToolResult(call.call_id, "denied", "Approval call already consumed")
+                self._approval_calls.add(key)
+            approved = InteractionMgr.GetInstance().Wait("approval", prompt, context, binding=binding)
+        except ControlError:
+            return ToolResult(call.call_id, "cancelled", "Approval interrupted")
+        except DomainError as error:
+            return ToolResult(call.call_id, "error", str(error))
+        except (TypeError, ValueError):
+            return ToolResult(call.call_id, "invalid", "Invalid approval arguments")
+        if approved is not True:
+            return ToolResult(call.call_id, "denied", "Approval declined")
+        with mgr.Scope('tool.approval_recheck', input=lambda: CallView(call)):
+            result = self._recheck(call, binding, context)
+            mgr.Complete(status=result.status if result else 'allowed',
+                         output=lambda: ToolOutput(result) if result else {'allowed': True})
+            return result
+
+    def _recheck(self, call, binding, context):
+        try:
+            unchanged = binding == BindApproval(call, context)
+        except (TypeError, ValueError):
+            unchanged = False
+        if not unchanged:
+            return ToolResult(call.call_id, 'denied', 'Approval parameters changed')
+        if (not self._available(call.name, context)
+                or Decide(self._entries[call.name], call, context, call.name in self._approval_names).outcome == 'deny'):
+            return ToolResult(call.call_id, 'denied', 'Operation no longer allowed')
+
+    def _handle(self, call, context):
+        _, handler, _ = self._registry[call.name]
         try:
             result = handler.Execute(call.args, context)
             if not isinstance(result, ToolResult) or result.status not in {"ok", "denied", "invalid", "error", "unknown", "cancelled"}:

@@ -1,11 +1,14 @@
 """OpenAI-compatible embedding wire driver, bound once by the memory factory."""
 import os
 from math import isfinite
+from collections.abc import Mapping
 
 from ..frame.contracts import DomainError
 from .contracts import EmbeddingProfile
 from .common import text
 from .transport import JSONHTTP
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import Usage
 
 
 def ValidateProfile(profile):
@@ -62,7 +65,16 @@ class HTTPEmbedder:
         payload = {"model": self.profile.model, "input": [prefix + value for value in texts], "encoding_format": "float"}
         if self._dimensions:
             payload["dimensions"] = self.profile.dimensions
-        return DecodeBatch(self._http.Post("", payload, context), len(texts), self.profile.dimensions)
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('embedding.call', kind='embedding', model=self.profile.model, usage_status='unknown',
+                       input=payload, requested_count=len(texts), expected_dimensions=self.profile.dimensions):
+            response = self._http.Post('', payload, context)
+            mgr.Update(usage=lambda: Usage(response), output=lambda: dict(
+                returned_count=len(response['data']) if isinstance(response, Mapping) and isinstance(response.get('data'), list) else None,
+                response_received=True))
+            vectors = DecodeBatch(response, len(texts), self.profile.dimensions)
+            mgr.Complete(status='ok', output={'count': len(vectors), 'dimensions': self.profile.dimensions})
+            return vectors
 
     def Close(self):
         self._http.Close()

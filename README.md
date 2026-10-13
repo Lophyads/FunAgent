@@ -467,12 +467,14 @@ uv run --locked --extra openai funagent --conf-dir ./demo-conf
 | 类别 | 代表工具 / 实现 | 启用条件 |
 | --- | --- | --- |
 | 基础与人工交互 | `calculator`、`current_time`、`echo`、`clarify` | 在对应 purpose 中选择工具 |
-| 工作区文件 | `list_directory`、`search_files`、`read_file`、`write_file`、`patch_file` | 工作区权限；写入和补丁需单次批准 |
+| 文件 | `list_directory`、`search_files`、`read_file`、`write_file`、`patch_file` | 读取需 `workspace.read`；写入和补丁需 `workspace.write` 及单次批准 |
 | 终端 | `terminal` | 显式绑定 terminal 后端、`process.execute` 权限与单次批准 |
 | 联网 | `web_search`、`web_extract` | 绑定 Web 后端并授予 `network.read`；当前根配置使用 treg |
 | 桌面操作 | `computer_use` | 可用的 HTTP AX 后端、`computer.use` 权限及操作策略 |
 | 记忆 | `memory` | 记忆来源、来源权限及用途选择 |
 | MCP 外部工具 | `mcp_<server_id>__<规范化原名>` | MCP 后端、动态发现、include/exclude 和调用策略 |
+
+通用读取工具接受绝对路径或相对会话 workspace 的路径（包括 `..`），可以读取 workspace 外的文件。`search_files.path` 可以是文件或目录；`query` 是不区分大小写的字面子串，通配符过滤使用 `glob`。读取结果中的 `path` 为绝对路径，搜索结果可直接传给 `read_file`；目录条目的 `name` 相对返回的目录 `path`。受保护路径、符号链接/reparse point 和文本大小限制仍有效。`write_file`、`patch_file` 及 terminal 的工作目录保持原 workspace 边界；旧工具 `read_workspace` 仍只读取 workspace 内的文件。
 
 MCP 支持 stdio、Streamable HTTP 和 SSE。可选依赖按需要安装：模型用 `openai`，MCP / treg 用 `mcp`，Supabase 记忆用 `supabase` + `embedding`，DDGS 搜索与 PDF 提取用 `web`。只安装依赖不会自动启用后端，还需要对应配置和权限。
 
@@ -503,6 +505,8 @@ quit
 
 配置记忆来源后还可使用 `memory search/list/write/update/delete/confirm/export` 和 `review <session_id>`。配置日志文件后可使用 `logs tail/follow`；记忆导出生成 JSONL，并拒绝覆盖已有目标文件。
 
+主任务轨迹始终保存为日志目录同级 `trace_json/<trace_id>.json`。CLI 使用 `trace <task_id> [json|markdown|path]` 或 `traces [session_id]`；页面对话面板的“任务轨迹”和 Data 任务行可打开只读审查。操作树、IO、token、等待及完整性共用同一读取器，历史任务没有文件时显示“未采集”。离线读取、样例、六项资源配置与恢复诊断见 [观察层使用说明](docs/观察层使用说明.md)。
+
 ### HTTP API
 
 | 接口 | 用途 |
@@ -516,6 +520,9 @@ quit
 | `/memory/*` | 授权来源、搜索、分页记录、写入与改删确认 |
 | `GET /diagnostics/{kind}` | 工具、连接、模型、配置与状态诊断 |
 | `GET /data/schema`、`GET /data/tables/{table}` | 主数据库白名单表的只读浏览 |
+| `GET /traces` | 按会话 / 时间筛选保存的轨迹摘要，支持 `limit` 与 `offset` |
+| `GET /tasks/{id}/trace` | 读取已保存操作树、IO、汇总与主库校准状态 |
+| `GET /tasks/{id}/trace/json`、`GET /tasks/{id}/trace/markdown` | 导出已保存 JSON 或 Markdown 审查报告 |
 
 `request_key` 在会话内唯一：相同键和相同内容返回原任务，异内容返回 `409 CONFLICT`。刷新页面可从数据库读取会话历史与任务状态；运行过程通过有界 SSE 快照校准。详细参数、游标、错误码和人工答复格式见 [API 参考](docs/api-reference.md)。
 
@@ -532,6 +539,14 @@ uv build --out-dir dist
 历史完整迁移与发布验收见 [迁移验收记录](docs/migration-acceptance.md)，运行其中命令前需检查它们要求的示例、测试资源和外部依赖。
 
 ## 使用边界与常见问题
+
+可使用 [记忆 endpoint 检查脚本](check_memory_endpoint.py) 验证配置对应的 Supabase REST 服务与当前版本的 `list/search` RPC：
+
+```powershell
+uv run --no-sync python -X utf8 check_memory_endpoint.py --conf-dir .
+```
+
+脚本读取所选目录的 `memory.conf` 和 `.env`，进程环境变量优先；默认检查 `facts`，可用 `--source` 指定其他来源，或用 `--timeout 10` 调整单次 HTTP 超时。仅执行读取，输出错误码与函数签名，不展示凭据或记忆正文。退出码 `0` 表示两个读取 RPC 均通过，`1` 表示远端检查失败，`2` 表示本地配置错误。检查不包含 embedding、向量检索或写入能力；依赖使用项目现有的 `python-dotenv` 和 `supabase` extra 中的 `httpx`。
 
 当前运行模型为单机、单应用进程、一个主任务工作线程及可选的一个复盘工作线程。主任务队列在进程内，持久化用于保存结果和修复中断状态；不提供分布式调度、跨进程接管或重启后自动重放任务。取消是合作式取消，关闭时需要等待实际 IO 和借用归还。
 

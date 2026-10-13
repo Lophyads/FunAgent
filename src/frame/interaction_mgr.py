@@ -1,5 +1,6 @@
 """Task-bound human requests; answers bypass the occupied main queue."""
 from dataclasses import dataclass, field
+from contextlib import ExitStack
 from math import isfinite
 from threading import Event, Lock
 from uuid import uuid4
@@ -9,6 +10,8 @@ from .contracts import ApprovalBinding, ControlError, DomainError, Interaction, 
 from .protocols import InteractionAccess
 from .clarification import ValidateQuestions, ValidateAnswers
 from .event_mgr import Emit
+from ..observability.observation_mgr import ObservationMgr
+from .clarification import QuestionData
 
 
 @dataclass
@@ -62,6 +65,9 @@ class InteractionMgr:
                         instance._end(identifier, waiter, ControlError("CANCELLED"))
 
     def _end(self, identifier, waiter, error):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.UseBinding(('interaction', identifier)):
+            mgr.Event('interaction.ended', interaction_id=identifier, error_code=error.code, occurred_at=time.time())
         self._pending.pop(identifier, None)
         waiter.error = error
         waiter.event.set()
@@ -79,6 +85,24 @@ class InteractionMgr:
                 self._end(identifier, waiter, DomainError("INTERACTION_EXPIRED", "Human request expired"))
 
     def Wait(self, kind, prompt, context, *, binding=None, questions=()):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('interaction.wait', input=lambda: dict(kind=kind, prompt=prompt,
+                       questions=[QuestionData(q) for q in questions],
+                       approval=dict(call_id=binding.call_id, tool_name=binding.tool_name,
+                                     arguments_digest=binding.arguments_digest) if binding else None)):
+            try:
+                answer = self._wait(kind, prompt, context, binding=binding, questions=questions)
+            except DomainError as error:
+                status = ('expired' if error.code == 'INTERACTION_EXPIRED' else 'cancelled' if error.code == 'CANCELLED'
+                          else 'timeout' if error.code == 'DEADLINE' else 'failed')
+                mgr.Complete(status=status, error_code=error.code)
+                raise
+            mgr.Complete(status='declined' if kind == 'approval' and answer is False else 'answered',
+                         output=lambda: {'answer': answer})
+            return answer
+
+    def _wait(self, kind, prompt, context, *, binding=None, questions=()):
+        mgr = ObservationMgr.GetInstance()
         if context.purpose != "main" or not context.task_id or not context.run_id:
             raise DomainError("INTERACTION_DENIED", "This run cannot request human input")
         if kind not in {"clarify", "approval"} or not isinstance(prompt, str) or not prompt.strip():
@@ -103,6 +127,9 @@ class InteractionMgr:
             context.CheckCancelled()
             if any(w.request.task_id == context.task_id for w in self._pending.values()):
                 raise DomainError("INTERACTION_PENDING", "Task already has a human request")
+            mgr.Update(interaction_id=request.interaction_id, expires_at=deadline,
+                       **({'call_id': binding.call_id} if binding else {}))
+            mgr.Bind(('interaction', request.interaction_id))
             self._pending[request.interaction_id] = waiter
         Emit(context, 'interaction_pending', {'interaction_id': request.interaction_id, 'kind': kind})
         try:
@@ -124,20 +151,31 @@ class InteractionMgr:
             return tuple(w.request for w in self._pending.values() if w.request.task_id == task_id)
 
     def Resolve(self, interaction_id, answer, *, task_id, run_id):
-        with self._lock:
-            waiter = self._pending.get(interaction_id)
-            if waiter is not None:
-                self._expire(interaction_id, waiter)
-            if waiter is None or waiter.error is not None or (waiter.request.task_id, waiter.request.run_id) != (task_id, run_id):
-                raise DomainError("INTERACTION_STALE", "Human request is no longer pending for this run")
-            if waiter.request.kind == "approval":
-                valid = type(answer) is bool
-            elif waiter.request.kind == "clarify":
-                answer = ValidateAnswers(waiter.request.questions, answer)
-                valid = True
-            if not valid:
-                raise DomainError("INVALID_REQUEST", "Invalid human answer")
-            waiter.answer = answer
-            self._pending.pop(interaction_id)
-            waiter.event.set()
+        mgr = ObservationMgr.GetInstance()
+        # Acquire the server-owned target while it is still pending, and keep
+        # the lease through publication even if Wait has already returned.
+        with ExitStack() as leases:
+            with self._lock:
+                waiter = self._pending.get(interaction_id)
+                if waiter is not None:
+                    self._expire(interaction_id, waiter)
+                if waiter is None or waiter.error is not None or (waiter.request.task_id, waiter.request.run_id) != (task_id, run_id):
+                    raise DomainError("INTERACTION_STALE", "Human request is no longer pending for this run")
+                leases.enter_context(mgr.UseBinding(('interaction', interaction_id)))
+                occurred_at = time.time()
+                try:
+                    if waiter.request.kind == 'approval':
+                        if type(answer) is not bool:
+                            raise DomainError('INVALID_REQUEST', 'Invalid human answer')
+                    else:
+                        answer = ValidateAnswers(waiter.request.questions, answer)
+                except DomainError as error:
+                    mgr.Event('interaction.answer_invalid', interaction_id=interaction_id,
+                              error_code=error.code, occurred_at=occurred_at)
+                    raise
+                waiter.answer = answer
+                self._pending.pop(interaction_id)
+                waiter.event.set()
+            mgr.Event('interaction.resolved', interaction_id=interaction_id, answer=lambda: answer,
+                      occurred_at=occurred_at)
             Emit(waiter.context, 'interaction_resolved', {'interaction_id': interaction_id})

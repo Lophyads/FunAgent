@@ -13,6 +13,7 @@ from ..persistence.protocols import ReviewStore
 from .prompt import Evidence
 from .contracts import MemoryQuery
 from .protocols import MemoryReader
+from ..observability.observation_mgr import ObservationMgr
 
 
 class MemoryReviewStrategy(ModelStrategy):
@@ -31,6 +32,11 @@ class MemoryReviewStrategy(ModelStrategy):
 class ReviewProcess:
     @staticmethod
     def Run(job, context):
+        with ObservationMgr.GetInstance().Suspend():
+            return ReviewProcess._run(job, context)
+
+    @staticmethod
+    def _run(job, context):
         from .memory_mgr import MemoryMgr
         store: ReviewStore = DbMgr.GetInstance()
         try:

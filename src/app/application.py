@@ -24,6 +24,8 @@ from ..model.model_runtime import ModelRuntime
 from ..model.factory import Create as CreateModel
 from ..persistence.db_mgr import DbMgr
 from ..persistence.factory import Create as CreatePersistence
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.factory import Create as CreateObservation
 from ..task.task_mgr import TaskMgr
 from ..task.task_process import TaskProcess
 from ..task.task_queue import TaskQueue
@@ -61,6 +63,10 @@ def Start(conf_dir):
         owner.Own(ConfMgr, ConfMgr.Close)
         conf = Initialize(conf_dir)
         logs = owner.Own(LogSession(conf, conf_dir))
+        observation = CreateObservation(conf, logs, conf_dir)
+        owner.Own(observation, observation.CloseResource)
+        ObservationMgr.Initialize(observation)
+        owner.TrackBinding(ObservationMgr, observation)
         options = conf.Serv().Options()
         review = conf.Memory().Policy("review")
         store = owner.Own(CreatePersistence(options, conf_dir))
@@ -87,10 +93,14 @@ def Start(conf_dir):
             worker.Start()
         queue = TaskQueue(options["capacity"], executor=TaskProcess,
                           timeout=options.get("task_timeout", 60), start_worker=False)
+        # The queue constructor has repaired main database interrupted tasks.
+        # Recovery IO belongs to the observation writer before new task admission.
+        observation.Recover(store.GetTask)
         owner.Bind(TaskMgr, queue, worker=True)
         queue.Start()
         owner.Bind(DiagnosticsMgr, DiagnosticService(conf, tools, ModelRuntime.GetInstance(), queue,
-                                                     logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact))
+                                                     logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact,
+                                                     traces=observation.Reader(store.GetTask), observation=observation))
         if options["mode"] in {"web", "both"}:
             _http_server = owner.HTTP(HttpServer(options["host"], options["port"]))
             _http_server.Start()
@@ -118,13 +128,15 @@ def Stop():
         # Public test/embedding assembly uses the same drain path. Its bound
         # managers retain their existing ownership of stores and providers.
         _lifecycle = Lifecycle()
-        for manager in (ConfMgr, ToolMgr, ModelRuntime, DbMgr, MemoryMgr, MemoryOperationsMgr, DiagnosticsMgr, InteractionMgr, EventMgr, ReviewScheduler, TaskMgr):
+        for manager in (ConfMgr, ObservationMgr, ToolMgr, ModelRuntime, DbMgr, MemoryMgr, MemoryOperationsMgr, DiagnosticsMgr, InteractionMgr, EventMgr, ReviewScheduler, TaskMgr):
             try:
                 instance = manager.GetInstance()
             except DomainError as error:
                 if error.code != "NOT_READY":
                     raise
             else:
+                if manager is ObservationMgr and instance is ObservationMgr._null:
+                    continue
                 _lifecycle.TrackBinding(manager, instance, worker=manager in (TaskMgr, ReviewScheduler))
         if _http_server is not None:
             _lifecycle.HTTP(_http_server)

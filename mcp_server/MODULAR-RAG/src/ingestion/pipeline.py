@@ -5,9 +5,9 @@ document ingestion flow:
     1. File Integrity Check (SHA256 skip check)
     2. Document Loading (PDF → Document)
     3. Chunking (Document → Chunks)
-    4. Transform (Refine + Enrich + Caption)
+    4. Transform (Refine + Enrich)
     5. Encoding (Dense + Sparse vectors)
-    6. Storage (VectorStore + BM25 Index + ImageStorage)
+    6. Storage (VectorStore + BM25 Index)
 
 Design Principles:
 - Config-Driven: All components configured via settings.yaml
@@ -18,6 +18,8 @@ Design Principles:
 
 from pathlib import Path
 from typing import Callable, List, Optional, Dict, Any
+import re
+import shutil
 import time
 
 from src.core.settings import Settings, load_settings, resolve_path
@@ -35,7 +37,6 @@ from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 from src.ingestion.chunking.document_chunker import DocumentChunker
 from src.ingestion.transform.chunk_refiner import ChunkRefiner
 from src.ingestion.transform.metadata_enricher import MetadataEnricher
-from src.ingestion.transform.image_captioner import ImageCaptioner
 from src.ingestion.embedding.dense_encoder import DenseEncoder
 from src.ingestion.embedding.sparse_encoder import SparseEncoder
 from src.ingestion.embedding.batch_processor import BatchProcessor
@@ -103,7 +104,6 @@ class IngestionPipeline:
     - Text chunking with configurable splitter
     - Chunk refinement (rule-based + LLM)
     - Metadata enrichment (rule-based + LLM)
-    - Image captioning (Vision LLM)
     - Dense embedding (Azure text-embedding-ada-002)
     - Sparse encoding (BM25 term statistics)
     - Vector storage (ChromaDB)
@@ -165,10 +165,6 @@ class IngestionPipeline:
         
         self.metadata_enricher = MetadataEnricher(settings)
         logger.info(f"  ✓ MetadataEnricher initialized (use_llm={self.metadata_enricher.use_llm})")
-        
-        self.image_captioner = ImageCaptioner(settings)
-        has_vision = self.image_captioner.llm is not None
-        logger.info(f"  ✓ ImageCaptioner initialized (vision_enabled={has_vision})")
         
         # Stage 5: Encoders
         embedding = EmbeddingFactory.create(settings)
@@ -279,11 +275,10 @@ class IngestionPipeline:
             _elapsed = (time.monotonic() - _t0) * 1000.0
             
             text_preview = document.text[:200].replace('\n', ' ') + "..." if len(document.text) > 200 else document.text
-            image_count = len(document.metadata.get("images", []))
+            image_count = 0
             
             logger.info(f"  Document ID: {document.id}")
             logger.info(f"  Text length: {len(document.text)} chars")
-            logger.info(f"  Images extracted: {image_count}")
             logger.info(f"  Preview: {text_preview[:100]}...")
             
             stages["loading"] = {
@@ -293,7 +288,7 @@ class IngestionPipeline:
             }
             if trace is not None:
                 trace.record_stage("load", {
-                    "method": "markitdown",
+                    "method": document.metadata.get("parser", "markdown"),
                     "doc_id": document.id,
                     "text_length": len(document.text),
                     "image_count": image_count,
@@ -321,7 +316,7 @@ class IngestionPipeline:
             }
             if trace is not None:
                 trace.record_stage("split", {
-                    "method": "recursive",
+                    "method": "paragraph",
                     "chunk_count": len(chunks),
                     "avg_chunk_size": sum(len(c.text) for c in chunks) // len(chunks) if chunks else 0,
                     "chunks": [
@@ -358,26 +353,18 @@ class IngestionPipeline:
             enriched_by_rule = sum(1 for c in chunks if c.metadata.get("enriched_by") == "rule")
             logger.info(f"      LLM enriched: {enriched_by_llm}, Rule enriched: {enriched_by_rule}")
             
-            # 4c: Image Captioning
-            logger.info("  4c. Image Captioning...")
-            chunks = self.image_captioner.transform(chunks, trace)
-            captioned = sum(1 for c in chunks if c.metadata.get("image_captions"))
-            logger.info(f"      Chunks with captions: {captioned}")
-            
             stages["transform"] = {
                 "chunk_refiner": {"llm": refined_by_llm, "rule": refined_by_rule},
                 "metadata_enricher": {"llm": enriched_by_llm, "rule": enriched_by_rule},
-                "image_captioner": {"captioned_chunks": captioned}
             }
             _elapsed_transform = (time.monotonic() - _t0_transform) * 1000.0
             if trace is not None:
                 trace.record_stage("transform", {
-                    "method": "refine+enrich+caption",
+                    "method": "refine+enrich",
                     "refined_by_llm": refined_by_llm,
                     "refined_by_rule": refined_by_rule,
                     "enriched_by_llm": enriched_by_llm,
                     "enriched_by_rule": enriched_by_rule,
-                    "captioned_chunks": captioned,
                     "chunks": [
                         {
                             "chunk_id": c.id,
@@ -482,26 +469,9 @@ class IngestionPipeline:
                 vector_store.delete(stale_ids, trace=trace)
             logger.info(f"      Removed {len(stale_ids)} stale vectors")
             
-            # 6c: Register images in image storage index
-            # Note: Images are already saved by PdfLoader, we just need to index them
-            logger.info("  6c. Image Storage Index...")
-            images = document.metadata.get("images", [])
-            for img in images:
-                img_path = Path(img["path"])
-                if img_path.exists():
-                    self.image_storage.register_image(
-                        image_id=img["id"],
-                        file_path=img_path,
-                        collection=self.collection,
-                        doc_hash=file_hash,
-                        page_num=img.get("page", 0)
-                    )
-            logger.info(f"      Indexed {len(images)} images")
-            
             stages["storage"] = {
                 "vector_count": len(vector_ids),
                 "bm25_docs": len(sparse_stats),
-                "images_indexed": len(images)
             }
             _elapsed_storage = (time.monotonic() - _t0_storage) * 1000.0
             if trace is not None:
@@ -514,16 +484,6 @@ class IngestionPipeline:
                         "store": "ChromaDB",
                     }
                     for i, c in enumerate(chunks)
-                ]
-                # Image storage details
-                image_storage_details = [
-                    {
-                        "image_id": img["id"],
-                        "file_path": str(img["path"]),
-                        "page": img.get("page", 0),
-                        "doc_hash": file_hash,
-                    }
-                    for img in images
                 ]
                 trace.record_stage("upsert", {
                     "dense_store": {
@@ -538,11 +498,6 @@ class IngestionPipeline:
                         "count": len(sparse_stats),
                         "path": f"data/db/bm25/{self.collection}/",
                     },
-                    "image_store": {
-                        "backend": "ImageStorage (JSON index)",
-                        "count": len(images),
-                        "images": image_storage_details,
-                    },
                     "chunk_mapping": chunk_storage,
                 }, elapsed_ms=_elapsed_storage)
             
@@ -550,15 +505,16 @@ class IngestionPipeline:
             # Mark Success
             # ─────────────────────────────────────────────────────────────
             self.integrity_checker.mark_success(file_hash, record_path, self.collection)
+            self._remove_legacy_image_rows(file_hash)
             for rec in previous_records:
                 if rec["file_hash"] != file_hash:
+                    self._remove_replaced_image_artifacts(rec, record_path)
                     self.integrity_checker.remove_record(rec["file_hash"])
             
             logger.info("\n" + "=" * 60)
             logger.info("✅ Pipeline completed successfully!")
             logger.info(f"   Chunks: {len(chunks)}")
             logger.info(f"   Vectors: {len(vector_ids)}")
-            logger.info(f"   Images: {len(images)}")
             logger.info("=" * 60)
             
             return PipelineResult(
@@ -566,7 +522,7 @@ class IngestionPipeline:
                 file_path=str(file_path),
                 doc_id=file_hash,
                 chunk_count=len(chunks),
-                image_count=len(images),
+                image_count=0,
                 vector_ids=vector_ids,
                 stages=stages
             )
@@ -587,6 +543,31 @@ class IngestionPipeline:
     def close(self) -> None:
         """Clean up resources."""
         self.image_storage.close()
+
+    def _remove_legacy_image_rows(self, doc_hash: str) -> None:
+        """Drop old image-index rows for a reprocessed document without deleting files."""
+        for image in self.image_storage.list_images(collection=self.collection, doc_hash=doc_hash):
+            self.image_storage.delete_image(image["image_id"], remove_file=False)
+
+    def _remove_replaced_image_artifacts(self, record: Dict[str, Any], record_path: str) -> None:
+        """Delete images belonging to the exact source record that was replaced."""
+        doc_hash = record.get("file_hash", "")
+        if (
+            record.get("file_path") != record_path
+            or record.get("collection") != self.collection
+            or re.fullmatch(r"[0-9a-f]{64}", doc_hash) is None
+        ):
+            raise ValueError("Refusing to clean images for an unrelated ingestion record")
+
+        for image in self.image_storage.list_images(collection=self.collection, doc_hash=doc_hash):
+            self.image_storage.delete_image(image["image_id"], remove_file=True)
+
+        root = resolve_path(f"data/images/{self.collection}").resolve()
+        target = (root / doc_hash).resolve()
+        if target.parent != root:
+            raise ValueError(f"Unsafe legacy image directory: {target}")
+        if target.exists():
+            shutil.rmtree(target)
 
 
 def run_pipeline(

@@ -27,6 +27,8 @@ def _register_builtin_providers() -> None:
         SplitterFactory.register_provider("recursive", RecursiveSplitter)
     except ImportError:
         pass  # RecursiveSplitter not available (missing langchain dependency)
+    from src.libs.splitter.paragraph_splitter import ParagraphSplitter
+    SplitterFactory.register_provider("paragraph", ParagraphSplitter)
 
 
 class SplitterFactory:

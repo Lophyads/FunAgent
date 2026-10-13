@@ -4,14 +4,15 @@ import {mount as chat} from './components/chat.js';
 import {mount as overview} from './pages/overview.js';
 import {mount as memory} from './pages/memory.js';
 import {mount as data} from './pages/data.js';
+import {mount as observability} from './pages/observability.js';
 import {mount as catalog} from './pages/catalog.js';
 import {notify} from './components/ui.js';
 
 const store=createStore(),api=new ApiClient(store),commands=createCommands(store,api);
-const pages={overview,memory,data,tools:catalog,connections:catalog,models:catalog,config:catalog};
+const pages={overview,memory,data,observability,tools:catalog,connections:catalog,models:catalog,config:catalog};
 const context={store,api,commands},pageRoot=document.querySelector('#page'),shell=document.querySelector('#shell');
 let disposePage=()=>{};
-function route(){const name=location.hash.slice(1)||'overview',page=pages[name]?name:'overview';disposePage();store.ui('activePage',page);disposePage=pages[page](pageRoot,{...context,page});
+function route(){const hash=location.hash.slice(1),separator=hash.indexOf('?'),name=(separator<0?hash:hash.slice(0,separator))||'overview',page=pages[name]?name:'overview',routeParams=new URLSearchParams(separator<0?'':hash.slice(separator+1));disposePage();store.ui('activePage',page);disposePage=pages[page](pageRoot,{...context,page,routeParams});
   for(const link of document.querySelectorAll('#sidebar a')){const active=link.hash===`#${page}`;link.classList.toggle('active',active);if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current');}}
 window.addEventListener('hashchange',route);route();const disposeChat=chat(document.querySelector('#chat'),context);
 store.subscribe(s=>s.ui.connectionStatus,value=>{const node=document.querySelector('#connection');node.textContent={connecting:'连接中',connected:'已连接',reconnecting:'重连中'}[value];node.className=`badge ${value}`;});

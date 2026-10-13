@@ -13,8 +13,12 @@ Design Principles:
 from __future__ import annotations
 
 import logging
+import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from src.core.settings import resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +267,22 @@ class DocumentManager:
             result.images_deleted = deleted_imgs
         except Exception as e:
             result.errors.append(f"ImageStorage delete failed: {e}")
+
+        # PyMuPDF4LLM images are linked from Markdown and intentionally are not
+        # registered in ImageStorage. Remove their document-scoped folder too.
+        try:
+            if re.fullmatch(r"[0-9a-f]{64}", source_hash) is None:
+                raise ValueError("Invalid document hash for image directory cleanup")
+            image_root = resolve_path(f"data/images/{collection}").resolve()
+            image_dir = (image_root / source_hash).resolve()
+            if image_dir.parent != image_root:
+                raise ValueError(f"Unsafe document image directory: {image_dir}")
+            if image_dir.exists():
+                unindexed_files = sum(1 for item in image_dir.rglob("*") if item.is_file())
+                shutil.rmtree(image_dir)
+                result.images_deleted += unindexed_files
+        except Exception as e:
+            result.errors.append(f"Markdown image directory delete failed: {e}")
 
         # 4. FileIntegrity – remove the ingestion record
         try:

@@ -55,6 +55,9 @@ class SafeFormatter(logging.Formatter):
         output = _ASSIGNMENT.sub(r"\1[REDACTED]", output)
         return _USERINFO.sub(r"\1[REDACTED]@", output)
 
+    def RedactionLookahead(self):
+        return max((len(secret) for secret in self._secrets), default=0)
+
 
 class LogSession:
     def __init__(self, conf, conf_dir):
@@ -93,6 +96,9 @@ class LogSession:
 
     def Redact(self, text):
         return self._formatter.Redact(text)
+
+    def RedactionLookahead(self):
+        return self._formatter.RedactionLookahead()
 
     def _CloseHandlers(self):
         failed = False

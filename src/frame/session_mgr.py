@@ -6,6 +6,7 @@ import logging
 
 from ..persistence.db_mgr import DbMgr
 from .contracts import DomainError, ControlError, SessionCreate, PageQuery, HistoryQuery
+from ..observability.observation_mgr import ObservationMgr
 
 
 class SessionMgr:
@@ -40,9 +41,19 @@ class SessionMgr:
     @staticmethod
     def EnsurePrompt(session_id, context):
         """Initialize once; concurrent callers return the same durable winner."""
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('conversation.prompt', input={'session_id': session_id}):
+            result = SessionMgr._ensure_prompt(session_id, context)
+            mgr.Complete(output={'prompt': result})
+            return result
+
+    @staticmethod
+    def _ensure_prompt(session_id, context):
+        mgr = ObservationMgr.GetInstance()
         context.CheckCancelled()
         session = SessionMgr.Load(session_id).session
         if session.prompt is not None:
+            mgr.Update(mode='reused')
             return session.prompt
         from .conf_mgr import ConfMgr
         from ..memory.memory_mgr import MemoryMgr
@@ -50,6 +61,7 @@ class SessionMgr:
         from ..memory.prompt import Evidence
         conf = ConfMgr.GetInstance()
         prompt = conf.Serv().Options().get("system_prompt", "You are a helpful assistant.")
+        mgr.Update(mode='initialized', input={'session_id': session_id, 'base_prompt': prompt})
         policy = conf.Memory().Policy("profile")
         child = replace(context, deadline=min(context.deadline or float("inf"), time.monotonic() + policy.get("timeout", 2)))
         try:
@@ -60,6 +72,8 @@ class SessionMgr:
                 prompt += "\n\n" + Evidence(profile)
         except DomainError as error:
             context.CheckCancelled()
+            mgr.Event('profile.degraded', error_code=error.code)
+            mgr.Update(mode='initialized_with_fallback')
             logging.getLogger("funagent.session").warning("Profile initialization failed (profile:%s)",
                 "DEADLINE" if isinstance(error, ControlError) else "MEMORY_SOURCE",
                 extra={"session_id": session_id, "run_id": context.run_id, "purpose": context.purpose})
@@ -72,4 +86,5 @@ class SessionMgr:
             winner = SessionMgr.Load(session_id).session.prompt
             if winner is None:
                 raise
+            mgr.Update(mode='concurrent_winner')
             return winner

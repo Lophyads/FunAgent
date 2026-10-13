@@ -1,7 +1,6 @@
-"""Markdown Loader implementation using MarkItDown.
+"""Markdown Loader implementation.
 
-Markdown needs no conversion the way a PDF does -- MarkItDown returns the
-source byte-for-byte -- but it still goes through the same loader contract so
+Markdown needs no conversion -- it goes through the same loader contract so
 the rest of the pipeline never learns what a document originally was.
 
 Plain .txt is deliberately NOT handled: tests/e2e/test_data_ingestion.py pins
@@ -11,8 +10,7 @@ document nobody chose to structure. Register one here if that changes.
 Features:
 - Markdown loading with the same Document contract as PdfLoader
 - Title and SHA256 identity inherited from BaseLoader (format-independent)
-- Graceful degradation: a MarkItDown failure falls back to a direct read,
-  because for these formats reading the file IS the conversion
+- Direct UTF-8 reads preserve Markdown structure without a conversion layer
 
 No image extraction: Markdown carries no embedded binaries. An image in it is
 a link to a file the loader does not own, so there is nothing to pull out.
@@ -20,20 +18,11 @@ a link to a file the loader does not own, so there is nothing to pull out.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Dict
 
-try:
-    from markitdown import MarkItDown
-    MARKITDOWN_AVAILABLE = True
-except ImportError:
-    MARKITDOWN_AVAILABLE = False
-
 from src.core.types import Document
 from src.libs.loader.base_loader import BaseLoader
-
-logger = logging.getLogger(__name__)
 
 
 class MarkdownLoader(BaseLoader):
@@ -47,10 +36,8 @@ class MarkdownLoader(BaseLoader):
     Supported extensions:
         .md, .markdown
 
-    Graceful Degradation:
-        If MarkItDown is unavailable or raises, the file is read directly --
-        for Markdown that produces the same result, so a parser problem should
-        never cost the caller the document.
+    Markdown is read directly as UTF-8 because it is already the canonical
+    text format consumed by the rest of the pipeline.
     """
 
     SUPPORTED_EXTENSIONS = ('.md', '.markdown')
@@ -58,10 +45,9 @@ class MarkdownLoader(BaseLoader):
     def __init__(self) -> None:
         """Initialize the Markdown Loader.
 
-        Unlike PdfLoader there is nothing to configure: no image extraction,
-        no storage directory.
+        Unlike PdfLoader there is nothing to configure.
         """
-        self._markitdown = MarkItDown() if MARKITDOWN_AVAILABLE else None
+        pass
 
     def load(self, file_path: str | Path) -> Document:
         """Load and parse a Markdown file.
@@ -88,8 +74,6 @@ class MarkdownLoader(BaseLoader):
         doc_id = f"doc_{doc_hash[:16]}"
 
         text_content = self._read_text(path)
-        if not text_content.strip():
-            logger.warning(f"Loaded an empty document: {path}")
 
         metadata: Dict[str, Any] = {
             "source_path": str(path),
@@ -108,7 +92,7 @@ class MarkdownLoader(BaseLoader):
         )
 
     def _read_text(self, path: Path) -> str:
-        """Convert via MarkItDown, falling back to a direct read.
+        """Read Markdown without passing it through a document converter.
 
         Args:
             path: Path to the document.
@@ -117,19 +101,9 @@ class MarkdownLoader(BaseLoader):
             The document's Markdown text.
 
         Raises:
-            RuntimeError: If both the conversion and the direct read fail.
+            RuntimeError: If the file cannot be read.
         """
-        if self._markitdown is not None:
-            try:
-                result = self._markitdown.convert(str(path))
-                return result.text_content if hasattr(result, 'text_content') else str(result)
-            except Exception as e:
-                logger.warning(
-                    f"MarkItDown failed on {path}, falling back to a direct read: {e}"
-                )
-
         try:
             return path.read_text(encoding='utf-8', errors='replace')
         except Exception as e:
-            logger.error(f"Failed to read {path}: {e}")
             raise RuntimeError(f"Text loading failed: {e}") from e

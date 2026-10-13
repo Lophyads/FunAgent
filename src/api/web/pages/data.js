@@ -1,4 +1,4 @@
-import {el,button,pageHeader,notify,errorBox,showDetail,jsonView} from '../components/ui.js';
+import {el,button,pageHeader,notify,errorBox,showDetail,jsonView,showTrace} from '../components/ui.js';
 export function mount(root,{store,api}) {
   let schema=null,table='sessions',offset=0,sort='',direction='asc',generation=0,disposed=false;
   const tables=el('select',{'aria-label':'选择数据库表'}),column=el('select',{'aria-label':'筛选列'}),op=el('select',{'aria-label':'筛选操作'},...['eq','contains','is_null'].map(value=>el('option',{value,text:value}))),value=el('input',{'aria-label':'筛选值',placeholder:'筛选值'});
@@ -26,6 +26,7 @@ export function mount(root,{store,api}) {
         for(const [key,v] of Object.entries(result.values)){const section=el('section',{class:'row-field'},el('h3',{text:key+(result.truncated.includes(key)?' · 已截断':'')+(result.blobs.includes(key)?' · BLOB 预览':'')}));
           let json;try{json=typeof v==='string'?JSON.parse(v):v;}catch{json=undefined;}
           section.append(json!=null&&typeof json==='object'?jsonView(json):el('pre',{text:v==null?'NULL':String(v)}));body.append(section);}
+        if(data.table==='tasks'&&result.values.task_id)body.append(button('查看任务轨迹',()=>showTrace(result.values.task_id,api)));
         showDetail(`${data.table} · 行详情`,body);
       }catch(e){notify(e.message,true);}};
       tr.addEventListener('click',detail);tr.addEventListener('keydown',e=>{if(e.key==='Enter')detail();});tbody.append(tr);

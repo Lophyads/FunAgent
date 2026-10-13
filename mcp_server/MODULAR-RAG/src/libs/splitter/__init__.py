@@ -15,9 +15,11 @@ try:
     from src.libs.splitter.recursive_splitter import RecursiveSplitter
 except ImportError:
     RecursiveSplitter = None  # type: ignore[assignment, misc]
+from src.libs.splitter.paragraph_splitter import ParagraphSplitter
 
 __all__ = [
     "BaseSplitter",
     "SplitterFactory",
     "RecursiveSplitter",
+    "ParagraphSplitter",
 ]

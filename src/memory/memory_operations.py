@@ -1,5 +1,6 @@
 """Management uses frozen permissions and one-use challenges, never tool grants."""
 from dataclasses import replace
+from functools import wraps
 from threading import RLock
 from uuid import uuid4
 import hashlib
@@ -13,6 +14,15 @@ from .common import text, validate_content, validate_metadata
 from .contracts import MemoryListQuery, UNSET
 from .policy import Outcome
 from .prompt import RecordData
+from ..observability.observation_mgr import ObservationMgr
+
+
+def _management(method):
+    @wraps(method)
+    def call(*args, **kwargs):
+        with ObservationMgr.GetInstance().Suspend():
+            return method(*args, **kwargs)
+    return call
 
 
 def ManagementRecord(record):
@@ -54,16 +64,19 @@ class MemoryOperations:
         return self._sources[name].get("write_access" if write else "read_access",
                                       f"memory.{name}.{'write' if write else 'read'}")
 
+    @_management
     def Search(self, query):
         result = self._memory.Search(query, self._context())
         return {"records": [ManagementRecord(record) for record in result.records],
                 "source_status": dict(result.source_status), "warnings": list(result.warnings)}
 
+    @_management
     def List(self, query):
         page = self._memory.List(query, self._context())
         return {"records": [ManagementRecord(record) for record in page.items], "next_cursor": page.next_cursor,
                 "source_status": {query.source_id: "ok"}}
 
+    @_management
     def Write(self, draft, request_key=None):
         if request_key is not None and (not isinstance(request_key, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', request_key)):
             raise DomainError('INVALID_REQUEST', 'Invalid memory request key')
@@ -72,6 +85,7 @@ class MemoryOperations:
         draft = replace(draft, write_key="management:" + context.run_id, evidence=context.memory_evidence)
         return ManagementRecord(self._memory.Write(draft, context))
 
+    @_management
     def Request(self, action, ref, expected_version, patch=None):
         context = self._context()
         if not isinstance(action, str) or action not in {"replace", "remove"} or not text(expected_version) or len(expected_version) > 128:
@@ -128,6 +142,7 @@ class MemoryOperations:
             self._pending[identifier] = (now + self._timeout, digest, action, ref, expected_version, patch)
         return challenge
 
+    @_management
     def Confirm(self, challenge_id, arguments_digest, approve):
         if not isinstance(challenge_id, str) or not isinstance(arguments_digest, str) or type(approve) is not bool:
             raise DomainError("INVALID_REQUEST", "Invalid management confirmation")

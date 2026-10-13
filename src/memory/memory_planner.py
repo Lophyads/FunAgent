@@ -5,15 +5,27 @@ from ..frame.contracts import DomainError, Message, RunInput
 from ..model.model_runtime import ModelRuntime
 from .contracts import RetrievalPlan
 from .memory_retrieval_strategy import MemoryRetrievalStrategy
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import Plan
 
 
 class MemoryPlanner:
     @staticmethod
     def Plan(request, context, source_descriptions=()):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('memory.plan', run_id=context.run_id, purpose=context.purpose):
+            result = MemoryPlanner._plan(request, context, source_descriptions)
+            mgr.Complete(output=lambda: Plan(result))
+            return result
+
+    @staticmethod
+    def _plan(request, context, source_descriptions):
+        mgr = ObservationMgr.GetInstance()
         policy = ConfMgr.GetInstance().Memory().Policy("recall")
         data = {"question": request.text,
                 "history": LimitedHistory(request.history, policy.get("history_max_chars", 6000)),
                 "sources": source_descriptions}
+        mgr.Update(input=data)
         input = RunInput((Message("user", json.dumps(data, ensure_ascii=False)),),
                          'Return only a JSON object with boolean need_memory and need_knowledge, '
                          'string memory_query and knowledge_query, and variant (string or null). '

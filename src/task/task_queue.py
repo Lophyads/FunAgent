@@ -10,6 +10,8 @@ from ..persistence.protocols import TaskStore
 from ..frame.interaction_mgr import InteractionMgr
 from .protocols import TaskExecutor
 from ..frame.event_mgr import Emit
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import TaskOutput
 
 
 class TaskQueue:
@@ -43,25 +45,38 @@ class TaskQueue:
         self._condition.notify_all()
 
     def Submit(self, request):
+        started_at = time.time()
+        mgr = ObservationMgr.GetInstance()
+        snapshot = mgr.PrepareInput(lambda: dict(text=request.text, request_key=request.request_key,
+                                                session_id=request.session_id))
         with self._condition:
             if request.request_key is not None:
                 existing = self._store.FindTurn(request)
                 if existing is not None:
+                    mgr.Diagnose('admission_deduplicated')
                     return existing.task_id
             if not self._accepting:
                 raise DomainError("STOPPING", "Task admission stopped")
             if len(self._contexts) >= self._capacity:
                 raise DomainError("CAPACITY", "Task capacity reached")
             task = self._store.RegisterTurn(request)
+            mgr.StartTask(task.task_id, session_id=request.session_id, input=snapshot, started_at=started_at,
+                          metadata={'instrumentation_stage': 2, 'coverage': 'main_pipeline'})
+            with mgr.UseTask(task.task_id):
+                with mgr.Scope('task.admission', started_at=started_at, metadata={'capacity': self._capacity}):
+                    mgr.Complete(status='accepted')
+                mgr.Start('task.queue_wait', binding=('queue_wait', task.task_id))
             try:
                 self._contexts[task.task_id] = RunContext(run_id=uuid4().hex, task_id=task.task_id, session_id=request.session_id)
+                with mgr.UseTask(task.task_id):
+                    mgr.Update(run_id=self._contexts[task.task_id].run_id, purpose='main')
                 Emit(self._contexts[task.task_id], 'task_queued', {'text': request.text, 'request_key': request.request_key})
                 self._publish(task.task_id)
             except Exception:
                 if task.task_id in self._queue:
                     self._queue.remove(task.task_id)
                 try:
-                    self._store.FinishTurn(task.task_id, RunResult("failed", reason="SUBMIT_FAILED", error_code="SUBMIT_FAILED"))
+                    actual = self._store.FinishTurn(task.task_id, RunResult("failed", reason="SUBMIT_FAILED", error_code="SUBMIT_FAILED"))
                 except Exception:
                     # Persistence unavailable: retain the slot and stop admission.
                     # The unpublished row is never run and startup will repair it.
@@ -69,6 +84,10 @@ class TaskQueue:
                     self._condition.notify_all()
                 else:
                     self._contexts.pop(task.task_id, None)
+                    with mgr.UseTask(task.task_id):
+                        with mgr.UseBinding(('queue_wait', task.task_id)):
+                            mgr.Complete(status='failed')
+                        mgr.EndTask(status=actual.status, output=lambda: TaskOutput(actual))
                 raise DomainError("SUBMIT_FAILED", "Task could not be published") from None
             return task.task_id
 
@@ -92,9 +111,16 @@ class TaskQueue:
                 return CancelResult(task_id, task.status, False)
             context.cancel.set()
             Emit(context, 'cancel_requested')
+            mgr = ObservationMgr.GetInstance()
+            with mgr.UseTask(task_id):
+                mgr.Event('task.cancel_requested')
             InteractionMgr.CancelTask(task_id)
             if self._running != task_id:
                 task = self._store.FinishTurn(task_id, RunResult("cancelled", reason="CANCELLED"))
+                with mgr.UseTask(task_id):
+                    with mgr.UseBinding(('queue_wait', task_id)):
+                        mgr.Complete(status='cancelled')
+                    mgr.EndTask(status=task.status, output=lambda: TaskOutput(task))
                 Emit(context, 'task_committed', {'status': task.status})
                 if task_id in self._queue:
                     self._queue.remove(task_id)
@@ -113,28 +139,35 @@ class TaskQueue:
                 context = replace(context, deadline=time.monotonic() + timeout)
                 self._running = task_id
             committed = False
-            try:
-                self._executor.Run(task_id, context)
-                committed = True
-            except Exception:
+            mgr = ObservationMgr.GetInstance()
+            with mgr.UseTask(task_id):
                 try:
-                    actual = self.Get(task_id)
-                    if actual.status in {"queued", "running"}:
-                        self._store.FinishTurn(task_id, RunResult("failed", reason="STORAGE", error_code="STORAGE"))
+                    with mgr.UseBinding(('queue_wait', task_id)):
+                        mgr.Complete(status='dequeued')
+                    self._executor.Run(task_id, context)
                     committed = True
                 except Exception:
-                    # Do not invent a terminal state or free unresolved capacity.
+                    try:
+                        actual = self.Get(task_id)
+                        if actual.status in {"queued", "running"}:
+                            actual = self._store.FinishTurn(task_id, RunResult("failed", reason="STORAGE", error_code="STORAGE"))
+                        mgr.EndTask(status=actual.status, output=lambda: TaskOutput(actual))
+                        committed = True
+                    except Exception:
+                        mgr.Event('task.terminal_unconfirmed')
+                        mgr.Diagnose('terminal_unconfirmed', task_id)
+                        # Do not invent a terminal state or free unresolved capacity.
+                        with self._condition:
+                            self._accepting = False
+                            for pending in self._contexts.values():
+                                pending.cancel.set()
+                finally:
+                    InteractionMgr.CancelTask(task_id)
                     with self._condition:
-                        self._accepting = False
-                        for pending in self._contexts.values():
-                            pending.cancel.set()
-            finally:
-                InteractionMgr.CancelTask(task_id)
-                with self._condition:
-                    if committed:
-                        self._contexts.pop(task_id, None)
-                    self._running = None
-                    self._condition.notify_all()
+                        if committed:
+                            self._contexts.pop(task_id, None)
+                        self._running = None
+                        self._condition.notify_all()
 
     def RequestStop(self):
         """Stop admission and wake cancellation without waiting on borrowed IO."""

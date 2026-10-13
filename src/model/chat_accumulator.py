@@ -70,3 +70,10 @@ class ChatAccumulator:
         return self.adapter.Decode(ProviderResponse({'choices': [{'message': {
             'role': 'assistant', 'content': ''.join(self.text), 'tool_calls': list(self.calls.values())},
             'finish_reason': self.finish}], 'usage': self.usage}))
+
+    def Snapshot(self):
+        """Bounded partial wire content, without Finish/Decode or state changes."""
+        return {'content': ''.join(self.text), 'tool_calls': [
+            {'index': index, 'id': call['id'], 'type': call['type'], 'function': dict(call['function'])}
+            for index, call in sorted(self.calls.items())], 'finish_reason': self.finish,
+            'partial': self.finish is None}

@@ -26,25 +26,14 @@ export function mount(root, {store, api, commands}) {
     const state=store.get(), history=state.server.messagesBySession[sid], rows=history?.messages || [];
     historyButton.hidden = !history?.has_more;
     const turns=Object.values(state.server.turns).filter(t=>t.session_id===sid).sort((a,b)=>a.created_at-b.created_at);
-    const items = rows.map(m => ({key:`db:${m.id}`, role:m.role, text:m.content || m.api_content || '',
-      tool_calls:m.tool_calls, tool_name:m.tool_name, status:m.tool_outcome_state, turn_id:m.metadata?.turn_id, id:m.id}));
+    // Durable assistants without tool calls are final replies committed by FinishTurn.
+    const items = rows.filter(m=>m.role==='user'||(m.role==='assistant'&&!m.tool_calls?.length))
+      .map(m=>({key:`db:${m.id}`,role:m.role,text:m.content || m.api_content || '',turn_id:m.metadata?.turn_id,id:m.id}));
     for (const t of turns) {
       const own=items.filter(m=>m.turn_id===t.turn_id);
       if (t.input&&!own.some(m=>m.role==='user')) items.push({key:`input:${t.turn_id}`,role:'user',text:t.input,status:'提交', turn_id:t.turn_id});
-      for (const attempt of Object.values(t.attempts || {})) {
-        if (!attempt.text) continue;
-        if (attempt.status==='discarded'||(terminal(t.status)&&t.status!=='completed'))continue;
-        if (attempt.status === 'accepted' && own.some(m=>m.role==='assistant'&&m.text===attempt.text)) continue;
-        if (terminal(t.status) && attempt.status === 'accepted' && own.some(m=>m.role==='assistant'&&!m.tool_calls?.length)) continue;
-        items.push({key:`attempt:${t.turn_id}:${attempt.attempt_id}`, role:'assistant', text:attempt.text, stream:!terminal(t.status)&&['started','delta'].includes(attempt.status),
-          status:attempt.status==='discarded'?'未采用 · 失败尝试':`${attempt.route||'模型'} · 第 ${attempt.iteration} 次迭代${attempt.truncated?' · 正文预览已截断':''}`, turn_id:t.turn_id});
-      }
-      const recordedCalls=new Set(own.flatMap(m=>m.tool_calls?.map(c=>c.id)||[]));
-      for(const tool of Object.values(t.tools||{}))if(!recordedCalls.has(tool.tool_call_id))
-        items.push({key:`tool:${t.turn_id}:${tool.tool_call_id}`,role:'tool',tool_name:tool.tool_name||'TOOL',text:`调用 ${tool.tool_call_id} · ${statusText(tool.status)}`,status:'运行快照',turn_id:t.turn_id});
-      if (t.result?.error) items.push({key:`error:${t.turn_id}`,turn_id:t.turn_id,role:'system',text:`${statusText(t.status)}：${t.result.error.code || 'execution_failed'}`});
     }
-    // Group optimistic/streaming nodes with their durable turn while preserving old history order.
+    // Group pending user input with its durable turn while preserving history order.
     const groups=new Map(), order=[];
     for(const item of items) {
       const key=item.turn_id||item.key;
@@ -59,7 +48,7 @@ export function mount(root, {store, api, commands}) {
     const oldHeight=messages.scrollHeight, oldTop=messages.scrollTop;
     const keys=new Set();
     if(!items.length) {
-      let empty=messages.querySelector('.chat-empty'); if(!empty) messages.append(el('div',{class:'chat-empty'},el('div',{class:'orbit',text:'F'}),el('h3',{text:'开启一次对话'}),el('p',{text:'执行过程与模型输出将实时显示。'})));
+      let empty=messages.querySelector('.chat-empty'); if(!empty) messages.append(el('div',{class:'chat-empty'},el('div',{class:'orbit',text:'F'}),el('h3',{text:'开启一次对话'}),el('p',{text:'在这里查看你的问题与最终回复。'})));
     } else messages.querySelector('.chat-empty')?.remove();
     let predecessor=null;
     for(const item of items) {
@@ -68,12 +57,10 @@ export function mount(root, {store, api, commands}) {
       const signature=JSON.stringify(item);
       if(node.signature!==signature) {
         node.signature=signature;
-        const title=item.tool_name || ({user:'YOU', assistant:'FUNAGENT',tool:'TOOL',system:'STATUS'}[item.role]);
+        const title={user:'YOU',assistant:'FUNAGENT'}[item.role];
         node.firstChild.replaceChildren(el('span',{text:title}),el('small',{text:item.status||''}),button('复制',()=>navigator.clipboard.writeText(item.text).then(()=>notify('已复制')).catch(()=>notify('复制失败',true))));
         const body=node.lastChild;
-        if(item.stream) {body.textContent=item.text;body.classList.add('streaming');}
-        else {body.classList.remove('streaming');body.innerHTML=markdown(item.text);}
-        if(item.tool_calls?.length) for(const call of item.tool_calls) body.append(el('details',{class:'tool-card'},el('summary',{text:`⚒ ${call.name || call.function?.name || 'tool'} · ${call.id}`}),el('pre',{text:call.arguments || call.function?.arguments || ''})));
+        body.innerHTML=markdown(item.text);
       }
       if(node.parentNode!==messages || node.previousSibling!==predecessor) messages.insertBefore(node,predecessor?predecessor.nextSibling:messages.firstChild);
       predecessor=node;

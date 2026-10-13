@@ -160,6 +160,17 @@ class CLIController:
             return CLIController._memory(line, output)
         if line.strip().split(maxsplit=1)[:1] == ["logs"]:
             return CLIController._logs(line, output)
+        trace_parts = line.strip().split()
+        if trace_parts and trace_parts[0] in {'trace', 'traces'}:
+            from .trace_routes import Reader
+            from .trace_cli import Show
+            if trace_parts[0] == 'traces' and len(trace_parts) in {1, 2}:
+                print(json.dumps(Reader().List(session_id=trace_parts[1] if len(trace_parts) == 2 else None), ensure_ascii=False), file=output)
+            elif trace_parts[0] == 'trace' and len(trace_parts) in {2, 3} and (len(trace_parts) == 2 or trace_parts[2] in {'json', 'markdown', 'path'}):
+                Show(Reader(), trace_parts[1], trace_parts[2] if len(trace_parts) == 3 else 'view', output)
+            else:
+                raise DomainError('INVALID_REQUEST', 'Use trace <task_id> [json|markdown|path] or traces [session_id]')
+            return
         answer_parts = line.strip().split(maxsplit=3)
         if answer_parts and answer_parts[0] == "answer":
             if len(answer_parts) != 4:
@@ -185,7 +196,7 @@ class CLIController:
         elif command in diagnostic_service.KINDS and len(parts) == 1:
             print(json.dumps(diagnostic_service.Read(command), ensure_ascii=False), file=output)
         elif command == "help" and len(parts) == 1:
-            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
+            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | trace <task_id> [json|markdown|path] | traces [session_id] | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
         elif command == "new":
             title = line.strip().partition(" ")[2].strip() or "New session"
             workspace = ConfMgr.GetInstance().Serv().Options()["workspace"]

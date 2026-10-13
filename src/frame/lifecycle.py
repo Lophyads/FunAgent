@@ -34,7 +34,9 @@ class Lifecycle:
             if bound is resource:
                 manager.Close()
             else:
-                closer = getattr(resource, "Stop" if worker else "Close", None)
+                closer = getattr(resource, "Stop" if worker else "CloseResource", None)
+                if closer is None and not worker:
+                    closer = getattr(resource, "Close", None)
                 if closer is not None:
                     closer()
         self._owned[id(resource)] = _Owned(resource, close, worker)

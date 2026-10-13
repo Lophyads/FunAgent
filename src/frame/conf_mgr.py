@@ -8,6 +8,7 @@ from types import MappingProxyType
 import tomllib
 
 from .contracts import DomainError, freeze
+from ..observability.contracts import DEFAULTS as OBSERVABILITY_DEFAULTS
 from ..tool.contracts import ToolSelectionRequest
 
 
@@ -56,6 +57,9 @@ class MemoryConf(ABC):
 class LogConf(ABC):
     @abstractmethod
     def Options(self) -> Mapping: ...
+
+    def Observability(self) -> Mapping:
+        return freeze(OBSERVABILITY_DEFAULTS)
 
 
 class ServConf(ABC):
@@ -141,7 +145,12 @@ class _TomlOptionsConf:
 
 
 class _TomlLogConf(_TomlOptionsConf, LogConf):
-    pass
+    def __init__(self, data):
+        super().__init__(data)
+        self._observability = freeze(dict(OBSERVABILITY_DEFAULTS, **data.get('observability', {})))
+
+    def Observability(self):
+        return self._observability
 
 
 class _TomlServConf(_TomlOptionsConf, ServConf):
@@ -185,7 +194,7 @@ def _validate(docs):
         ("model", {"adapters", "providers", "profiles"}),
         ("tool", {"tools", "toolsets", "backends", "purposes", "session_access"}),
         ("memory", {"sources", "policies"}),
-        ("log", {"options"}), ("serv", {"options"}),
+        ("log", {"options", "observability"}), ("serv", {"options"}),
     ):
         _require(set(docs[key]) <= allowed, key)
     providers = _table(model, "providers", "model.providers", required=True)
@@ -378,6 +387,10 @@ def _validate(docs):
     if any(policies.get(branch, {}).get("enabled", False) and policies.get(branch, {}).get("sources") for branch in ("facts", "knowledge")):
         _require("profile" in policies.get("recall", {}), "memory.policies.recall.profile")
     log_options = _table(log, "options", "log.options", required=True)
+    observation = _table(log, 'observability', 'log.observability')
+    _require(set(observation) <= set(OBSERVABILITY_DEFAULTS), 'log.observability')
+    for key, value in observation.items():
+        _number(value, 'log.observability.' + key, strict=True, integer=key != 'shutdown_timeout')
     _require(log_options["level"] in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, "log.options.level")
     for key in ("max_bytes", "backup_count"):
         if key in log_options:

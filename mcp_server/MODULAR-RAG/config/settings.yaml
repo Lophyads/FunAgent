@@ -11,9 +11,10 @@ llm:
 
 embedding:
   provider: openai
-  model: text-embedding-3-small
-  dimensions: 1536
-  api_key_env: EMBEDDING_API_KEY
+  model: text-embedding-qwen3-embedding-8b
+  dimensions: 4096
+  api_key: LM-Studio
+  base_url: http://127.0.0.1:1234/v1
 
 vector_store:
   provider: chroma
@@ -47,6 +48,8 @@ observability:
 
 ingestion:
   chunk_size: 512
-  chunk_overlap: 64
-  splitter: recursive
+  chunk_overlap: 0
+  splitter: paragraph
   batch_size: 32
+  chunk_refiner:
+    use_llm: false

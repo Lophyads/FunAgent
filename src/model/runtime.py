@@ -15,6 +15,9 @@ from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provide
 from .retry import Backoff, Wait
 from .validation import ValidateReply
 from ..frame.protocols import RunEventWriter, NullEventWriter
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import (Request, Wire, Usage, Reply, RunOutput, Messages, StreamHasOutput,
+                                        ToolCall as CallView, ToolOutput)
 
 
 class Runtime:
@@ -68,6 +71,7 @@ class Runtime:
             raise DomainError("CLOSE_FAILED", "Provider close failed") from None
 
     def _send(self, request, route, active, rule, context, counts, seen):
+        mgr = ObservationMgr.GetInstance()
         last = None
         for index in range(active, len(route)):
             profile = self._profiles[route[index]]
@@ -77,12 +81,14 @@ class Runtime:
                 context.CheckCancelled()
                 try:
                     # Re-encode every attempt, including profile/adapter changes.
-                    try:
-                        encoded = adapter.Encode(request, profile)
-                    except (ModelError, ControlError):
-                        raise
-                    except Exception:
-                        raise ModelError("PROTOCOL") from None
+                    with mgr.Scope('model.encode', input=lambda: Request(request), profile_id=profile.profile_id):
+                        try:
+                            encoded = adapter.Encode(request, profile)
+                        except (ModelError, ControlError):
+                            raise
+                        except Exception:
+                            raise ModelError('PROTOCOL') from None
+                        mgr.Complete(output=lambda: Wire(encoded.payload))
                     deadline = time.monotonic() + profile.timeout
                     if context.deadline is not None:
                         deadline = min(deadline, context.deadline)
@@ -90,39 +96,73 @@ class Runtime:
                     attempt_context.CheckCancelled()
                     counts["attempts"] += 1
                     self._emit(context, counts, 'attempt_started', {'profile_id': profile.profile_id})
-                    try:
-                        provider = self._providers[profile.provider_id]
-                        if profile.streaming:
-                            if not callable(getattr(provider, "Stream", None)) or not callable(getattr(adapter, "NewStream", None)):
-                                raise DomainError("UNSUPPORTED", "Selected model does not support streaming")
+                    provider = self._providers[profile.provider_id]
+                    if profile.streaming:
+                        if not callable(getattr(provider, 'Stream', None)) or not callable(getattr(adapter, 'NewStream', None)):
+                            raise DomainError('UNSUPPORTED', 'Selected model does not support streaming')
+                        try:
                             accumulator = adapter.NewStream()
-                            with provider.Stream(encoded, attempt_context) as packets:
-                                for packet in packets:
-                                    attempt_context.CheckCancelled()
-                                    text = accumulator.Add(packet)
-                                    if text:
-                                        self._emit(context, counts, 'text_delta', {'text': text})
-                            reply = accumulator.Finish()
-                        else:
-                            response = provider.Send(encoded, attempt_context)
-                    except (DomainError, ControlError):
-                        raise
-                    except Exception:
-                        raise ModelError("PROVIDER_FATAL") from None
-                    context.CheckCancelled()
-                    attempt_context.CheckCancelled()
-                    try:
-                        if not profile.streaming:
-                            reply = adapter.Decode(response)
-                        reply = ValidateReply(reply, seen, request.tools)
-                    except (ModelError, ControlError):
-                        raise
-                    except Exception:
-                        raise ModelError("PROTOCOL") from None
-                    context.CheckCancelled()
-                    attempt_context.CheckCancelled()
-                    self._emit(context, counts, 'attempt_accepted', {'text': reply.content or '', 'profile_id': profile.profile_id})
-                    return reply, index
+                        except (DomainError, ControlError):
+                            raise
+                        except Exception:
+                            raise ModelError('PROVIDER_FATAL') from None
+                    with mgr.Scope('model.attempt', kind='generation', input=lambda: Wire(encoded.payload),
+                                   usage_status='unknown', accepted=False, profile_id=profile.profile_id,
+                                   provider_id=profile.provider_id, model=profile.model, streaming=profile.streaming,
+                                   attempt_id=counts['attempts']):
+                        try:
+                            if profile.streaming:
+                                first_output = None
+                                received_usage = None
+                                unprocessed = None
+                                try:
+                                    with provider.Stream(encoded, attempt_context) as packets:
+                                        for packet in packets:
+                                            # Capture receipt before the next control/protocol check.
+                                            unprocessed = packet.payload
+                                            if isinstance(packet.payload, Mapping) and packet.payload.get('usage') is not None:
+                                                received_usage = packet.payload['usage']
+                                            if first_output is None and StreamHasOutput(packet.payload):
+                                                first_output = time.time()
+                                            attempt_context.CheckCancelled()
+                                            text = accumulator.Add(packet)
+                                            unprocessed = None
+                                            if text:
+                                                self._emit(context, counts, 'text_delta', {'text': text})
+                                    reply = accumulator.Finish()
+                                finally:
+                                    snapshot = getattr(accumulator, 'Snapshot', None)
+                                    def partial():
+                                        value = snapshot() if callable(snapshot) else {'snapshot_unavailable': True}
+                                        if unprocessed is not None:
+                                            value = dict(value, received_unprocessed=Wire(unprocessed))
+                                        return value
+                                    mgr.Update(output=partial, usage=lambda: received_usage or {},
+                                               **({'first_output_at': first_output} if first_output is not None else {}))
+                            else:
+                                response = provider.Send(encoded, attempt_context)
+                                mgr.Update(output=lambda: Wire(response.payload), usage=lambda: Usage(response.payload),
+                                           response_received=True)
+                        except (DomainError, ControlError):
+                            raise
+                        except Exception:
+                            raise ModelError("PROVIDER_FATAL") from None
+                        context.CheckCancelled()
+                        attempt_context.CheckCancelled()
+                        try:
+                            if not profile.streaming:
+                                reply = adapter.Decode(response)
+                            reply = ValidateReply(reply, seen, request.tools)
+                        except (ModelError, ControlError):
+                            raise
+                        except Exception:
+                            raise ModelError("PROTOCOL") from None
+                        context.CheckCancelled()
+                        attempt_context.CheckCancelled()
+                        mgr.Complete(status='accepted', accepted=True, decoded_reply=lambda: Reply(reply),
+                                     usage=lambda: reply.usage)
+                        self._emit(context, counts, 'attempt_accepted', {'text': reply.content or '', 'profile_id': profile.profile_id})
+                        return reply, index
                 except ControlError:
                     self._emit(context, counts, 'attempt_reset', {'error_code': 'TIMEOUT'})
                     context.CheckCancelled()
@@ -134,10 +174,18 @@ class Runtime:
                 if last.code in {"PROTOCOL", "TRUNCATED", "PROVIDER_FATAL", "INVALID_REQUEST"}:
                     raise last
                 if last.code in rule.retry_codes and retry < profile.max_retries:
-                    if not Wait(Backoff(retry, last.retry_after), context):
-                        raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
+                    delay = Backoff(retry, last.retry_after)
+                    with mgr.Scope('model.retry_wait', input={'seconds': delay, 'error_code': last.code}):
+                        if not Wait(delay, context):
+                            mgr.Complete(status='exhausted')
+                            raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
                     continue
                 if last.code in rule.fallback_codes:
+                    if index + 1 < len(route):
+                        mgr.Event('model.fallback', from_profile=profile.profile_id,
+                                  to_profile=route[index + 1], error_code=last.code)
+                    else:
+                        mgr.Event('model.route_exhausted', from_profile=profile.profile_id, error_code=last.code)
                     break
                 if last.code in rule.retry_codes:
                     raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
@@ -145,6 +193,18 @@ class Runtime:
         raise ModelError("PROFILES_EXHAUSTED", cause_code=last.code)
 
     def Run(self, input: RunInput, strategy: type[ModelStrategy], context: RunContext) -> RunResult:
+        mgr = ObservationMgr.GetInstance()
+        # Also protect callers that invoke the shared Runtime directly.
+        with mgr.Suspend() if context.purpose in {'review', 'management'} else mgr.Scope(
+                'agent.run', kind='agent', run_id=context.run_id, purpose=context.purpose,
+                input=lambda: dict(messages=Messages(input.messages),
+                                   system_prompt=input.system_prompt)):
+            result = self._run(input, strategy, context)
+            mgr.Complete(status=result.status, output=lambda: RunOutput(result), error_code=result.error_code)
+            return result
+
+    def _run(self, input, strategy, context):
+        mgr = ObservationMgr.GetInstance()
         scope = context.record_scope
         persistent = isinstance(scope, RecordScope) and scope.kind == "main_history"
         if persistent:
@@ -165,6 +225,7 @@ class Runtime:
         if not set(rule.profile_ids) <= set(self._profiles[primary].fallback_profiles):
             raise DomainError("CONFIG_REFERENCE", "Fallback profile not configured")
         route = (primary, *rule.profile_ids)
+        mgr.Update(route=route, max_iterations=maximum, strategy=strategy.__name__)
         dispatch = self._tool_dispatch
         from ..tool.contracts import ToolSelectionRequest
         messages = list(input.messages)
@@ -187,34 +248,43 @@ class Runtime:
                                         else ToolSelectionRequest(enable=allowed), context)
             definitions = selection.definitions
             for _ in range(maximum):
-                context.CheckCancelled()
-                reply, active = self._send(ModelRequest(tuple(messages), definitions), route, active, rule, context, counts, seen)
-                counts["iterations"] += 1
-                for key, value in reply.usage.items():
-                    usage[key] = usage.get(key, 0) + value
-                if not reply.calls:
-                    return finish("completed", final=reply.content)
-                safe_calls = tuple(replace(call, args={}) if call.argument_error else call for call in reply.calls)
-                message = Message("assistant", reply.content or "", safe_calls)
-                if persistent:
-                    self._journal.AppendToolCalls(scope, message)
-                messages.append(message)
-                seen.update(call.call_id for call in reply.calls)
-                pending = reply.calls
-                for call in reply.calls:
+                with mgr.Scope('agent.iteration', iteration=counts['iterations'] + 1):
                     context.CheckCancelled()
-                    self._emit(context, counts, 'tool_started', {'call_id': call.call_id, 'tool_name': call.name},
-                               iteration=counts['iterations'])
-                    result = dispatch.Execute(call, selection, context)
-                    results.append(result)
-                    pending = pending[1:]
+                    reply, active = self._send(ModelRequest(tuple(messages), definitions), route, active, rule, context, counts, seen)
+                    counts["iterations"] += 1
+                    for key, value in reply.usage.items():
+                        usage[key] = usage.get(key, 0) + value
+                    if not reply.calls:
+                        return finish("completed", final=reply.content)
+                    safe_calls = tuple(replace(call, args={}) if call.argument_error else call for call in reply.calls)
+                    message = Message("assistant", reply.content or "", safe_calls)
                     if persistent:
-                        self._journal.AppendToolResult(scope, result)
-                    messages.append(Message("tool", result.content, call_id=result.call_id,
-                                            status=result.status, effect=result.effect))
-                    self._emit(context, counts, 'tool_finished', {'call_id': result.call_id,
-                        'status': result.status, 'effect': result.effect}, iteration=counts['iterations'])
-                    context.CheckCancelled()
+                        with mgr.Scope('journal.tool_calls', input=lambda: Wire(ModelRequest((message,)))):
+                            self._journal.AppendToolCalls(scope, message)
+                            mgr.Complete(output={'recorded': True})
+                    messages.append(message)
+                    seen.update(call.call_id for call in reply.calls)
+                    pending = reply.calls
+                    for call in reply.calls:
+                        context.CheckCancelled()
+                        self._emit(context, counts, 'tool_started', {'call_id': call.call_id, 'tool_name': call.name},
+                                   iteration=counts['iterations'])
+                        with mgr.Scope('tool.call', kind='tool', call_id=call.call_id, input=lambda: CallView(call)):
+                            result = dispatch.Execute(call, selection, context)
+                            results.append(result)
+                            pending = pending[1:]
+                            mgr.Update(output=lambda: ToolOutput(result), tool_status=result.status, effect=result.effect,
+                                       result_recorded=False)
+                            if persistent:
+                                with mgr.Scope('journal.tool_result', input=lambda: ToolOutput(result)):
+                                    self._journal.AppendToolResult(scope, result)
+                                    mgr.Complete(output={'recorded': True})
+                            messages.append(Message("tool", result.content, call_id=result.call_id,
+                                                    status=result.status, effect=result.effect))
+                            mgr.Complete(status=result.status, effect=result.effect, result_recorded=persistent)
+                        self._emit(context, counts, 'tool_finished', {'call_id': result.call_id,
+                            'status': result.status, 'effect': result.effect}, iteration=counts['iterations'])
+                        context.CheckCancelled()
             context.CheckCancelled()
             return finish("limit", reason="MAX_ITERATIONS")
         except ControlError as error:

@@ -1,6 +1,8 @@
 """Chat Completions wire adapter and one SDK attempt, with implicit retry disabled."""
 import json
 import os
+import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from threading import Condition, Event, Thread, Lock
 
@@ -8,6 +10,8 @@ from ..frame.contracts import ControlError, DomainError, ModelReply, ToolCall, t
 from .protocols import Adapter, ModelError, ProviderRequest, ProviderResponse
 from .retry import RetryAfter
 from .validation import ValidateReply
+from ..observability.observation_mgr import ObservationMgr
+from ..observability.projections import Usage, StreamHasOutput
 
 
 def _unique_object(pairs):
@@ -185,9 +189,21 @@ class OpenAIProvider:
                 watcher = Thread(target=watch, name="funagent-stream-control")
                 watcher.start()
                 def packets():
+                    first_output = False
+                    mgr = ObservationMgr.GetInstance()
                     for packet in stream:
-                        context.CheckCancelled()
-                        yield ProviderResponse(packet.model_dump(warnings=False))
+                        received = packet.model_dump(warnings=False)
+                        if isinstance(received, Mapping) and received.get('usage') is not None:
+                            mgr.Update(usage=lambda: Usage(received))
+                        if not first_output and StreamHasOutput(received):
+                            first_output = True
+                            mgr.Update(first_output_at=time.time())
+                        try:
+                            context.CheckCancelled()
+                        except ControlError:
+                            mgr.Update(output=lambda: {'received_unprocessed': received})
+                            raise
+                        yield ProviderResponse(received)
                     context.CheckCancelled()
                 yield packets()
             finally:
@@ -213,6 +229,9 @@ class OpenAIProvider:
             client = self._client.with_options(timeout=min(30, context.Remaining()))
             context.CheckCancelled()
             response = client.chat.completions.create(**request.payload)
+            mgr = ObservationMgr.GetInstance()
+            mgr.Update(output=lambda: response.model_dump(warnings=False),
+                       usage=lambda: Usage(response.model_dump(warnings=False)), response_received=True)
             context.CheckCancelled()
             # Malformed SDK objects are validated by the adapter. Serializer
             # warnings can contain raw provider payloads, so do not emit them.

@@ -44,6 +44,16 @@ export function pageHeader(root, title, description, ...actions) {
 export function errorBox(text, retry) {return el('div', {class: 'empty error'}, el('p', {text}), retry && button('重试', retry));}
 export const statusText = s => ({queued:'排队', running:'运行中', waiting:'等待答复', cancelling:'取消请求中', completed:'完成', failed:'失败', cancelled:'已取消', interrupted:'中断'}[s] || s);
 
+export function showTrace(taskId) {
+  const dialog=document.querySelector('#detail');if(dialog?.open)dialog.close();
+  location.hash='#observability?'+new URLSearchParams({task:taskId});
+}
+
+export function showTraces(sessionId) {
+  if(!sessionId){notify('请先选择会话。');return;}
+  location.hash='#observability?'+new URLSearchParams({session:sessionId,offset:0});
+}
+
 export function confirmAction(title,text){return new Promise(resolve=>{const dialog=document.querySelector('#detail');let approved=false;
   showDetail(title,el('div',{},el('pre',{text}),el('div',{class:'actions'},button('放弃操作',()=>dialog.close()),button('确认操作',()=>{approved=true;dialog.close();},'primary'))));
   dialog.addEventListener('close',()=>resolve(approved),{once:true});

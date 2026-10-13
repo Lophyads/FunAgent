@@ -16,7 +16,7 @@ from ..frame.interaction_mgr import InteractionMgr
 from ..frame.clarification import QuestionData
 from ..frame.event_mgr import EventMgr
 from .request_validation import Fields as _fields, Text as _text
-from . import memory_routes, diagnostic_service, data_routes
+from . import memory_routes, diagnostic_service, data_routes, trace_routes
 from ..frame.web_projection import TaskView
 
 
@@ -102,6 +102,8 @@ class HTTPController:
             return memory_routes.Handle(method, route, query, body)
         if route.startswith("/data/"):
             return data_routes.Handle(method, route, query)
+        if route in {'/traces', '/trace-sessions'} or re.fullmatch(r'/tasks/[^/]+/trace(?:/[^/]+)?', route):
+            return trace_routes.Handle(method, route, query)
         if route == "/sessions":
             if method == "POST":
                 _fields(body, {"title"})
@@ -174,9 +176,10 @@ def _json_object(pairs):
     return result
 
 
-ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "favicon.svg",
+ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "favicon.svg",
                "components/chat.js", "components/ui.js", "pages/catalog.js", "pages/data.js", "pages/memory.js",
-               "pages/overview.js", "pages/overview-model.js")
+               "pages/overview.js", "pages/overview-model.js", "pages/observability.js",
+               "pages/observability-model.js", "components/trace-detail.js")
 ASSETS = {"/" + name: (name, {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
                               ".svg": "image/svg+xml"}[Path(name).suffix] + "; charset=utf-8") for name in ASSET_NAMES}
 ASSETS["/"] = ASSETS["/index.html"]
@@ -251,7 +254,10 @@ class _Handler(BaseHTTPRequestHandler):
                 except (ValueError, UnicodeError):
                     raise DomainError("INVALID_REQUEST", "Invalid JSON") from None
             status, payload = HTTPController.Handle(self.command, self.path, body)
-            self._send(status, payload)
+            if isinstance(payload, trace_routes.TraceDownload):
+                self._send(status, payload.data, payload.content_type)
+            else:
+                self._send(status, payload)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self.close_connection = True
         except Exception as error:
