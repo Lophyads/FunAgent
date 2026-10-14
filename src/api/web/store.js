@@ -15,6 +15,16 @@ export function createStore() {
     return () => subscriptions.delete(sub);
   }, server(key, value) {update(s => ({...s, server: {...s.server, [key]: value}}));},
   ui(key, value) {update(s => ({...s, ui: {...s.ui, [key]: value}}));},
+  migrateMemoryDrafts(sourceId) {
+    if(!sourceId)return;
+    const memory={...state.drafts.memoryByTarget};let changed=false;
+    for(const kind of ['user','note','episode','knowledge']){
+      if(!memory[kind])continue;
+      const key=JSON.stringify([sourceId,kind]);memory[key]??={...memory[kind],type:{user:'profile',note:'note',episode:'episode',knowledge:'knowledge'}[kind]};delete memory[kind];changed=true;
+    }
+    if(changed){update(s=>({...s,drafts:{...s.drafts,memoryByTarget:memory}}));
+      try{globalThis.localStorage?.setItem('funagent.webDrafts',JSON.stringify({chat:state.drafts.chatBySession,memory}));}catch{}}
+  },
   draft(group, key, value) {update(s => ({...s, drafts: {...s.drafts, [group]: {...s.drafts[group], [key]: value}}}));
     try{globalThis.localStorage?.setItem('funagent.webDrafts',JSON.stringify({chat:state.drafts.chatBySession,memory:state.drafts.memoryByTarget}));}catch{}
   }};

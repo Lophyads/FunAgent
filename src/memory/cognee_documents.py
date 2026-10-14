@@ -73,7 +73,7 @@ def VisibleText(value):
 
 
 class CogneeDocuments:
-    """Mixin: management is enabled only for a single UUID-scoped dataset."""
+    """Mixin: management resolves one public dataset name to a private UUID."""
 
     def _document_context(self, context, capability):
         context.CheckCancelled()
@@ -117,7 +117,8 @@ class CogneeDocuments:
             updated = _server_time(row.get("updatedAt", row.get("updated_at")))
         except (DomainError, TypeError, KeyError):
             raise DomainError("MEMORY_PROTOCOL", "Invalid FunAgent Cognee document metadata") from None
-        citation = f"cognee://{quote(self.source_id, safe='')}/data/{identifier}?dataset_id={self._document_dataset}"
+        citation = (f"cognee://{quote(self.source_id, safe='')}/data/{identifier}"
+                    f"?dataset={quote(self._document_dataset_name, safe='')}")
         return MemoryRecord(MemoryRef(self.source_id, identifier), self.kind, data["type"], content,
                             citation, sha256(raw).hexdigest(), tuple(data["evidence"]), False,
                             subject, event_at, created, updated, origin)
@@ -136,7 +137,7 @@ class CogneeDocuments:
                 query.type is not None and not text(query.type)):
             raise DomainError("INVALID_REQUEST", "Invalid memory list query")
         validate_filters(query)
-        identity = [self._document_dataset, self.source_id, query.type, query.subject,
+        identity = [self._document_dataset_name, self.source_id, query.type, query.subject,
                     timestamp(query.event_from), timestamp(query.event_to), query.origin]
         after = 0
         if query.cursor is not None:

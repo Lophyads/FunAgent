@@ -51,7 +51,9 @@ class MemoryOperations:
 
     def Sources(self):
         self._context()
-        return [{"source_id": name, "kind": source["kind"], "capabilities": list(source.get("capabilities", ("search",))),
+        return [{"source_id": name, "kind": source["kind"], "store": source.get("store", "unknown"),
+                 "source_description": source.get("source_description", ""),
+                 "capabilities": list(source.get("capabilities", ("search",))),
                  "writable": self._token(name, True) in self._access}
                 for name, source in self._sources.items() if self._token(name) in self._access]
 

@@ -9,9 +9,10 @@ export const eventText = v => ({start_task:'任务开始',start:'开始',update:
 export const formatValue = v => v === undefined ? '未记录' : typeof v === 'string' ? v : JSON.stringify(v,null,2) ?? 'null';
 export function parseJSON(v) {if(typeof v!=='string')return v;try{return JSON.parse(v);}catch{return v;}}
 export const payload = (trace,ref) => ref ? trace?.payloads?.[ref]?.data : undefined;
-const labels = {'conversation.prepare':'会话准备','memory.prepare':'记忆规划','memory.attach':'检索结果附加','memory.plan':'检索规划','memory.branch':'检索分支','memory.search':'记忆来源检索','memory.source.search':'来源查询','memory.query':'查询','memory.fit':'结果筛选','memory.authorization':'访问校验','model.encode':'请求编码','model.attempt':'模型交互','model.retry_wait':'重试等待','journal.tool_calls':'调用记录','tool.call':'工具调用','tool.policy_and_validation':'调用校验','tool.handler':'工具执行','journal.tool_result':'结果记录','agent.run':'执行器','agent.iteration':'模型循环','interaction.wait':'人工等待','turn.finalize':'最终保存','task.queue_wait':'排队等待'};
+const labels = {'conversation.prepare':'会话准备','profile.retrieve':'加载用户画像','memory.prepare':'记忆规划','memory.attach':'检索结果附加','memory.plan':'检索规划','memory.branch':'检索分支','memory.search':'记忆来源检索','memory.source.search':'来源查询','memory.query':'查询','memory.fit':'结果筛选','memory.authorization':'访问校验','model.encode':'请求编码','model.attempt':'模型交互','model.retry_wait':'重试等待','journal.tool_calls':'调用记录','tool.call':'工具调用','tool.policy_and_validation':'调用校验','tool.handler':'工具执行','journal.tool_result':'结果记录','agent.run':'执行器','agent.iteration':'模型循环','interaction.wait':'人工等待','turn.finalize':'最终保存','task.queue_wait':'排队等待'};
 export function traceName(trace,node) {
   const name=labels[node.name]||node.name||'未命名步骤';
+  if(node.name==='memory.search'&&descendants(trace?.root).find(parent=>parent.span_id===node.parent_span_id)?.name==='profile.retrieve')return labels['profile.retrieve'];
   if(node.name==='tool.call'||node.kind==='tool')return `${name} · ${readable(payload(trace,node.input_ref)?.name)||'未命名工具'}`;
   if(node.name==='model.attempt')return `${name} · ${node.model||payload(trace,node.input_ref)?.model||'未记录模型'}`;
   if(node.name==='memory.source.search'&&node.source_id)return `${name} · ${node.source_id}`;

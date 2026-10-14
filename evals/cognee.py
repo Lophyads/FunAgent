@@ -101,8 +101,8 @@ class CogneeBackend:
                 break
         if seen != self._items:
             raise DomainError("EVAL_LINEAGE", "Cognee did not ingest every evaluation item")
-        self.store = CogneeMemoryStore(self.settings | {"dataset_ids": [self.dataset_id]}, "eval",
-                                       transport=self.transport)
+        self.store = CogneeMemoryStore(self.settings | {"datasets": [self.space]}, "eval",
+                                       transport=self.transport, _dataset_id=self.dataset_id)
 
     def Search(self, text, limit, context):
         if self.store is None:

@@ -1,100 +1,184 @@
 import {el,button,pageHeader,notify,errorBox} from '../components/ui.js';
+import {dateLabel} from '../api.js';
+
+const labels={all:'全部',user:'用户事实',note:'长期笔记',episode:'历史事件',knowledge:'知识文档'};
+const recordTypes={user:'profile',note:'note',episode:'episode',knowledge:'knowledge'};
+const drivers={sqlite:'SQLite',supabase:'Supabase',cognee:'Cognee'};
 
 export function mount(root,{store,api}) {
-  let kind='user',generation=0,disposed=false,saving=false;
-  const selector=el('select',{'aria-label':'记忆类型'},
-    el('option',{value:'user',text:'用户事实'}),el('option',{value:'note',text:'长期笔记'}),el('option',{value:'episode',text:'历史事件'}));
-  pageHeader(root,'Memory','管理共享数据库记忆。新会话加载核心事实；已有会话可通过工具查询最新记录。',selector,button('刷新',()=>load()));
+  let sources=[],sourceId='',kind='user',generation=0,disposed=false,saving=false,importing=false,loading=false,loadError=null;
+  const sourceSelector=el('select',{'aria-label':'记忆库'},el('option',{text:'加载记忆库…',value:''}));
+  const selector=el('select',{'aria-label':'记忆类型'});
+  const file=el('input',{type:'file',accept:'.md',hidden:true,'aria-label':'Markdown 文件'});
+  const upload=button('导入 Markdown',()=>file.click()),refresh=button('刷新',()=>load());
+  pageHeader(root,'Memory','选择记忆库，导入知识文档或管理已有记录。',sourceSelector,selector,upload,refresh);
+  root.classList.add('memory-page');
+  const scope=el('p',{class:'muted memory-scope'});
   const search=el('input',{type:'search',placeholder:'输入关键词搜索','aria-label':'搜索记忆'});
-  const count=el('p',{class:'muted'}),entries=el('div',{class:'memory-entries'}),title=el('h2'),version=el('small',{class:'muted'});
-  const subject=el('input',{type:'text',maxlength:200,placeholder:'主题（可选）','aria-label':'记忆主题'});
+  const searchButton=button('搜索',()=>load()),newEntry=button('＋ 新条目',()=>setDraft(emptyDraft()));
+  const count=el('p',{class:'muted','aria-live':'polite'}),entries=el('div',{class:'memory-entries'}),title=el('h2'),version=el('small',{class:'muted memory-version'});
+  const subject=el('input',{type:'text',maxlength:512,placeholder:'标题或主题（可选）','aria-label':'记忆主题'});
+  const origin=el('input',{type:'text',maxlength:512,placeholder:'来源文件名（可选）','aria-label':'来源文件名'});
   const eventDate=el('input',{type:'text',maxlength:100,placeholder:'事件日期，如 2026-10-05（可选）','aria-label':'事件日期'});
-  const textarea=el('textarea',{class:'memory-editor',rows:12,maxlength:5000,'aria-label':'记忆内容',placeholder:'写下一条值得记住的信息…'});
+  const textarea=el('textarea',{class:'memory-editor',rows:16,maxlength:65536,'aria-label':'记忆内容',placeholder:'记忆正文或 Markdown 原文…'});
+  const status=el('p',{class:'muted','aria-live':'polite'});
   const conflict=el('div',{class:'conflict',hidden:true},el('p',{text:'记录已变化。草稿已保留，请比较最新记录后采用当前版本。'}));
-  conflict.append(button('采用当前版本',()=>{
+  const adopt=button('采用当前版本',()=>{
     const d=draft(),latest=page()?.entries.find(entry=>entry.id===d.id);
-    if(!latest){notify('请搜索或加载该记录的最新版本；若已删除，可将草稿另存为新条目。',true);return;}
-    setDraft({...d,expected_version:latest.version,conflict:false});
-  }),button('草稿另存为新条目',()=>setDraft({...draft(),action:'add',id:undefined,expected_version:undefined,conflict:false})));
-  const save=button('保存',()=>write(),'primary'),remove=button('删除条目',()=>write('remove'),'danger');
-  const more=button('加载更多',()=>load(true));
-  root.append(el('div',{class:'two-columns memory-layout'},
-    el('section',{class:'card'},el('div',{class:'actions'},search,button('搜索',()=>load())),
-      button('＋ 新条目',()=>setDraft(emptyDraft())),count,entries,more),
-    el('section',{class:'card memory-panel'},title,version,conflict,subject,eventDate,textarea,el('div',{class:'actions'},remove,save))));
+    if(!latest||page()?.readonly){notify('请加载该记录的最新版本；若已删除，可将草稿另存为新条目。',true);return;}
+    setDraft({...d,expected_version:latest.version,conflict:false,uncertain:false,failure:undefined,uncertain_action:undefined,reconciled:undefined});
+  });
+  const saveAsNew=button('草稿另存为新条目',()=>setDraft({...draft(),action:'add',id:undefined,expected_version:undefined,request_key:undefined,conflict:false,uncertain:false,failure:undefined,uncertain_action:undefined,reconciled:undefined}));
+  conflict.append(adopt,saveAsNew);
+  const save=button('保存',()=>write(),'primary'),remove=button('删除条目',()=>write('remove'),'danger'),more=button('加载更多',()=>load(true));
+  root.append(file,scope,el('div',{class:'two-columns memory-layout'},
+    el('section',{class:'card'},el('div',{class:'actions memory-search'},search,searchButton),newEntry,count,entries,more),
+    el('section',{class:'card memory-panel'},title,version,conflict,subject,origin,eventDate,textarea,status,el('div',{class:'actions'},remove,save))));
 
-  function emptyDraft(){return {action:'add',content:'',subject:'',event_at:''};}
-  function draft(){return store.get().drafts.memoryByTarget[kind]||emptyDraft();}
-  function page(){return store.get().server.memory[kind];}
-  function setDraft(value){store.draft('memoryByTarget',kind,value);}
-  for(const [node,key] of [[textarea,'content'],[subject,'subject'],[eventDate,'event_at']])
-    node.addEventListener('input',()=>setDraft({...draft(),request_key:undefined,[key]:node.value}));
-  selector.addEventListener('change',()=>{kind=selector.value;search.value='';render(true);load();});
-  search.addEventListener('keydown',event=>{if(event.key==='Enter')load();});
+  function source(){return sources.find(item=>item.source_id===sourceId);}
+  function target(){return JSON.stringify([sourceId,kind]);}
+  function busy(){return saving||importing;}
+  function can(capability){return Boolean(source()?.capabilities?.includes(capability)&&(!['write','update','delete'].includes(capability)||source().writable));}
+  function emptyDraft(){return {action:'add',type:recordTypes[kind],content:'',subject:'',origin:'',event_at:''};}
+  function draft(){return store.get().drafts.memoryByTarget[target()]||emptyDraft();}
+  function page(){return store.get().server.memory[target()];}
+  function setDraft(value){store.draft('memoryByTarget',target(),value);}
+  function recordDraft(entry,readonly=false){return {action:readonly||!entry.version?'view':'replace',id:entry.id||entry.record_id,expected_version:entry.version,
+    type:entry.type,content:entry.content,subject:entry.subject||'',origin:entry.origin||'',event_at:entry.event_at||'',event_timestamp:entry.event_timestamp};}
+  function selectRecord(entry){
+    if(busy())return;
+    const current=draft(),keep=current.action==='replace'&&current.id===entry.id&&(current.conflict||current.expected_version!==entry.version);
+    const next=recordDraft(entry,page()?.readonly);
+    setDraft(keep?{...current,...next,content:current.content,subject:current.subject,origin:current.origin,event_at:current.event_at,conflict:false}:next);
+    render(true);
+  }
+  function changeTarget(nextSource,nextKind){
+    sourceId=nextSource;kind=source()?.kind==='semantic'?'knowledge':nextKind;
+    store.ui('memorySourceId',sourceId);store.ui('memoryKind',kind);
+    selector.replaceChildren(...(source()?.kind==='semantic'?['knowledge']:Object.keys(labels)).map(value=>el('option',{value,text:labels[value]})));
+    selector.value=kind;sourceSelector.value=sourceId;search.value='';loadError=null;generation++;
+    entries.signature=null;render(true);load();
+  }
+  for(const [node,key] of [[textarea,'content'],[subject,'subject'],[origin,'origin'],[eventDate,'event_at']])
+    node.addEventListener('input',()=>setDraft({...draft(),request_key:undefined,uncertain:false,failure:undefined,uncertain_action:undefined,reconciled:undefined,[key]:node.value}));
+  sourceSelector.addEventListener('change',()=>changeTarget(sourceSelector.value,kind));
+  selector.addEventListener('change',()=>changeTarget(sourceId,selector.value));
+  search.addEventListener('keydown',event=>{if(event.key==='Enter'&&!busy())load();});
+  file.addEventListener('change',()=>importMarkdown());
+
+  async function importMarkdown(){
+    const selected=file.files?.[0];file.value='';
+    if(!selected||busy()||!can('write'))return;
+    importing=true;render();
+    try{
+      if(!/\.md$/i.test(selected.name))throw new Error('请选择 .md 文件。');
+      if(selected.size>65536)throw new Error('文档超过 64 KiB，请缩小文档或拆成多个文件。');
+      let content;
+      try{content=new TextDecoder('utf-8',{fatal:true}).decode(await selected.arrayBuffer());}catch{throw new Error('文档必须使用 UTF-8 编码。');}
+      if(!content.trim()||content.length>65536)throw new Error('文档内容为空或超过长度上限。');
+      if(disposed)return;
+      changeTarget(sourceId,'knowledge');
+      setDraft({action:'add',type:'knowledge',content,subject:selected.name.replace(/\.md$/i,''),origin:selected.name,event_at:'',imported:true});
+      notify('文档已载入，点击“导入文档”保存至所选记忆库。');
+    }catch(error){if(!disposed)notify(error.message,true);}
+    finally{importing=false;if(!disposed)render(true);}
+  }
 
   async function load(append=false){
-    const own=kind,gen=++generation,old=page(),query=search.value.trim();
+    if(!source())return false;
+    const ownSource=source(),own=target(),gen=++generation,old=page(),query=search.value.trim();
     append=append&&!query&&!!old?.next_cursor;
     const params=new URLSearchParams({limit:'50'});
     if(query)params.set('q',query);
-    if(append&&old?.next_cursor&&!query)params.set('cursor',old.next_cursor);
+    if(append)params.set('cursor',old.next_cursor);
+    loading=true;loadError=null;render();
     try{
-      const value=await api.request('/api/memory/'+own+'?'+params);
-      if(disposed||gen!==generation)return;
+      const value=await api.readMemory(ownSource,kind,params);
+      if(disposed||gen!==generation)return false;
       if(append)value.entries=[...new Map([...(old?.entries||[]),...value.entries].map(entry=>[entry.id,entry])).values()];
-      entries.signature=null;
       store.server('memory',{...store.get().server.memory,[own]:value});
-    }catch(error){if(!disposed&&gen===generation){entries.signature=null;entries.replaceChildren(errorBox(error.message,()=>load()));}}
+      return true;
+    }catch(error){if(!disposed&&gen===generation)loadError=error.message;return false;}
+    finally{if(!disposed&&gen===generation){loading=false;entries.signature=null;render();}}
   }
 
   async function write(action){
-    if(saving)return;
-    const d=draft(),own=kind;action=action||d.action;
-    const body={action,id:d.id,expected_version:d.expected_version};
-    if(action!=='remove')Object.assign(body,{content:d.content,subject:d.subject||'',event_at:d.event_at?.trim()||null,event_timestamp:d.event_timestamp});
-    if(action==='add'){body.request_key=d.request_key||crypto.randomUUID();setDraft({...d,request_key:body.request_key});}
+    if(busy()||draft().action==='view')return;
+    const d={...draft()},ownSource=source(),ownKind=kind,own=target();action=action||d.action;
+    const body={...d,action};
+    if(action==='add'){body.request_key=d.request_key||crypto.randomUUID();store.draft('memoryByTarget',own,{...d,request_key:body.request_key});}
     saving=true;render();
     try{
-      const result=await api.request('/api/memory/'+own,{method:'PATCH',body:JSON.stringify(body)});
-      if(result.declined){notify('已放弃操作');return;}
-      store.draft('memoryByTarget',own,emptyDraft());
-      notify(result.reason==='duplicate'?'相同记忆已存在':'记忆已保存');await load();
+      const result=await api.writeMemory(ownSource,ownKind,body);
+      if(result.declined){if(!disposed)notify('已放弃操作');return;}
+      const next=action==='remove'?emptyDraft():recordDraft({...result,event_timestamp:result.event_at,event_at:dateLabel(result.event_at)});
+      store.draft('memoryByTarget',own,next);
+      if(!disposed){search.value='';notify(action==='remove'?'记忆已删除':'记忆已保存');await load();}
     }catch(error){
-      notify(error.message,true);
-      if(error.status===409||error.status===404){store.draft('memoryByTarget',own,{...d,conflict:true});search.value='';await load();}
+      if(error.status===409||error.status===404){store.draft('memoryByTarget',own,{...store.get().drafts.memoryByTarget[own],conflict:true,
+        uncertain:false,failure:undefined,uncertain_action:undefined,reconciled:undefined});if(!disposed){search.value='';await load();}}
+      else{
+        const uncertain=(!error.status||error.status>=500)&&!['EMBEDDING_SOURCE','EMBEDDING_PROTOCOL'].includes(error.code);
+        store.draft('memoryByTarget',own,{...store.get().drafts.memoryByTarget[own],failure:error.message,uncertain,
+          uncertain_action:uncertain?action:undefined,reconciled:undefined});
+        if(uncertain&&action!=='add'&&!disposed){
+          search.value='';
+          const reconciled=await load();
+          if(!disposed)store.draft('memoryByTarget',own,{...store.get().drafts.memoryByTarget[own],reconciled});
+        }
+      }
+      if(!disposed)notify(error.message,true);
     }finally{saving=false;if(!disposed)render(true);}
   }
 
   function render(force=false){
-    const d=draft(),value=page(),latest=value?.entries.find(entry=>entry.id===d.id);
-    title.textContent=d.action==='replace'?'编辑条目':'新增条目';
-    version.textContent=d.id?'ID '+d.id+' · 编辑版本 '+d.expected_version+' · 当前版本 '+(latest?.version??'未加载'):'保存后生成记录 ID 和版本';
+    const d=draft(),value=page(),selected=source(),latest=!value?.readonly&&value?.entries.find(entry=>entry.id===d.id);
     const changed=d.action==='replace'&&latest&&latest.version!==d.expected_version;
-    conflict.hidden=!(d.conflict||changed);
-    for(const [node,key] of [[textarea,'content'],[subject,'subject'],[eventDate,'event_at']])
+    const readonly=d.action==='view'||!can(d.action==='replace'?'update':'write');
+    title.textContent=d.action==='view'?'查看检索结果':d.action==='replace'?'编辑'+(labels[Object.keys(recordTypes).find(k=>recordTypes[k]===d.type)]||'条目'):d.imported?'导入 Markdown':'新增条目';
+    version.textContent=d.id?'来源 '+sourceId+' · 记录 '+d.id+' · 版本 '+(d.expected_version||'只读'):selected?'目标：'+sourceId:'请先配置可读取的记忆来源';
+    scope.textContent=[selected?.source_description,selected?.store==='cognee'?'列表范围：FunAgent 管理的文档；其他资料可通过搜索查看。':''].filter(Boolean).join(' · ');
+    conflict.hidden=!(d.conflict||changed);adopt.disabled=busy()||!latest?.version;saveAsNew.disabled=busy()||!can('write');
+    for(const [node,key] of [[textarea,'content'],[subject,'subject'],[origin,'origin'],[eventDate,'event_at']]){
       if(force||document.activeElement!==node)node.value=d[key]||'';
-    eventDate.hidden=kind!=='episode';selector.disabled=saving;
-    save.disabled=Boolean(saving||!d.content?.trim()||!!changed||!!d.conflict||value?.disabled||value?.writable===false||(value?.capabilities&&!value.capabilities.includes(d.action==='replace'?'update':'write')));
-    remove.hidden=d.action!=='replace';remove.disabled=Boolean(saving||!!changed||!!d.conflict||value?.writable===false||(value?.capabilities&&!value.capabilities.includes('delete')));
-    more.hidden=!value?.next_cursor;more.disabled=saving;
-    count.textContent=value?.disabled?'记忆未启用或没有管理读取权限':value?value.entries.length+' 条已加载'+(value.total==null?'':' / 共 '+value.total+' 条'):'读取中…';
-    if(!value)return;
-    const signature=JSON.stringify([value.entries,d.id]);
+      node.readOnly=busy()||readonly;
+    }
+    eventDate.hidden=d.type!=='episode';sourceSelector.disabled=busy()||!sources.length;selector.disabled=busy()||!selected;
+    upload.disabled=busy()||!can('write');refresh.disabled=busy()||loading||!selected;
+    newEntry.disabled=busy()||!can('write')||kind==='all';search.disabled=busy()||!can('search');searchButton.disabled=busy()||loading||!can('search');
+    save.textContent=d.imported&&d.action==='add'?'导入文档':'保存';
+    save.disabled=Boolean(busy()||readonly||!d.type||!d.content?.trim()||changed||d.conflict);
+    remove.hidden=d.action!=='replace';remove.disabled=Boolean(busy()||changed||d.conflict||!can('delete'));
+    more.hidden=!value?.next_cursor||!!search.value.trim();more.disabled=busy()||loading;
+    status.textContent=saving?(d.imported?'导入处理中…':'保存处理中…'):importing?'读取文档…':d.uncertain?(d.uncertain_action&&d.uncertain_action!=='add'?
+      '操作结果未确认，草稿已保留。'+(d.reconciled?'列表已自动刷新，请核对当前记录状态后再决定是否重试。':'自动刷新失败，请手动刷新核对后再决定是否重试。'):
+      '操作结果未确认，草稿已保留。请刷新核对；原样重试导入会使用同一请求标识。')+(d.failure?' 原因：'+d.failure:''):d.failure?d.failure+' 草稿已保留，修复后可重试。':d.action==='view'?'搜索结果仅供查看；编辑或删除请清空搜索，在管理列表中选择记录。':d.type==='knowledge'?'Markdown 原文保存；请求体最多 64 KiB。':'';
+    count.textContent=loadError?'读取失败':loading?'读取中…':value?.no_list?'此来源只支持搜索，无法列出可管理记录。':value?value.entries.length+' 条已加载'+(value.readonly?' · 搜索结果只读':''):selected?'读取中…':'没有可读取的记忆来源，请检查 memory.conf 和管理读取权限。';
+    const signature=JSON.stringify([value,d.id,busy(),loadError]);
     if(entries.signature!==signature){
       entries.signature=signature;
-      entries.replaceChildren(...value.entries.map(entry=>button(
-        (entry.subject?entry.subject+' · ':'')+entry.content+(entry.event_at?' · '+entry.event_at:'')+'  (v'+entry.version+')',()=>{
-          const current=draft();
-          const keep=current.conflict||(current.id===entry.id&&current.expected_version!==entry.version);
-          setDraft({action:'replace',id:entry.id,expected_version:entry.version,
-            content:keep?current.content:entry.content,subject:keep?current.subject:entry.subject,
-            event_at:keep?current.event_at:entry.event_at,event_timestamp:entry.event_timestamp,conflict:false});render(true);
-        },'memory-entry '+(entry.id===d.id?'selected':''))));
-      if(!value.entries.length)entries.append(el('p',{class:'empty',text:'暂无匹配记忆。'}));
+      if(loadError){entries.replaceChildren(errorBox(loadError,()=>load()));return;}
+      entries.replaceChildren(...(value?.entries||[]).map(entry=>{
+        const item=button('',()=>selectRecord(entry),'memory-entry '+(entry.id===d.id?'selected':''));item.disabled=busy();
+        item.append(el('strong',{text:entry.subject||entry.origin||entry.type}),el('p',{class:'memory-summary',text:entry.content.slice(0,160)+(entry.content.length>160?'…':'')}),
+          el('small',{text:[entry.origin,entry.updated_at?dateLabel(entry.updated_at):'',entry.version?'v'+entry.version.slice(0,8):'只读'].filter(Boolean).join(' · ')}));return item;
+      }));
+      if(value&&!value.entries.length&&!value.no_list)entries.append(el('p',{class:'empty',text:'暂无匹配记忆。'}));
     }
   }
   const unsubscribe=store.subscribe(s=>s.server.memory,()=>render());
   const unsubscribeDraft=store.subscribe(s=>s.drafts.memoryByTarget,()=>render());
-  const focus=()=>load();window.addEventListener('focus',focus);render();load();
-  return ()=>{disposed=true;generation++;unsubscribe();unsubscribeDraft();window.removeEventListener('focus',focus);};
+  const focus=()=>{if(!busy())load();};window.addEventListener('focus',focus);
+  async function initialize(){
+    try{
+      const data=await api.memorySources();if(disposed)return;sources=data.sources;
+      sourceSelector.replaceChildren(...sources.map(item=>el('option',{value:item.source_id,text:item.source_id+' · '+(drivers[item.store]||item.store)})));
+      store.migrateMemoryDrafts(data.default_source_id&&sources.some(item=>item.source_id===data.default_source_id)?data.default_source_id:null);
+      if(['user','note','episode','knowledge'].some(key=>store.get().drafts.memoryByTarget[key]))notify('旧草稿尚未绑定来源；请恢复默认来源配置后再载入。',true);
+      const selected=sources.find(item=>item.source_id===store.get().ui.memorySourceId)||sources.find(item=>item.source_id===data.default_source_id)||sources[0];
+      if(selected)changeTarget(selected.source_id,store.get().ui.memoryKind||'user');else{sourceSelector.replaceChildren(el('option',{value:'',text:'无可用记忆库'}));render(true);}
+    }catch(error){if(!disposed){sourceSelector.replaceChildren(el('option',{value:'',text:'来源读取失败'}));render();entries.replaceChildren(errorBox(error.message,()=>initialize()));}}
+  }
+  render();initialize();
+  return ()=>{disposed=true;generation++;unsubscribe();unsubscribeDraft();window.removeEventListener('focus',focus);root.classList.remove('memory-page');};
 }

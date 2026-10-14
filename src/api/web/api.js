@@ -1,7 +1,12 @@
 import {applyEvent, terminal} from './store.js';
 import {notify, confirmAction} from './components/ui.js';
 
-const types={user:'profile',note:'note',episode:'episode'};
+const types={user:'profile',note:'note',episode:'episode',knowledge:'knowledge'};
+export function memoryJSON(value){
+  const body=JSON.stringify(value);
+  if(new TextEncoder().encode(body).byteLength>65536){const error=new Error('请求超过 64 KiB，请缩小文档或拆成多个文件。');error.status=413;error.code='PAYLOAD_TOO_LARGE';throw error;}
+  return body;
+}
 export const dateLabel=value=>{if(!value)return '';const d=new Date(value);return Number.isNaN(d.getTime())?value:`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
 export function dateISO(value){
   if(!value?.trim())return null;
@@ -18,8 +23,6 @@ export class ApiClient {
   traceReview(taskId,{signal}={}){return this.wire(`/tasks/${encodeURIComponent(taskId)}/trace`,{signal});}
   async request(path,options={}){
     // Logical page resources are translated here; no legacy HTTP routes exist.
-    const memory=path.match(/^\/api\/memory\/(user|note|episode)(?:\?(.*))?$/);
-    if(memory)return options.method==='PATCH'?this.writeMemory(memory[1],JSON.parse(options.body)):this.readMemory(memory[1],new URLSearchParams(memory[2]));
     if(path.startsWith('/api/data/'))return this.wire(path.slice(4),options);
     const catalog=path.match(/^\/api\/(tools|connections|models|config|status)$/);
     if(catalog){const kind=catalog[1],data=await this.wire(`/diagnostics/${kind}`,options);
@@ -57,14 +60,28 @@ export class ApiClient {
         if(['snapshot','reset','turn.finished'].includes(item.kind))this.scheduleHistory(sid);
         if(['snapshot','reset','turn.finished'].includes(item.kind)||item.kind.startsWith('interaction.'))this.interactions().catch(()=>{});
         if(item.kind==='turn.finished')this.sessions().catch(()=>{});}});});}
-  async sourceInfo(){const data=await this.wire('/memory/sources');return data.sources.find(s=>s.source_id===data.default_source_id)||null;}
-  async readMemory(kind,params){const source=await this.sourceInfo();if(!source)return {entries:[],disabled:true,next_cursor:null};const q=new URLSearchParams({source_id:source.source_id,type:types[kind],limit:params.get('limit')||'50'}),search=params.get('q');
-    if(search)q.set('text',search);else if(params.get('cursor'))q.set('cursor',params.get('cursor'));const data=await this.wire(`/memory/${search?'search':'records'}?${q}`);
-    return {...data,entries:data.records.map(r=>({...r,id:r.record_id,kind,event_timestamp:r.event_at,event_at:dateLabel(r.event_at)})),writable:source.writable,capabilities:source.capabilities,source_id:source.source_id};}
-  async writeMemory(kind,body){const source=await this.sourceInfo();if(!source)throw new Error('未启用可管理的记忆来源。');const metadata={content:body.content,type:types[kind],subject:body.subject?.trim()||null,
-    event_at:kind==='episode'?(body.event_timestamp&&dateLabel(body.event_timestamp)===body.event_at?body.event_timestamp:dateISO(body.event_at)):null};
-    if(body.action==='add')return this.wire('/memory/records',{method:'POST',body:JSON.stringify({source_id:source.source_id,...metadata,request_key:body.request_key})});
-    const proposal=await this.wire('/memory/changes',{method:'POST',body:JSON.stringify({action:body.action,source_id:source.source_id,record_id:body.id,expected_version:body.expected_version,...(body.action==='replace'?{patch:metadata}:{})})});
+  memorySources(){return this.wire('/memory/sources');}
+  async readMemory(source,kind,params=new URLSearchParams()){
+    const search=params.get('q'),capabilities=source.capabilities||[];
+    if(!search&&!capabilities.includes('list'))return {entries:[],next_cursor:null,no_list:true};
+    const q=new URLSearchParams({source_id:source.source_id,limit:params.get('limit')||'50'});
+    if(types[kind])q.set('type',types[kind]);
+    if(search)q.set('text',search);else if(params.get('cursor'))q.set('cursor',params.get('cursor'));
+    const data=await this.wire(`/memory/${search?'search':'records'}?${q}`);
+    if(data.source_status?.[source.source_id]&&data.source_status[source.source_id]!=='ok')throw new Error('记忆来源暂时无法读取，请检查服务后重试。');
+    return {...data,readonly:Boolean(search),entries:data.records.map(r=>({...r,id:r.record_id,event_timestamp:r.event_at,event_at:dateLabel(r.event_at)}))};
+  }
+  async writeMemory(source,kind,body){
+    const operation={add:'write',replace:'update',remove:'delete'}[body.action];
+    if(!source?.writable||!operation||!source.capabilities?.includes(operation)){const error=new Error('当前来源没有此操作的能力或写权限。');error.status=403;throw error;}
+    const type=body.type||types[kind];
+    if(body.action!=='remove'&&!type){const error=new Error('请选择新增记忆的类型。');error.status=400;throw error;}
+    let metadata;
+    try{metadata=body.action==='remove'?null:{content:body.content,type,subject:body.subject?.trim()||null,origin:body.origin?.trim()||null,
+      event_at:type==='episode'?(body.event_timestamp&&dateLabel(body.event_timestamp)===body.event_at?body.event_timestamp:dateISO(body.event_at)):body.event_timestamp||null};}
+    catch(error){error.status=400;throw error;}
+    if(body.action==='add')return this.wire('/memory/records',{method:'POST',body:memoryJSON({source_id:source.source_id,...metadata,request_key:body.request_key})});
+    const proposal=await this.wire('/memory/changes',{method:'POST',body:memoryJSON({action:body.action,source_id:source.source_id,record_id:body.id,expected_version:body.expected_version,...(body.action==='replace'?{patch:metadata}:{})})});
     const approve=await confirmAction(body.action==='remove'?'删除记忆':'确认修改记忆',`来源：${proposal.source_id}\n记录：${proposal.record_id}\n版本：${proposal.expected_version}\n\n${proposal.patch?.content||'确认后删除这条记录。'}`);
     const result=await this.wire(`/memory/challenges/${proposal.challenge_id}/confirm`,{method:'POST',body:JSON.stringify({arguments_digest:proposal.arguments_digest,approve})});return {...result,declined:!approve};}
   close(){this.closed=true;this.source?.close();clearInterval(this.expiryTimer);for(const timer of this.historyTimers.values())clearTimeout(timer);if(this.frame)cancelAnimationFrame(this.frame);}

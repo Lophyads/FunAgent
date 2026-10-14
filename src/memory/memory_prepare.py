@@ -4,14 +4,14 @@ from uuid import uuid4
 import time
 from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, ControlError
-from .contracts import MemoryContext, MemoryBranch, MemoryQuery, RetrievalPlan
+from .contracts import MemoryContext, MemoryBranch, MemoryQuery
 from .common import normalize
 from .memory_mgr import MemoryMgr
 from .memory_planner import MemoryPlanner
 from .prompt import FitBranch
 from .protocols import MemoryReader
 from ..observability.observation_mgr import ObservationMgr
-from ..observability.projections import Memory, Messages, Query, Plan
+from ..observability.projections import Memory, Messages, Query
 
 class MemoryPrepare:
     @staticmethod
@@ -53,9 +53,9 @@ class MemoryPrepare:
         except (DomainError, ControlError) as error:
             context.CheckCancelled()
             code = error.code if error.code in {"PLAN_INVALID", "PLAN_FAILED", "DEADLINE"} else "PLAN_FAILED"
-            plan = RetrievalPlan(bool(names["facts"]), bool(names["knowledge"]), request.text, request.text,
-                                 degraded=True, warnings=(f"recall:{code}",))
-            mgr.Event('memory.plan_degraded', error_code=code, plan=lambda: Plan(plan))
+            warning = f"recall:{code}"
+            mgr.Event('memory.plan_skipped', error_code=code, warning=warning)
+            return MemoryContext(warnings=(warning,), status="skipped")
         context.CheckCancelled()
         branches = {}
         for branch, needed in (("facts", plan.need_memory), ("knowledge", plan.need_knowledge)):

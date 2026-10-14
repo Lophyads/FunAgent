@@ -55,6 +55,6 @@ export function showTraces(sessionId) {
 }
 
 export function confirmAction(title,text){return new Promise(resolve=>{const dialog=document.querySelector('#detail');let approved=false;
-  showDetail(title,el('div',{},el('pre',{text}),el('div',{class:'actions'},button('放弃操作',()=>dialog.close()),button('确认操作',()=>{approved=true;dialog.close();},'primary'))));
+  showDetail(title,el('div',{},el('pre',{class:'confirmation-content',text}),el('div',{class:'actions'},button('放弃操作',()=>dialog.close()),button('确认操作',()=>{approved=true;dialog.close();},'primary'))));
   dialog.addEventListener('close',()=>resolve(approved),{once:true});
 });}

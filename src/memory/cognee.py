@@ -13,6 +13,7 @@ from .common import text, validate_query
 from .contracts import MemoryRecord, MemoryRef, MemorySearchResult
 from .transport import JSONHTTP, ValidateConnection
 from .cognee_documents import CogneeDocuments, VisibleText
+from .cognee_datasets import CogneeDataset
 
 
 SEARCH_TYPES = frozenset({"CHUNKS", "CHUNKS_LEXICAL"})
@@ -21,7 +22,7 @@ SEARCH_TYPES = frozenset({"CHUNKS", "CHUNKS_LEXICAL"})
 def ValidateSettings(settings):
     """Shared by configuration loading and standalone construction; no IO."""
     allowed = {"store", "kind", "capabilities", "read_access", "write_access", "source_description",
-               "endpoint", "datasets", "dataset_ids", "search_type", "credential_env", "auth_header", "timeout"}
+               "endpoint", "datasets", "search_type", "credential_env", "auth_header", "timeout"}
     capabilities = settings.get("capabilities", ("search",)) if isinstance(settings, Mapping) else ()
     valid = (isinstance(settings, Mapping) and set(settings) <= allowed and
              settings.get("kind", "semantic") == "semantic" and
@@ -36,22 +37,12 @@ def ValidateSettings(settings):
     if not valid:
         raise DomainError("CONFIG_INVALID", "Invalid Cognee memory settings")
     ValidateConnection(settings.get("endpoint"), settings.get("timeout", 2))
-    present = [key for key in ("datasets", "dataset_ids") if key in settings]
-    if len(present) != 1:
-        raise DomainError("CONFIG_INVALID", "Cognee requires datasets or dataset_ids, exclusively")
-    selected = settings[present[0]]
+    selected = settings.get("datasets")
     if (not isinstance(selected, (list, tuple)) or not 1 <= len(selected) <= 100 or
             any(not text(value) or len(value) > 512 for value in selected) or len(set(selected)) != len(selected)):
         raise DomainError("CONFIG_INVALID", "Invalid Cognee dataset scope")
-    if present[0] == "dataset_ids":
-        try:
-            ids = [str(UUID(value)) for value in selected]
-            if len(set(ids)) != len(ids):
-                raise ValueError
-        except (ValueError, TypeError, AttributeError):
-            raise DomainError("CONFIG_INVALID", "Cognee dataset_ids require unique UUIDs") from None
-    if set(capabilities) - {"search"} and (present[0] != "dataset_ids" or len(selected) != 1):
-        raise DomainError("CONFIG_INVALID", "Cognee document management requires one dataset UUID")
+    if set(capabilities) - {"search"} and (len(selected) != 1 or CogneeDataset.Find(selected[0]) is None):
+        raise DomainError("CONFIG_REFERENCE", "Cognee document management requires one registered dataset name")
     if "credential_env" in settings:
         name = settings["credential_env"]
         if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
@@ -74,16 +65,28 @@ def Headers(settings):
 class CogneeMemoryStore(CogneeDocuments):
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
-    def __init__(self, settings, source_id, *, transport=None):
+    def __init__(self, settings, source_id, *, transport=None, _dataset_id=None):
         ValidateSettings(settings)
         if not text(source_id):
             raise DomainError("CONFIG_INVALID", "Invalid Cognee memory source")
         self.source_id, self.kind = source_id, "semantic"
         self.capabilities = frozenset(settings.get("capabilities", ("search",)))
-        key = "dataset_ids" if "dataset_ids" in settings else "datasets"
-        selected = tuple(str(UUID(value)) for value in settings[key]) if key == "dataset_ids" else tuple(settings[key])
-        self._scope = {key: selected}
-        self._document_dataset = selected[0] if key == "dataset_ids" and len(selected) == 1 else None
+        self._dataset_names = tuple(settings["datasets"])
+        registered = CogneeDataset.Find(self._dataset_names[0]) if len(self._dataset_names) == 1 else None
+        managed = bool(self.capabilities - {"search"})
+        if _dataset_id is not None:
+            if managed:
+                raise DomainError("CONFIG_INVALID", "Internal Cognee dataset scope is read-only")
+            try:
+                _dataset_id = str(UUID(_dataset_id))
+            except (TypeError, ValueError, AttributeError):
+                raise DomainError("CONFIG_INVALID", "Invalid internal Cognee dataset identifier") from None
+        self._document_dataset = registered.dataset_id if managed and registered is not None else None
+        self._document_dataset_name = registered.dataset_name if managed and registered is not None else None
+        scoped_id = _dataset_id or self._document_dataset
+        self._scope = ({"dataset_ids": (scoped_id,)} if scoped_id is not None
+                       else {"datasets": self._dataset_names})
+        self._scope_dataset_ids = frozenset(self._scope.get("dataset_ids", ()))
         self._document_lock = RLock()
         self._search_type, self._timeout = settings.get("search_type", "CHUNKS"), settings.get("timeout", 2)
         self._http = JSONHTTP(settings["endpoint"].rstrip("/"), Headers(settings), self._timeout, transport=transport)
@@ -134,10 +137,9 @@ class CogneeMemoryStore(CogneeDocuments):
                     dataset_id = str(UUID(dataset_id))
                 except (TypeError, ValueError, AttributeError):
                     raise DomainError("MEMORY_PROTOCOL", "Invalid Cognee evidence dataset_id") from None
-                if "dataset_ids" in self._scope and dataset_id not in self._scope["dataset_ids"]:
+                if self._scope_dataset_ids and dataset_id not in self._scope_dataset_ids:
                     raise DomainError("MEMORY_PROTOCOL", "Cognee evidence is outside the requested scope")
-            if dataset_name is not None and (not text(dataset_name) or
-                    "datasets" in self._scope and dataset_name not in self._scope["datasets"]):
+            if dataset_name is not None and (not text(dataset_name) or dataset_name not in self._dataset_names):
                 raise DomainError("MEMORY_PROTOCOL", "Cognee evidence is outside the requested scope")
             identifier = metadata["chunk_id"]
             if identifier in seen:
@@ -146,9 +148,7 @@ class CogneeMemoryStore(CogneeDocuments):
             origin = metadata.get("document_name")
             if origin is not None and (not text(origin) or len(origin) > 512):
                 raise DomainError("MEMORY_PROTOCOL", "Invalid Cognee source document name")
-            locators = {"data_id": metadata["data_id"], **self._scope}
-            if dataset_id:
-                locators["dataset_id"] = dataset_id
+            locators = {"data_id": metadata["data_id"], "datasets": self._dataset_names}
             citation = "cognee://" + quote(self.source_id, safe="") + "/" + quote(identifier, safe="") + "?" + urlencode(locators, doseq=True)
             records.append(MemoryRecord(MemoryRef(self.source_id, identifier), self.kind, "knowledge", VisibleText(row["text"]),
                                         citation, origin=origin))
