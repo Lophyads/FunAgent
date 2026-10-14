@@ -54,6 +54,14 @@ def _supabase(source_id, settings, conf_dir):
 STORES["supabase"] = _supabase
 
 
+def _cognee(source_id, settings, conf_dir):
+    from .cognee import CogneeMemoryStore
+    return CogneeMemoryStore(settings, source_id)
+
+
+STORES["cognee"] = _cognee
+
+
 def RequiredBackends(conf):
     return tuple({s["backend_id"] for s in conf.Memory().Sources().values()
                   if s["store"] == "callback" and s["callback_id"] == "mcp"})

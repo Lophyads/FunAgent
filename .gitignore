@@ -14,6 +14,7 @@ build/
 .env
 docs_copy/
 logs/
+trace_json/
 .correlation-key
 .funagent/
 
@@ -31,3 +32,7 @@ sql/supabase/
 tests/
 scripts/
 TREG_INTEGRATION.md
+mcp_server/MODULAR-RAG/data/
+tests_observability/
+docs/
+mcp_server/MODULAR-RAG/data/chroma_db

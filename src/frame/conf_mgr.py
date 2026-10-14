@@ -297,6 +297,9 @@ def _validate(docs):
         if source["store"] == "sqlite":
             _require(source["kind"] == "episodic", "memory.sources.kind")
             _text(source["path"], "memory.sources.path")
+        if source["store"] == "cognee":
+            from ..memory.cognee import ValidateSettings
+            ValidateSettings(source)
         if source["store"] == "supabase":
             _require(source["kind"] == "episodic", "memory.sources.kind")
             for field in ("namespace", "endpoint"):

@@ -52,10 +52,14 @@ class JSONHTTP:
                 self._condition.notify_all()
 
     def Post(self, path, payload, context):
+        return self.Request("POST", path, context, json=payload)
+
+    def Request(self, method, path, context, *, response_mode="json", status_codes=None, **kwargs):
+        """Bounded JSON responses, also for eval uploads and status queries."""
         with self.Borrow(context):
             try:
                 context.CheckCancelled()
-                with self._response(path, payload, context) as response:
+                with self._response(method, path, context, **kwargs) as response:
                     parts, size = [], 0
                     for part in response.iter_bytes():
                         context.CheckCancelled()
@@ -75,7 +79,9 @@ class JSONHTTP:
                                         "42501": "DENIED"}.get(json.loads(body).get("code"), code)
                             except (ValueError, AttributeError):
                                 pass
-                        raise DomainError(code, "Memory request failed")
+                        raise DomainError((status_codes or {}).get(response.status_code, code), "Memory request failed")
+                    if response_mode == "bytes":
+                        return body
                     return json.loads(body)
             except DomainError:
                 raise
@@ -86,10 +92,10 @@ class JSONHTTP:
                 raise DomainError(self._source, "Memory connection failed") from None
 
     @contextmanager
-    def _response(self, path, payload, context):
+    def _response(self, method, path, context, **kwargs):
         lease = None
         try:
-            with self._client.stream("POST", self._endpoint + path, json=payload,
+            with self._client.stream(method, self._endpoint + path, **kwargs,
                                      timeout=min(self._timeout, context.Remaining())) as response:
                 original = response.stream
                 class Lease(self._httpx.SyncByteStream):
