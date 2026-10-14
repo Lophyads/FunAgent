@@ -1,18 +1,15 @@
-"""Cognee chunk recall plus opt-in document management over HTTP."""
+"""Episodic notes over Cognee's document and chunk-recall APIs."""
 from collections.abc import Mapping
-from dataclasses import replace
 from threading import RLock
 import os
 import re
-import time
-from urllib.parse import quote, urlencode
 from uuid import UUID
 
 from ..frame.contracts import ControlError, DomainError
 from .common import text, validate_query
-from .contracts import MemoryRecord, MemoryRef, MemorySearchResult
+from .contracts import MemorySearchResult
 from .transport import JSONHTTP, ValidateConnection
-from .cognee_documents import CogneeDocuments, VisibleText
+from .cognee_documents import CogneeDocuments, _uuid
 from .cognee_datasets import CogneeDataset
 
 
@@ -25,7 +22,7 @@ def ValidateSettings(settings):
                "endpoint", "datasets", "search_type", "credential_env", "auth_header", "timeout"}
     capabilities = settings.get("capabilities", ("search",)) if isinstance(settings, Mapping) else ()
     valid = (isinstance(settings, Mapping) and set(settings) <= allowed and
-             settings.get("kind", "semantic") == "semantic" and
+             settings.get("kind", "episodic") == "episodic" and
              isinstance(capabilities, (list, tuple)) and all(isinstance(value, str) for value in capabilities) and
              len(capabilities) == len(set(capabilities)) and
              "search" in capabilities and set(capabilities) <= {"search", "list", "write", "update", "delete"} and
@@ -38,7 +35,7 @@ def ValidateSettings(settings):
         raise DomainError("CONFIG_INVALID", "Invalid Cognee memory settings")
     ValidateConnection(settings.get("endpoint"), settings.get("timeout", 2))
     selected = settings.get("datasets")
-    if (not isinstance(selected, (list, tuple)) or not 1 <= len(selected) <= 100 or
+    if (not isinstance(selected, (list, tuple)) or len(selected) != 1 or
             any(not text(value) or len(value) > 512 for value in selected) or len(set(selected)) != len(selected)):
         raise DomainError("CONFIG_INVALID", "Invalid Cognee dataset scope")
     if set(capabilities) - {"search"} and (len(selected) != 1 or CogneeDataset.Find(selected[0]) is None):
@@ -69,7 +66,7 @@ class CogneeMemoryStore(CogneeDocuments):
         ValidateSettings(settings)
         if not text(source_id):
             raise DomainError("CONFIG_INVALID", "Invalid Cognee memory source")
-        self.source_id, self.kind = source_id, "semantic"
+        self.source_id, self.kind = source_id, "episodic"
         self.capabilities = frozenset(settings.get("capabilities", ("search",)))
         self._dataset_names = tuple(settings["datasets"])
         registered = CogneeDataset.Find(self._dataset_names[0]) if len(self._dataset_names) == 1 else None
@@ -81,12 +78,10 @@ class CogneeMemoryStore(CogneeDocuments):
                 _dataset_id = str(UUID(_dataset_id))
             except (TypeError, ValueError, AttributeError):
                 raise DomainError("CONFIG_INVALID", "Invalid internal Cognee dataset identifier") from None
-        self._document_dataset = registered.dataset_id if managed and registered is not None else None
-        self._document_dataset_name = registered.dataset_name if managed and registered is not None else None
-        scoped_id = _dataset_id or self._document_dataset
-        self._scope = ({"dataset_ids": (scoped_id,)} if scoped_id is not None
-                       else {"datasets": self._dataset_names})
-        self._scope_dataset_ids = frozenset(self._scope.get("dataset_ids", ()))
+        self._document_dataset = _dataset_id or (registered.dataset_id if registered is not None else None)
+        if self._document_dataset is None:
+            raise DomainError("CONFIG_REFERENCE", "Cognee notes require a registered dataset name")
+        self._document_dataset_name = self._dataset_names[0]
         self._document_lock = RLock()
         self._search_type, self._timeout = settings.get("search_type", "CHUNKS"), settings.get("timeout", 2)
         self._http = JSONHTTP(settings["endpoint"].rstrip("/"), Headers(settings), self._timeout, transport=transport)
@@ -96,28 +91,42 @@ class CogneeMemoryStore(CogneeDocuments):
         validate_query(query)
         if (query.source_ids and self.source_id not in query.source_ids) or (query.kind and query.kind != self.kind):
             return MemorySearchResult()
-        if (not query.text.strip() or query.include_deleted or any(getattr(query, key) is not None
-                for key in ("subject", "origin", "event_from", "event_to"))):
-            raise DomainError("UNSUPPORTED", "Cognee supports text search without record metadata filters")
-        if query.types and "knowledge" not in query.types:
+        if query.types and "note" not in query.types:
             return MemorySearchResult((), {self.source_id: "ok"})
-        child = replace(context, deadline=min(context.deadline or float("inf"), time.monotonic() + self._timeout))
+        if query.include_deleted:
+            raise DomainError("UNSUPPORTED", "Cognee physically deletes notes; deleted receipts are unavailable")
+        child = self._document_context(context, "search")
         try:
-            with self._http.Borrow(child):
-                payload = self._http.Post("/recall", {"query": query.text, "search_type": self._search_type,
-                    "scope": ["graph"], "top_k": query.limit, "only_context": False, "stream": False,
-                    **{key: list(value) for key, value in self._scope.items()}}, child)
-                records = self._records(payload, query.limit)
+            with self._document_lock, self._http.Borrow(child):
+                candidates = None
+                if query.text.strip():
+                    payload = self._http.Post("/recall", {"query": query.text, "search_type": self._search_type,
+                        "scope": ["graph"], "top_k": 100, "only_context": False, "stream": False,
+                        "dataset_ids": [self._document_dataset]}, child)
+                    candidates = self._candidates(payload)
+                    if not candidates:
+                        return MemorySearchResult((), {self.source_id: "ok"})
+                rows = self._rows(child)
+                if candidates is not None:
+                    by_id = {_uuid(row.get("id")): row for _, row in rows}
+                    rows = ((0, by_id[identifier]) for identifier in candidates if identifier in by_id)
+                records = []
+                for _, row in rows:
+                    record = self._record(row, child)
+                    if record is not None and self._matches(record, query):
+                        records.append(record)
+                        if len(records) == query.limit:
+                            break
                 child.CheckCancelled()
-                return MemorySearchResult(records, {self.source_id: "ok"})
+                return MemorySearchResult(tuple(records), {self.source_id: "ok"})
         except ControlError:
             context.CheckCancelled()
             raise DomainError("MEMORY_TIMEOUT", "Cognee memory search timed out") from None
 
-    def _records(self, payload, limit):
-        if not isinstance(payload, list) or len(payload) > limit:
+    def _candidates(self, payload):
+        if not isinstance(payload, list) or len(payload) > 100:
             raise DomainError("MEMORY_PROTOCOL", "Invalid Cognee recall response")
-        records, seen = [], set()
+        identifiers, seen = [], set()
         for row in payload:
             if isinstance(row, dict) and row.get("source") == "system":
                 if row.get("status") == "memory_warming_up":
@@ -133,11 +142,8 @@ class CogneeMemoryStore(CogneeDocuments):
                 raise DomainError("MEMORY_PROTOCOL", "Cognee evidence requires chunk_id and data_id")
             dataset_id, dataset_name = row.get("dataset_id"), row.get("dataset_name")
             if dataset_id is not None:
-                try:
-                    dataset_id = str(UUID(dataset_id))
-                except (TypeError, ValueError, AttributeError):
-                    raise DomainError("MEMORY_PROTOCOL", "Invalid Cognee evidence dataset_id") from None
-                if self._scope_dataset_ids and dataset_id not in self._scope_dataset_ids:
+                dataset_id = _uuid(dataset_id)
+                if dataset_id != self._document_dataset:
                     raise DomainError("MEMORY_PROTOCOL", "Cognee evidence is outside the requested scope")
             if dataset_name is not None and (not text(dataset_name) or dataset_name not in self._dataset_names):
                 raise DomainError("MEMORY_PROTOCOL", "Cognee evidence is outside the requested scope")
@@ -145,14 +151,8 @@ class CogneeMemoryStore(CogneeDocuments):
             if identifier in seen:
                 raise DomainError("MEMORY_PROTOCOL", "Duplicate Cognee evidence")
             seen.add(identifier)
-            origin = metadata.get("document_name")
-            if origin is not None and (not text(origin) or len(origin) > 512):
-                raise DomainError("MEMORY_PROTOCOL", "Invalid Cognee source document name")
-            locators = {"data_id": metadata["data_id"], "datasets": self._dataset_names}
-            citation = "cognee://" + quote(self.source_id, safe="") + "/" + quote(identifier, safe="") + "?" + urlencode(locators, doseq=True)
-            records.append(MemoryRecord(MemoryRef(self.source_id, identifier), self.kind, "knowledge", VisibleText(row["text"]),
-                                        citation, origin=origin))
-        return tuple(records)
+            identifiers.append(_uuid(metadata["data_id"]))
+        return tuple(dict.fromkeys(identifiers))
 
     def Close(self):
         self._http.Close()

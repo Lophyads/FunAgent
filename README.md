@@ -128,7 +128,7 @@ flowchart TD
     Valid -->|否| Fallback["对启用且授权的分支按原问题降级"]
     Needs --> Facts{"需要事实召回？"}
     Fallback --> Facts
-    Facts -->|是| FactsQuery["查询 facts 来源中的 note / episode"]
+    Facts -->|是| FactsQuery["查询 facts 策略配置的 note / episode 来源"]
     Facts -->|否| FactsSkip["事实分支标记 skipped"]
     FactsQuery --> Knowledge{"需要知识召回？"}
     FactsSkip --> Knowledge
@@ -147,7 +147,7 @@ flowchart TD
 | 分支 | 查询与预算 | 结果如何使用 |
 | --- | --- | --- |
 | 用户画像 `profile` | 独立的来源、条数、字符数与超时配置 | 首次初始化时进入冻结的系统提示 |
-| 长期事实 `facts` | 每轮至多一个去重后的查询，限定 `note/episode`，按来源授权检索 | 作为带引用的长期事实证据附加到本轮请求 |
+| 长期事实 `facts` 策略 | 每轮至多一个去重后的查询，限定 `note/episode`，按来源授权检索 | 作为带引用的长期事实证据附加到本轮请求 |
 | 参考知识 `knowledge` | 查询文本、变体与原问题去重后，按 `max_queries` 限制为 1–3 次 | 作为参考资料附加到本轮请求 |
 
 各分支按完整渲染后的字符数和记录数裁剪，长正文保留 `truncated` 标记；来源状态和安全 `warnings` 随结果传递。来源失败或子预算耗尽可留下部分结果，父任务取消或总期限耗尽则终止本轮。注入后的消息仅供本次模型请求使用，持久历史仍保存原始用户输入。
@@ -448,7 +448,7 @@ uv run --locked --extra openai funagent --conf-dir ./demo-conf
 | 策略 | 数据用途 | 运行方式 |
 | --- | --- | --- |
 | `profile` | 用户画像、稳定偏好 | 会话首次提示初始化时读取并冻结；新会话可读取更新后的画像 |
-| `facts` | `note` / `episode` 等长期事实 | 按本轮规划召回；显式 `memory` 工具读取最新存储 |
+| `facts` 策略分支 | `note` / `episode` 等长期事实 | 按本轮规划召回；具体后端由 `sources` 指定（根配置为 `supabase` 和 `cognee`） |
 | `knowledge` | 文档、参考知识 | 按本轮规划查询只读语义来源，支持去重与限次 |
 | `review` | 从已提交历史提取新事实 | 独立队列与工作线程，按 completed 轮次触发，保存处理水位 |
 
@@ -456,9 +456,12 @@ uv run --locked --extra openai funagent --conf-dir ./demo-conf
 
 - **SQLite：** 本地事实存储，支持关键词、FTS5 / BM25、中文匹配回退和时间筛选。
 - **Supabase：** 通过项目 RPC 存储事实，配合独立 Embedding HTTP 驱动进行向量化与精确余弦检索；写入和版本更新由 RPC 提交。
+- **Cognee：** 独立 HTTP 长期笔记驱动，仅存储和检索 `episodic/note` 记录；通过 `CHUNKS` / `CHUNKS_LEXICAL` 排序并归并完整笔记，与 SQLite、Supabase 共用检索输入输出协议。单个数据集名称在驱动内部映射 UUID；[配置与限制](docs/Cognee记忆驱动.md)。
 - **MCP / HTTP callback：** 只读知识来源；MCP 查询可借用启动时已连接的工具后端。
 
 开启事实来源后，需要在 `tool.conf` 配置相应的 `memory.<source_id>.read/write` 权限，并为相关用途选择 `memory` 工具。主模型的 `replace/remove` 需要单次批准和 `expected_version`；后台复盘只允许 `list/search/add`。CLI / Web 管理端的改删使用独立确认挑战，绑定记录、版本与修改内容。
+
+Web 的 Memory 页面可选择已配置来源，导入 UTF-8 Markdown、分页查看记录并编辑或删除。单篇文档保存为一条知识记录；[使用与验收说明](docs/Web记忆管理使用说明.md)。
 
 复盘启用且未指定频率时，默认每 10 个 completed 用户轮触发；`every_turns = 0` 关闭自动触发。离线快速开始关闭了记忆召回与复盘，真实接入可参考根目录 `memory.conf` 的策略结构和 [当前 API](docs/api-reference.md)。
 
@@ -546,9 +549,9 @@ uv build --out-dir dist
 uv run --no-sync python -X utf8 check_memory_endpoint.py --conf-dir .
 ```
 
-脚本读取所选目录的 `memory.conf` 和 `.env`，进程环境变量优先；默认检查 `facts`，可用 `--source` 指定其他来源，或用 `--timeout 10` 调整单次 HTTP 超时。仅执行读取，输出错误码与函数签名，不展示凭据或记忆正文。退出码 `0` 表示两个读取 RPC 均通过，`1` 表示远端检查失败，`2` 表示本地配置错误。检查不包含 embedding、向量检索或写入能力；依赖使用项目现有的 `python-dotenv` 和 `supabase` extra 中的 `httpx`。
+脚本读取所选目录的 `memory.conf` 和 `.env`，进程环境变量优先；默认检查 `supabase`，可用 `--source` 指定其他来源，或用 `--timeout 10` 调整单次 HTTP 超时。仅执行读取，输出错误码与函数签名，不展示凭据或记忆正文。退出码 `0` 表示两个读取 RPC 均通过，`1` 表示远端检查失败，`2` 表示本地配置错误。检查不包含 embedding、向量检索或写入能力；依赖使用项目现有的 `python-dotenv` 和 `supabase` extra 中的 `httpx`。
 
-当前运行模型为单机、单应用进程、一个主任务工作线程及可选的一个复盘工作线程。主任务队列在进程内，持久化用于保存结果和修复中断状态；不提供分布式调度、跨进程接管或重启后自动重放任务。取消是合作式取消，关闭时需要等待实际 IO 和借用归还。
+当前运行模型为单机、单应用进程，一个主任务工作线程、一个 Eval 工作线程及可选的一个复盘工作线程。主任务队列在进程内，持久化用于保存结果和修复中断状态；不提供分布式调度、跨进程接管或重启后自动重放任务。取消是合作式取消，关闭时需要等待实际 IO 和借用归还。
 
 旧项目 API、配置和数据库 schema 没有自动迁移入口，已有历史库的迁移需单独处理。架构图列出的外部能力是否可用，取决于配置、权限、可选依赖和服务准备情况。
 
@@ -562,3 +565,21 @@ uv run --no-sync python -X utf8 check_memory_endpoint.py --conf-dir .
 | `CAPACITY` | 当前准入容量已满，等待任务完成或取消任务 |
 | 根配置启动时 RAG 失败 | 检查独立解释器、`cwd`、服务依赖与 MCP 启动输出 |
 | 页面刷新后过程信息缺失 | 最终历史与任务状态可从主库读取；重启前的临时事件缓冲不持久化 |
+
+## 在线记忆 Eval
+
+Web 侧边栏的 **Eval** 页面支持单问题、多来源检索与 LLM 评分。选择有管理端读取权限的来源和每来源 Top-K（1–20，最多 8 个来源）后开始评测。各来源独立保留召回内容和引用，展示检索耗时、评分耗时、逐条相关性、整体回答支持度及判定理由。召回内容先显示，评分随后更新；空召回、超时和评分失败分别展示，评分失败仍保留证据。
+
+默认使用 `serv.conf` 的 `model_profile` 作为评测模型；也可以在 `[options]` 中设置：
+
+```toml
+eval_model_profile = "primary" # 必须是 model.conf 中已定义的 profile
+eval_source_timeout = 30       # 每个来源的检索超时，秒
+eval_judge_timeout = 60        # 每个来源的评测超时，秒
+```
+
+LLM 评分衡量召回内容对回答的支持程度，不代表有参考标注的事实准确率。单条相关性为 0–3 分，整体支持度为 0–4 分并转换为百分制；最多使用每来源 16000 字符的记忆正文，截断情况和实际评测输入可查看。评测禁用工具、使用临时模型上下文，独立于聊天任务和离线 Eval 的数据导入。离线 `demo` 模型不会产生真实评测分数，需要配置可用的 LLM。
+
+结果保存在配置目录的 `.funagent/eval.sqlite3`，最近 50 条可从页面重新打开。刷新或重启后完成结果保留；未完成任务标记为中断，不自动重跑。接口为 `GET /eval/options`、`POST /eval/runs`、`GET /eval/runs` 和 `GET /eval/runs/{run_id}`。提交请求可携带 32 位小写十六进制 `request_key`，相同输入的重试复用同一任务。
+
+离线回归用例位于 `evals/tests/test_online_eval.py`，浏览器验收可运行 `node evals/tests/web_acceptance.cjs`（需要 Playwright；Windows 默认使用已安装的 Chrome，可通过 `EVAL_BROWSER_CHANNEL` 指定其他浏览器）。验收仅使用临时 SQLite 来源和测试模型，不访问真实记忆服务。

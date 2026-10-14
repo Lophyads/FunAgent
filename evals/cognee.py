@@ -1,11 +1,12 @@
 """Eval owns ingestion; retrieval uses the application's read-only driver."""
 from dataclasses import asdict
-from urllib.parse import parse_qs, urlsplit
+from hashlib import sha256
 from uuid import UUID
 
 from src.frame.contracts import DomainError
 from src.memory.cognee import CogneeMemoryStore, Headers, ValidateSettings
 from src.memory.contracts import MemoryQuery
+from src.memory.cognee_documents import _pack
 from src.memory.transport import JSONHTTP
 from .dataset import Encode
 
@@ -48,7 +49,10 @@ class CogneeBackend:
         result = self._http.Request("POST", "/remember", context,
             data={"datasetId": self.dataset_id, "run_in_background": "true", "self_improvement": "false",
                   "external_metadata": Encode([{"eval_item_id": i["id"]} for i in items])},
-            files=[("data", (i["id"] + ".txt", i["text"].encode("utf8"), "text/plain")) for i in items])
+            files=[("data", ("funagent-" + sha256((self.space + ":" + i["id"]).encode()).hexdigest() + ".txt",
+                _pack(i["text"], {"source_id": "eval", "write_key": i["id"], "type": "note",
+                                 "evidence": ["eval:" + self.space + "/" + i["id"]], "origin": i["id"] + ".txt"}),
+                "text/plain")) for i in items])
         if not isinstance(result, dict) or result.get("status") not in {"running", "completed", "errored"}:
             raise DomainError("EVAL_PROTOCOL", "Invalid Cognee ingestion response")
         if result.get("dataset_id") is not None and _uuid(result["dataset_id"]) != self.dataset_id:
@@ -110,8 +114,7 @@ class CogneeBackend:
         result = self.store.Search(MemoryQuery(text=text, source_ids=("eval",), limit=limit), context)
         evidence = []
         for record in result.records:
-            data_ids = parse_qs(urlsplit(record.citation).query).get("data_id", [])
-            item = self._mapping.get(_uuid(data_ids[0])) if len(data_ids) == 1 else None
+            item = self._mapping.get(record.ref.record_id)
             evidence.append({"record_id": record.ref.record_id, "item_ids": [item] if item else [],
                              "text": record.content, "citation": record.citation,
                              "unmapped": item is None, "truncated": record.truncated})

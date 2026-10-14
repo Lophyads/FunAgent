@@ -420,7 +420,9 @@ def _validate(docs):
     else:
         _text(serv_options["database"], "serv.options.database")
     _refs([serv_options["model_profile"]], profiles, "serv.options.model_profile")
-    for key in ("max_iterations", "task_timeout", "interaction_timeout"):
+    if "eval_model_profile" in serv_options:
+        _refs([serv_options["eval_model_profile"]], profiles, "serv.options.eval_model_profile")
+    for key in ("max_iterations", "task_timeout", "interaction_timeout", "eval_source_timeout", "eval_judge_timeout"):
         if key in serv_options:
             _number(serv_options[key], f"serv.options.{key}", strict=True, integer=key == "max_iterations")
     if "system_prompt" in serv_options:

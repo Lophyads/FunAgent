@@ -16,7 +16,7 @@ from ..frame.interaction_mgr import InteractionMgr
 from ..frame.clarification import QuestionData
 from ..frame.event_mgr import EventMgr
 from .request_validation import Fields as _fields, Text as _text
-from . import memory_routes, diagnostic_service, data_routes, trace_routes
+from . import memory_routes, diagnostic_service, data_routes, trace_routes, eval_routes
 from ..frame.web_projection import TaskView
 
 
@@ -103,6 +103,8 @@ class HTTPController:
             return 200, diagnostic_service.Read(route.removeprefix("/diagnostics/"))
         if route.startswith("/memory/"):
             return memory_routes.Handle(method, route, query, body)
+        if route.startswith("/eval/"):
+            return eval_routes.Handle(method, route, query, body)
         if route.startswith("/data/"):
             return data_routes.Handle(method, route, query)
         if route in {'/traces', '/trace-sessions'} or re.fullmatch(r'/tasks/[^/]+/trace(?:/[^/]+)?', route):
@@ -179,10 +181,10 @@ def _json_object(pairs):
     return result
 
 
-ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "favicon.svg",
+ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "eval.css", "favicon.svg",
                "components/chat.js", "components/ui.js", "pages/catalog.js", "pages/data.js", "pages/memory.js",
                "pages/overview.js", "pages/overview-model.js", "pages/observability.js",
-               "pages/observability-model.js", "components/trace-detail.js")
+               "pages/observability-model.js", "components/trace-detail.js", "pages/eval.js")
 ASSETS = {"/" + name: (name, {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
                               ".svg": "image/svg+xml"}[Path(name).suffix] + "; charset=utf-8") for name in ASSET_NAMES}
 ASSETS["/"] = ASSETS["/index.html"]

@@ -53,9 +53,11 @@ export function mount(root,{store,api}) {
     render(true);
   }
   function changeTarget(nextSource,nextKind){
-    sourceId=nextSource;kind=source()?.kind==='semantic'?'knowledge':nextKind;
+    sourceId=nextSource;
+    const kinds=source()?.store==='cognee'?['note']:source()?.kind==='semantic'?['knowledge']:Object.keys(labels);
+    kind=kinds.includes(nextKind)?nextKind:kinds[0];
     store.ui('memorySourceId',sourceId);store.ui('memoryKind',kind);
-    selector.replaceChildren(...(source()?.kind==='semantic'?['knowledge']:Object.keys(labels)).map(value=>el('option',{value,text:labels[value]})));
+    selector.replaceChildren(...kinds.map(value=>el('option',{value,text:labels[value]})));
     selector.value=kind;sourceSelector.value=sourceId;search.value='';loadError=null;generation++;
     entries.signature=null;render(true);load();
   }
@@ -77,8 +79,9 @@ export function mount(root,{store,api}) {
       try{content=new TextDecoder('utf-8',{fatal:true}).decode(await selected.arrayBuffer());}catch{throw new Error('文档必须使用 UTF-8 编码。');}
       if(!content.trim()||content.length>65536)throw new Error('文档内容为空或超过长度上限。');
       if(disposed)return;
-      changeTarget(sourceId,'knowledge');
-      setDraft({action:'add',type:'knowledge',content,subject:selected.name.replace(/\.md$/i,''),origin:selected.name,event_at:'',imported:true});
+      const importedKind=source()?.store==='cognee'?'note':'knowledge';
+      changeTarget(sourceId,importedKind);
+      setDraft({action:'add',type:recordTypes[importedKind],content,subject:selected.name.replace(/\.md$/i,''),origin:selected.name,event_at:'',imported:true});
       notify('文档已载入，点击“导入文档”保存至所选记忆库。');
     }catch(error){if(!disposed)notify(error.message,true);}
     finally{importing=false;if(!disposed)render(true);}
@@ -137,7 +140,7 @@ export function mount(root,{store,api}) {
     const readonly=d.action==='view'||!can(d.action==='replace'?'update':'write');
     title.textContent=d.action==='view'?'查看检索结果':d.action==='replace'?'编辑'+(labels[Object.keys(recordTypes).find(k=>recordTypes[k]===d.type)]||'条目'):d.imported?'导入 Markdown':'新增条目';
     version.textContent=d.id?'来源 '+sourceId+' · 记录 '+d.id+' · 版本 '+(d.expected_version||'只读'):selected?'目标：'+sourceId:'请先配置可读取的记忆来源';
-    scope.textContent=[selected?.source_description,selected?.store==='cognee'?'列表范围：FunAgent 管理的文档；其他资料可通过搜索查看。':''].filter(Boolean).join(' · ');
+    scope.textContent=[selected?.source_description,selected?.store==='cognee'?'仅管理和检索本项目的长期笔记。':''].filter(Boolean).join(' · ');
     conflict.hidden=!(d.conflict||changed);adopt.disabled=busy()||!latest?.version;saveAsNew.disabled=busy()||!can('write');
     for(const [node,key] of [[textarea,'content'],[subject,'subject'],[origin,'origin'],[eventDate,'event_at']]){
       if(force||document.activeElement!==node)node.value=d[key]||'';

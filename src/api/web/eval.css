@@ -1,0 +1,51 @@
+.eval-page .page-header{margin-bottom:20px}
+.eval-form{display:grid;gap:12px;margin-bottom:24px}
+.eval-form>label{font-weight:600}
+.eval-form textarea{min-height:95px}
+.eval-form-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.eval-form-row input[type=number]{width:76px}
+.eval-source-choices{display:flex;flex-wrap:wrap;gap:8px}
+.eval-source-choice{padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);cursor:pointer}
+.eval-source-choice:has(input:checked){border-color:var(--accent);background:var(--accent-wash)}
+.eval-source-choice input{accent-color:var(--accent)}
+.eval-source-choice span{overflow-wrap:anywhere}
+.eval-model,.eval-feedback{font-size:12px;margin:0}
+.eval-feedback:empty{display:none}
+.eval-results:empty{display:none}
+.eval-result-header,.eval-source-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.eval-result-question{font-size:16px;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:14px}
+.eval-run-meta,.eval-score-note{font-size:12px;overflow-wrap:anywhere}
+.eval-table-scroll{overflow-x:auto;border:1px solid var(--border);border-radius:10px;margin:16px 0}
+.eval-comparison{min-width:560px;width:100%;border-collapse:collapse;background:var(--surface)}
+.eval-comparison th,.eval-comparison td{padding:12px;text-align:left;border-bottom:1px solid var(--border);font-size:12px}
+.eval-comparison th{color:var(--muted);font-weight:500}
+.eval-comparison tbody tr:last-child td{border-bottom:0}
+.eval-score{color:var(--accent);font-weight:600;white-space:nowrap}
+.eval-state.completed{color:var(--accent)}
+.eval-state.failed,.eval-state.timeout,.eval-state.interrupted{color:var(--red)}
+.eval-state.partial,.eval-state.running{color:var(--warn)}
+.eval-source-results{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
+.eval-source-result{min-width:0}
+.eval-source-header h3{font-size:16px;overflow-wrap:anywhere}
+.eval-grade-summary{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin:14px 0 8px}
+.eval-grade-summary strong{font-size:24px;color:var(--accent);font-weight:500}
+.eval-grade-summary span{font-size:12px;color:var(--muted)}
+.eval-judge-reason,.eval-record-reason{font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}
+.eval-record{border-top:1px solid var(--border);padding:8px 0;margin-top:8px}
+.eval-record summary{display:flex;justify-content:space-between;gap:14px;align-items:baseline}
+.eval-record summary strong{font-size:13px;color:var(--text);overflow-wrap:anywhere}
+.eval-record summary span{font-size:12px;white-space:nowrap}
+.eval-record-meta{display:block;font-size:11px;overflow-wrap:anywhere}
+.eval-record-content{max-height:380px;margin-bottom:8px}
+.eval-truncation{color:var(--warn)}
+.eval-error{color:var(--red);font-size:13px;overflow-wrap:anywhere}
+.eval-input{margin-top:12px;font-size:12px}
+.eval-input pre{max-height:320px}
+.eval-history-card{margin-top:24px}
+.eval-history-card>p{font-size:12px}
+.eval-history{display:grid;gap:8px;max-height:380px;overflow:auto}
+.eval-history-item{display:grid;gap:5px;text-align:left;padding:12px;background:var(--bg);min-width:0}
+.eval-history-item.selected{border-color:var(--accent);background:var(--accent-wash)}
+.eval-history-question{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.eval-history-item small{font-size:11px}
+@media(max-width:850px){.eval-form-row{gap:10px}.eval-source-choice{font-size:12px;padding:7px 9px}.eval-comparison th,.eval-comparison td{padding:9px}}

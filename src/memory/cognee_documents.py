@@ -60,18 +60,6 @@ def _unpack(raw):
         raise DomainError("MEMORY_PROTOCOL", "Invalid FunAgent Cognee document") from None
 
 
-def VisibleText(value):
-    """Keep the storage footer out of short chunks returned by recall."""
-    content, separator, suffix = value.rpartition("\n" + MARKER)
-    if separator and suffix.endswith(" -->"):
-        try:
-            _unpack((content + separator + suffix).encode("utf8"))
-            return content
-        except DomainError:
-            pass
-    return value
-
-
 class CogneeDocuments:
     """Mixin: management resolves one public dataset name to a private UUID."""
 
@@ -108,7 +96,7 @@ class CogneeDocuments:
             raise DomainError("MEMORY_PROTOCOL", "Cognee data is outside the requested dataset")
         raw = self._raw(identifier, context)
         content, data = _unpack(raw)
-        if data.get("source_id") != self.source_id or not text(data.get("write_key")):
+        if data.get("source_id") != self.source_id or data.get("type") != "note" or not text(data.get("write_key")):
             return None
         try:
             validate_content(content, data.get("evidence"), data.get("type"))
@@ -169,7 +157,8 @@ class CogneeDocuments:
 
     @staticmethod
     def _matches(record, query):
-        return (query.type is None or record.type == query.type) and (
+        return (getattr(query, "type", None) is None or record.type == query.type) and (
+            not getattr(query, "types", ()) or record.type in query.types) and (
             query.subject is None or record.subject == query.subject) and (
             query.origin is None or record.origin == query.origin) and (
             query.event_from is None or record.event_at is not None and record.event_at >= timestamp(query.event_from)) and (
@@ -177,8 +166,8 @@ class CogneeDocuments:
 
     def Write(self, draft, context):
         validate_content(draft.content, draft.evidence, draft.type)
-        if draft.type != "knowledge":
-            raise DomainError("UNSUPPORTED", "Cognee stores managed knowledge documents")
+        if draft.type != "note":
+            raise DomainError("UNSUPPORTED", "Cognee stores only note memories")
         subject, event_at, origin = validate_metadata(draft.subject, draft.event_at, draft.origin)
         if draft.source_id != self.source_id or not text(draft.write_key):
             raise DomainError("INVALID_REQUEST", "Invalid memory write identity")
@@ -228,8 +217,8 @@ class CogneeDocuments:
                 old = self._current(ref, expected_version, child)
                 category = old.type if patch.type is None else patch.type
                 validate_content(patch.content, patch.evidence, category)
-                if category != "knowledge":
-                    raise DomainError("UNSUPPORTED", "Cognee stores managed knowledge documents")
+                if category != "note":
+                    raise DomainError("UNSUPPORTED", "Cognee stores only note memories")
                 subject, event_at, origin = validate_metadata(*(getattr(old, key) if getattr(patch, key) is UNSET
                                                                 else getattr(patch, key) for key in ("subject", "event_at", "origin")))
                 raw = self._raw(old.ref.record_id, child)

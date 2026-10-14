@@ -7,6 +7,10 @@ from ..api.diagnostics_mgr import DiagnosticsMgr
 from ..api.diagnostic_service import DiagnosticService
 from ..api.http_server import HttpServer
 from ..api.log_reader import LogReader
+from ..eval.eval_mgr import EvalMgr
+from ..eval.judge import RetrievalJudge
+from ..eval.repository import EvalRepository
+from ..eval.service import EvalService
 from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError
 from ..frame.environment import Environment
@@ -84,6 +88,14 @@ def Start(conf_dir):
         memory = (CreateMemory(conf, conf_dir, owner.Own, backends=backends) if required else CreateMemory(conf, conf_dir, owner.Own))
         owner.Bind(MemoryMgr, memory)
         owner.Bind(MemoryOperationsMgr, MemoryOperations(memory, conf))
+        eval_profile = conf.Model().Profile(options.get("eval_model_profile", options["model_profile"]))
+        evaluations = EvalService(memory, MemoryOperationsMgr.GetInstance(), conf.Tool().Access("management"),
+            owner.Own(EvalRepository(conf_dir / ".funagent" / "eval.sqlite3")),
+            RetrievalJudge(ModelRuntime.GetInstance(), eval_profile),
+            source_timeout=options.get("eval_source_timeout", 30),
+            judge_timeout=options.get("eval_judge_timeout", eval_profile.timeout), start_worker=False)
+        owner.Bind(EvalMgr, evaluations, worker=True)
+        evaluations.Start()
         if review.get("enabled", False) and review.get("sources"):
             owner.Own(ReviewScheduler, ReviewScheduler.Close)
             ReviewScheduler.Initialize(review.get("capacity", 16), executor=ReviewProcess, start_worker=False)
@@ -128,7 +140,7 @@ def Stop():
         # Public test/embedding assembly uses the same drain path. Its bound
         # managers retain their existing ownership of stores and providers.
         _lifecycle = Lifecycle()
-        for manager in (ConfMgr, ObservationMgr, ToolMgr, ModelRuntime, DbMgr, MemoryMgr, MemoryOperationsMgr, DiagnosticsMgr, InteractionMgr, EventMgr, ReviewScheduler, TaskMgr):
+        for manager in (ConfMgr, ObservationMgr, ToolMgr, ModelRuntime, DbMgr, MemoryMgr, MemoryOperationsMgr, DiagnosticsMgr, InteractionMgr, EventMgr, ReviewScheduler, TaskMgr, EvalMgr):
             try:
                 instance = manager.GetInstance()
             except DomainError as error:
@@ -137,7 +149,7 @@ def Stop():
             else:
                 if manager is ObservationMgr and instance is ObservationMgr._null:
                     continue
-                _lifecycle.TrackBinding(manager, instance, worker=manager in (TaskMgr, ReviewScheduler))
+                _lifecycle.TrackBinding(manager, instance, worker=manager in (TaskMgr, ReviewScheduler, EvalMgr))
         if _http_server is not None:
             _lifecycle.HTTP(_http_server)
     try:

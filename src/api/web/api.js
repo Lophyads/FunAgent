@@ -21,6 +21,10 @@ export class ApiClient {
   traceSessions({limit=50,offset=0,signal}={}){return this.wire(`/trace-sessions?limit=${limit}&offset=${offset}`,{signal});}
   traceOverview({sessionId,unassigned=false,limit=50,offset=0,signal}={}){const query=new URLSearchParams({view:'overview',limit,offset});if(unassigned)query.set('unassigned','1');else if(sessionId)query.set('session_id',sessionId);return this.wire(`/traces?${query}`,{signal});}
   traceReview(taskId,{signal}={}){return this.wire(`/tasks/${encodeURIComponent(taskId)}/trace`,{signal});}
+  evalOptions({signal}={}){return this.wire('/eval/options',{signal});}
+  evalRuns({signal}={}){return this.wire('/eval/runs',{signal});}
+  evalRun(runId,{signal}={}){return this.wire(`/eval/runs/${encodeURIComponent(runId)}`,{signal});}
+  createEval(body){return this.wire('/eval/runs',{method:'POST',body:JSON.stringify(body)});}
   async request(path,options={}){
     // Logical page resources are translated here; no legacy HTTP routes exist.
     if(path.startsWith('/api/data/'))return this.wire(path.slice(4),options);

@@ -24,6 +24,8 @@ def Create(conf, own, *, tool_dispatch, journal, events=None):
     from .runtime import Runtime
     profiles, providers, adapters = {}, {}, {}
     pending = [conf.Serv().Options()["model_profile"]]
+    if "eval_model_profile" in conf.Serv().Options():
+        pending.append(conf.Serv().Options()["eval_model_profile"])
     for purpose in ("review", "recall"):
         policy = conf.Memory().Policy(purpose)
         active = (any(conf.Memory().Policy(branch).get("enabled", False) and conf.Memory().Policy(branch).get("sources")
