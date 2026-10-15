@@ -65,7 +65,7 @@ class JSONHTTP:
                         context.CheckCancelled()
                         size += len(part)
                         if size > 2 * 1024 * 1024:
-                            raise DomainError(self._protocol, "Memory response is too large")
+                            raise DomainError('INSPECTION_TOO_LARGE' if self._protocol == 'INSPECTION_PROTOCOL' else self._protocol, "Memory response is too large")
                         parts.append(part)
                     context.CheckCancelled()
                     body = b"".join(parts)
@@ -87,6 +87,9 @@ class JSONHTTP:
                 raise
             except (ValueError, UnicodeError):
                 raise DomainError(self._protocol, "Invalid memory response") from None
+            except self._httpx.TimeoutException:
+                context.CheckCancelled()
+                raise DomainError('INSPECTION_TIMEOUT' if self._source == 'INSPECTION_SOURCE' else self._source, "Memory request timed out") from None
             except Exception:
                 context.CheckCancelled()
                 raise DomainError(self._source, "Memory connection failed") from None

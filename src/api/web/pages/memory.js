@@ -1,5 +1,6 @@
 import {el,button,pageHeader,notify,errorBox} from '../components/ui.js';
 import {dateLabel} from '../api.js';
+import {mountInspection} from '../components/memory-datasets.js';
 
 const labels={all:'全部',user:'用户事实',note:'长期笔记',episode:'历史事件',knowledge:'知识文档'};
 const recordTypes={user:'profile',note:'note',episode:'episode',knowledge:'knowledge'};
@@ -10,7 +11,7 @@ export function mount(root,{store,api}) {
   const sourceSelector=el('select',{'aria-label':'记忆库'},el('option',{text:'加载记忆库…',value:''}));
   const selector=el('select',{'aria-label':'记忆类型'});
   const file=el('input',{type:'file',accept:'.md',hidden:true,'aria-label':'Markdown 文件'});
-  const upload=button('导入 Markdown',()=>file.click()),refresh=button('刷新',()=>load());
+  const upload=button('导入 Markdown',()=>file.click()),refresh=button('刷新',()=>{if(['data','graph'].includes(store.get().ui.memoryInspectionTab)&&source()?.inspection)inspection.refresh();else load();});
   pageHeader(root,'Memory','选择记忆库，导入知识文档或管理已有记录。',sourceSelector,selector,upload,refresh);
   root.classList.add('memory-page');
   const scope=el('p',{class:'muted memory-scope'});
@@ -34,6 +35,9 @@ export function mount(root,{store,api}) {
   root.append(file,scope,el('div',{class:'two-columns memory-layout'},
     el('section',{class:'card'},el('div',{class:'actions memory-search'},search,searchButton),newEntry,count,entries,more),
     el('section',{class:'card memory-panel'},title,version,conflict,subject,origin,eventDate,textarea,status,el('div',{class:'actions'},remove,save))));
+  const layout=root.querySelector('.memory-layout');layout.id='memory-panel-records';layout.setAttribute('role','tabpanel');layout.setAttribute('aria-labelledby','memory-tab-records');
+  const inspectionRoot=el('div');layout.before(inspectionRoot);
+  const inspection=mountInspection(inspectionRoot,{store,api,onTab:tab=>{const browsing=tab!=='records';layout.hidden=selector.hidden=upload.hidden=scope.hidden=browsing;}});
 
   function source(){return sources.find(item=>item.source_id===sourceId);}
   function target(){return JSON.stringify([sourceId,kind]);}
@@ -60,6 +64,7 @@ export function mount(root,{store,api}) {
     selector.replaceChildren(...kinds.map(value=>el('option',{value,text:labels[value]})));
     selector.value=kind;sourceSelector.value=sourceId;search.value='';loadError=null;generation++;
     entries.signature=null;render(true);load();
+    inspection.setSource(source());
   }
   for(const [node,key] of [[textarea,'content'],[subject,'subject'],[origin,'origin'],[eventDate,'event_at']])
     node.addEventListener('input',()=>setDraft({...draft(),request_key:undefined,uncertain:false,failure:undefined,uncertain_action:undefined,reconciled:undefined,[key]:node.value}));
@@ -116,6 +121,7 @@ export function mount(root,{store,api}) {
       if(result.declined){if(!disposed)notify('已放弃操作');return;}
       const next=action==='remove'?emptyDraft():recordDraft({...result,event_timestamp:result.event_at,event_at:dateLabel(result.event_at)});
       store.draft('memoryByTarget',own,next);
+      inspection.invalidate();
       if(!disposed){search.value='';notify(action==='remove'?'记忆已删除':'记忆已保存');await load();}
     }catch(error){
       if(error.status===409||error.status===404){store.draft('memoryByTarget',own,{...store.get().drafts.memoryByTarget[own],conflict:true,
@@ -135,6 +141,7 @@ export function mount(root,{store,api}) {
   }
 
   function render(force=false){
+    inspection.busy(busy());
     const d=draft(),value=page(),selected=source(),latest=!value?.readonly&&value?.entries.find(entry=>entry.id===d.id);
     const changed=d.action==='replace'&&latest&&latest.version!==d.expected_version;
     const readonly=d.action==='view'||!can(d.action==='replace'?'update':'write');
@@ -183,5 +190,5 @@ export function mount(root,{store,api}) {
     }catch(error){if(!disposed){sourceSelector.replaceChildren(el('option',{value:'',text:'来源读取失败'}));render();entries.replaceChildren(errorBox(error.message,()=>initialize()));}}
   }
   render();initialize();
-  return ()=>{disposed=true;generation++;unsubscribe();unsubscribeDraft();window.removeEventListener('focus',focus);root.classList.remove('memory-page');};
+  return ()=>{disposed=true;generation++;inspection.close();unsubscribe();unsubscribeDraft();window.removeEventListener('focus',focus);root.classList.remove('memory-page');};
 }

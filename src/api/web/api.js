@@ -65,6 +65,7 @@ export class ApiClient {
         if(['snapshot','reset','turn.finished'].includes(item.kind)||item.kind.startsWith('interaction.'))this.interactions().catch(()=>{});
         if(item.kind==='turn.finished')this.sessions().catch(()=>{});}});});}
   memorySources(){return this.wire('/memory/sources');}
+  inspectMemory(operation,params,{signal}={}){return this.wire(`/memory/cognee/${operation}?${new URLSearchParams(params)}`,{signal});}
   async readMemory(source,kind,params=new URLSearchParams()){
     const search=params.get('q'),capabilities=source.capabilities||[];
     if(!search&&!capabilities.includes('list'))return {entries:[],next_cursor:null,no_list:true};

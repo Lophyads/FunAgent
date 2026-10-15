@@ -30,8 +30,9 @@ def ManagementRecord(record):
 
 
 class MemoryOperations:
-    def __init__(self, memory, conf, *, clock=time.monotonic):
+    def __init__(self, memory, conf, *, clock=time.monotonic, inspection=None):
         self._memory = memory
+        self._inspection = inspection
         self._sources = conf.Memory().Sources()
         self._facts = tuple(conf.Memory().Policy('facts').get('sources', ()))
         self._access = conf.Tool().Access("management")
@@ -54,13 +55,25 @@ class MemoryOperations:
         return [{"source_id": name, "kind": source["kind"], "store": source.get("store", "unknown"),
                  "source_description": source.get("source_description", ""),
                  "capabilities": list(source.get("capabilities", ("search",))),
-                 "writable": self._token(name, True) in self._access}
+                 "writable": self._token(name, True) in self._access,
+                 **({'inspection': list(self._inspection.capabilities)} if self._inspection and self._inspection.Supports(name) else {})}
                 for name, source in self._sources.items() if self._token(name) in self._access]
 
     def DefaultSource(self):
         self._context()
         return next((name for name in self._facts if self._sources[name]['kind'] == 'episodic'
                      and self._token(name) in self._access), None)
+
+    @_management
+    def Inspect(self, operation, query):
+        context = self._context()
+        if self._inspection is None:
+            raise DomainError('UNSUPPORTED', 'Inspection unavailable')
+        return self._inspection.Read(operation, query, context)
+
+    def _invalidate(self, source):
+        if self._inspection is not None:
+            self._inspection.Invalidate(source)
 
     def _token(self, name, write=False):
         return self._sources[name].get("write_access" if write else "read_access",
@@ -85,7 +98,9 @@ class MemoryOperations:
         identity = hashlib.sha256((draft.source_id + ':' + request_key).encode()).hexdigest() if request_key else None
         context = self._context(identity)
         draft = replace(draft, write_key="management:" + context.run_id, evidence=context.memory_evidence)
-        return ManagementRecord(self._memory.Write(draft, context))
+        result = ManagementRecord(self._memory.Write(draft, context))
+        self._invalidate(draft.source_id)
+        return result
 
     @_management
     def Request(self, action, ref, expected_version, patch=None):
@@ -166,8 +181,11 @@ class MemoryOperations:
             if Outcome(action, context.purpose) != "approval":
                 raise DomainError("DENIED", "Memory action no longer allowed")
             if action == "replace":
-                return ManagementRecord(self._memory.Update(ref, replace(patch, evidence=context.memory_evidence), version, context))
+                result = ManagementRecord(self._memory.Update(ref, replace(patch, evidence=context.memory_evidence), version, context))
+                self._invalidate(ref.source_id)
+                return result
             self._memory.Delete(ref, version, context)
+            self._invalidate(ref.source_id)
             return {"deleted": True}
 
     def Close(self):

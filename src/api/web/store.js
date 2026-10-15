@@ -3,7 +3,7 @@ export function createStore() {
   let saved={};try{saved=JSON.parse(globalThis.localStorage?.getItem('funagent.webDrafts')||'{}');}catch{}
   const chatBySession={};for(const [sid,d]of Object.entries(saved.chat||{}))if(/^[A-Za-z0-9_-]{1,128}$/.test(sid)&&typeof d?.text==='string'&&d.text.length<=16000)
     chatBySession[sid]={...d,submitting:false,uncertain:!!(d.requestId&&d.pendingText)};
-  let state = {server: {sessions: [], messagesBySession: {}, turns: {}, interactions: [], memory: {}, data: {}, catalog: {}},
+  let state = {server: {sessions: [], messagesBySession: {}, turns: {}, interactions: [], memory: {}, memoryInspection: {}, data: {}, catalog: {}},
     ui: {activeSessionId: sessionStorage.getItem('funagent.session') || '', activePage: 'overview', connectionStatus: 'connecting'},
     drafts: {chatBySession, memoryByTarget: saved.memory||{}}};
   const subscriptions = new Set();

@@ -21,6 +21,10 @@ from ..frame.web_projection import TaskView
 
 
 ERRORS = {
+    'INSPECTION_TIMEOUT': (504, '浏览读取超时，请重试。'),
+    'INSPECTION_PROTOCOL': (502, '浏览服务响应无效。'),
+    'INSPECTION_TOO_LARGE': (502, '响应超过容量限制，请缩小图谱或仅查看文件元数据。'),
+    'INSPECTION_SOURCE': (502, '浏览服务连接失败，请重试。'),
     "INVALID_REQUEST": (400, "Invalid request."),
     "NOT_FOUND": (404, "Object or route not found."),
     "METHOD_NOT_ALLOWED": (405, "Method not allowed."),
@@ -181,7 +185,7 @@ def _json_object(pairs):
     return result
 
 
-ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "eval.css", "favicon.svg",
+ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "eval.css", "memory.css", "components/memory-datasets.js", "components/memory-graph.js", "components/memory-graph-model.js", "components/memory-graph-state.js", "components/memory-graph-renderer.js", "components/memory-graph-detail.js", "vendor/memory-graph-engine.js", "favicon.svg",
                "components/chat.js", "components/ui.js", "pages/catalog.js", "pages/data.js", "pages/memory.js",
                "pages/overview.js", "pages/overview-model.js", "pages/observability.js",
                "pages/observability-model.js", "components/trace-detail.js", "pages/eval.js")

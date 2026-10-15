@@ -62,6 +62,16 @@ def _cognee(source_id, settings, conf_dir):
 STORES["cognee"] = _cognee
 
 
+def CreateInspection(conf, own):
+    from .inspection import MemoryInspection
+    from .cognee_inspection import CogneeInspection
+    from .cognee_datasets import CogneeDataset
+    sources = conf.Memory().Sources()
+    adapters = {name: own(CogneeInspection(settings, name)) for name, settings in sources.items()
+                if settings.get('store') == 'cognee' and all(CogneeDataset.Find(n) for n in settings['datasets'])}
+    return own(MemoryInspection(sources, adapters))
+
+
 def RequiredBackends(conf):
     return tuple({s["backend_id"] for s in conf.Memory().Sources().values()
                   if s["store"] == "callback" and s["callback_id"] == "mcp"})

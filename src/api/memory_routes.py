@@ -29,6 +29,9 @@ def _query(query, *, search=False):
 
 
 def Handle(method, route, query, body):
+    if route.startswith('/memory/cognee/'):
+        from .memory_cognee_routes import Handle as Inspect
+        return Inspect(method, route, query, body)
     operations = MemoryOperationsMgr.GetInstance()
     if route in {"/memory/search", "/memory/records"} and method == "GET":
         value = _query(query, search=route.endswith("search"))

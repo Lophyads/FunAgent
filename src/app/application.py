@@ -21,7 +21,7 @@ from ..frame.log_session import LogSession
 from ..frame.review_scheduler import ReviewScheduler
 from ..memory.memory_mgr import MemoryMgr
 from ..memory.memory_operations_mgr import MemoryOperationsMgr
-from ..memory.factory import Create as CreateMemory, RequiredBackends
+from ..memory.factory import Create as CreateMemory, RequiredBackends, CreateInspection
 from ..memory.memory_operations import MemoryOperations
 from ..memory.review_process import ReviewProcess
 from ..model.model_runtime import ModelRuntime
@@ -87,7 +87,8 @@ def Start(conf_dir):
         InteractionMgr.Initialize(options.get("interaction_timeout", 120))
         memory = (CreateMemory(conf, conf_dir, owner.Own, backends=backends) if required else CreateMemory(conf, conf_dir, owner.Own))
         owner.Bind(MemoryMgr, memory)
-        owner.Bind(MemoryOperationsMgr, MemoryOperations(memory, conf))
+        inspection = CreateInspection(conf, owner.Own)
+        owner.Bind(MemoryOperationsMgr, MemoryOperations(memory, conf, inspection=inspection))
         eval_profile = conf.Model().Profile(options.get("eval_model_profile", options["model_profile"]))
         evaluations = EvalService(memory, MemoryOperationsMgr.GetInstance(), conf.Tool().Access("management"),
             owner.Own(EvalRepository(conf_dir / ".funagent" / "eval.sqlite3")),
