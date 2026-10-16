@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Lock
 from types import MappingProxyType
 import tomllib
+from urllib.parse import urlsplit
 
 from .contracts import DomainError, freeze
 from ..observability.contracts import DEFAULTS as OBSERVABILITY_DEFAULTS
@@ -77,7 +78,8 @@ class _TomlModelConf(ModelConf):
         self._profiles = MappingProxyType({
             key: ModelProfile(key, value["provider_id"], value["adapter_id"],
                               value["model"], value["timeout"], value.get("max_retries", 0),
-                              tuple(value.get("fallback_profiles", ())), value.get("streaming", False))
+                              tuple(value.get("fallback_profiles", ())), value.get("streaming", False),
+                              value.get("task", "chat"))
             for key, value in data["profiles"].items()
         })
 
@@ -134,7 +136,7 @@ class _TomlMemoryConf(MemoryConf):
         return self._data.get("topics", super().Topics())
 
     def Policy(self, purpose):
-        if purpose in {"profile", "facts", "knowledge"}:
+        if purpose in {"profile", "facts", "knowledge", "rerank"}:
             return self._data.get("policies", {}).get(purpose, MappingProxyType({"enabled": False, "sources": ()}))
         try:
             return self._data["policies"][purpose]
@@ -210,6 +212,15 @@ def _validate(docs):
     for provider in providers.values():
         _require(isinstance(provider, dict), "model.providers")
         _text(provider["kind"], "model.providers.kind")
+        if provider["kind"] == "http_json":
+            _require(set(provider) <= {"kind", "endpoint", "credential_env"}, "model.providers.http_json")
+            _text(provider["endpoint"], "model.providers.endpoint")
+            endpoint = urlsplit(provider["endpoint"])
+            _require(endpoint.scheme in {"http", "https"} and bool(endpoint.hostname) and
+                     endpoint.username is None and endpoint.password is None and not endpoint.fragment,
+                     "model.providers.endpoint")
+            if "credential_env" in provider:
+                _text(provider["credential_env"], "model.providers.credential_env")
     for profile in profiles.values():
         _require(isinstance(profile, dict), "model.profiles")
         _refs([profile["provider_id"]], providers, "model.profiles.provider_id")
@@ -220,6 +231,15 @@ def _validate(docs):
         _require(type(profile.get("streaming", False)) is bool, "model.profiles.streaming")
         _refs(_names(profile.get("fallback_profiles", []), "model.profiles.fallback_profiles"),
               profiles, "model.profiles.fallback_profiles")
+        task = profile.get("task", "chat")
+        _require(task in {"chat", "rerank"}, "model.profiles.task")
+        _require((task == "rerank") == (profile["adapter_id"] == "tei_rerank"), "model.profiles.adapter_id")
+        if task == "rerank":
+            _require(providers[profile["provider_id"]]["kind"] == "http_json", "model.profiles.provider_id")
+            _require(not profile.get("streaming", False) and profile.get("max_retries", 0) == 0 and
+                     not profile.get("fallback_profiles", []), "model.profiles.rerank")
+        _require(all(profiles[name].get("task", "chat") == task for name in profile.get("fallback_profiles", [])),
+                 "model.profiles.fallback_profiles")
     definitions = _table(tool, "tools", "tool.tools")
     backends = _table(tool, "backends", "tool.backends")
     for backend in backends.values():
@@ -362,10 +382,19 @@ def _validate(docs):
         _require(isinstance(policy, dict), "memory.policies")
         if purpose == "recall":
             _require(set(policy) <= {"profile", "timeout", "history_max_chars", "input_max_chars"}, "memory.policies.recall")
+        if purpose == "rerank":
+            _require(set(policy) <= {"enabled", "profile"}, "memory.policies.rerank")
+            if policy.get("enabled", False):
+                _require("profile" in policy, "memory.policies.rerank.profile")
         if purpose in {"profile", "facts", "knowledge"}:
-            _require(set(policy) <= {"enabled", "sources", "max_records", "max_chars", "timeout", "max_queries"}, "memory.policies")
+            allowed = {"enabled", "sources", "max_records", "max_chars", "timeout", "max_queries"}
+            if purpose in {"facts", "knowledge"}:
+                allowed |= {"candidate_limit", "min_score"}
+            _require(set(policy) <= allowed, "memory.policies")
         if "profile" in policy:
             _refs([policy["profile"]], profiles, "memory.policies.profile")
+            _require(profiles[policy["profile"]].get("task", "chat") ==
+                     ("rerank" if purpose == "rerank" else "chat"), "memory.policies.profile.task")
         _refs(_names(policy.get("sources", []), "memory.policies.sources"), sources, "memory.policies.sources")
         if "enabled" in policy:
             _require(type(policy["enabled"]) is bool, "memory.policies.enabled")
@@ -394,6 +423,12 @@ def _validate(docs):
         if "max_queries" in policy:
             _number(policy["max_queries"], "memory.policies.max_queries", strict=True, integer=True)
             _require(policy["max_queries"] <= 3, "memory.policies.max_queries")
+        if "candidate_limit" in policy:
+            _number(policy["candidate_limit"], "memory.policies.candidate_limit", integer=True, strict=True)
+            _require(policy["candidate_limit"] <= 100, "memory.policies.candidate_limit")
+        if "min_score" in policy:
+            _number(policy["min_score"], "memory.policies.min_score")
+            _require(policy["min_score"] <= 1, "memory.policies.min_score")
         if "history_max_chars" in policy:
             _number(policy["history_max_chars"], "memory.policies.history_max_chars", integer=True, minimum=256)
         if "input_max_chars" in policy:
@@ -432,8 +467,10 @@ def _validate(docs):
     else:
         _text(serv_options["database"], "serv.options.database")
     _refs([serv_options["model_profile"]], profiles, "serv.options.model_profile")
+    _require(profiles[serv_options["model_profile"]].get("task", "chat") == "chat", "serv.options.model_profile.task")
     if "eval_model_profile" in serv_options:
         _refs([serv_options["eval_model_profile"]], profiles, "serv.options.eval_model_profile")
+        _require(profiles[serv_options["eval_model_profile"]].get("task", "chat") == "chat", "serv.options.eval_model_profile.task")
     for key in ("max_iterations", "task_timeout", "interaction_timeout", "eval_source_timeout", "eval_judge_timeout"):
         if key in serv_options:
             _number(serv_options[key], f"serv.options.{key}", strict=True, integer=key == "max_iterations")

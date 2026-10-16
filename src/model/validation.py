@@ -6,6 +6,34 @@ from math import isfinite
 from ..frame.contracts import ModelReply, ToolCall, thaw
 from ..frame.tool_validator import ToolValidator
 from .protocols import ModelError
+from .contracts import RerankRequest, RerankResult
+
+
+def ValidateRerankRequest(request):
+    if (not isinstance(request, RerankRequest) or not isinstance(request.question, str)
+            or not request.question.strip() or len(request.question) > 8000
+            or not isinstance(request.texts, tuple) or not request.texts
+            or any(not isinstance(text, str) or not text.strip() or len(text) > 65536
+                   for text in request.texts)):
+        raise ModelError('INVALID_REQUEST')
+    return request
+
+
+def ValidateScores(scores):
+    if (not isinstance(scores, tuple) or not scores
+            or any(type(score) not in (int, float) or not 0 <= score <= 1 or not isfinite(score)
+                   for score in scores)):
+        raise ModelError('PROTOCOL')
+    return scores
+
+
+def ValidateRerankResult(result, count):
+    if not isinstance(result, RerankResult):
+        raise ModelError('PROTOCOL')
+    ValidateScores(result.scores)
+    if len(result.scores) != count:
+        raise ModelError('PROTOCOL')
+    return result
 
 
 def _json_value(value):

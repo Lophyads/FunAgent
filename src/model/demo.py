@@ -1,11 +1,11 @@
 """Explicit offline demo driver, without network or external effects."""
 from uuid import uuid4
 import json
-from ..frame.contracts import ModelReply, ToolCall
+from ..frame.contracts import ModelReply, ModelRequest, ToolCall
 from .protocols import Adapter, ProviderRequest, ProviderResponse
 
 
-class DemoAdapter(Adapter):
+class DemoAdapter(Adapter[ModelRequest, ModelReply]):
     @staticmethod
     def Encode(request, profile):
         return ProviderRequest(request)

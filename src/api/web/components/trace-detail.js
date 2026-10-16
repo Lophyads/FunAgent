@@ -75,7 +75,7 @@ function eventList(model,node) {
       for(const event of events.slice(count,count+100)){
         const name=model.nodes.get(event.span_id)?.name||event.name||event.span_id;
         const row=el('details',{class:'obs-event-row'},el('summary',{class:'obs-event'},el('span',{text:`#${event.seq}`}),el('span',{text:eventText(event.operation)}),el('span',{text:`${name}${event.status?` · ${resultText(event.status)}`:''}`}),el('span',{text:seconds(node.started_at==null?null:(event.occurred_at-node.started_at)*1000)})));
-        row.addEventListener('toggle',()=>{if(!row.open||row.dataset.loaded)return;row.dataset.loaded='true';const snapshot={...event,name};const io=exchange(model.trace,snapshot);if(io)row.append(el('div',{class:'obs-event-body'},io));row.append(rawDetails('事件字段',event));});
+        row.addEventListener('toggle',()=>{if(!row.open||row.dataset.loaded)return;row.dataset.loaded='true';const snapshot={kind:model.nodes.get(event.span_id)?.kind,...event,name};const io=exchange(model.trace,snapshot);if(io)row.append(el('div',{class:'obs-event-body'},io));row.append(rawDetails('事件字段',event));});
         list.append(row);
       }
       count+=100;more.hidden=count>=events.length;
@@ -131,6 +131,7 @@ export function savedInfo(model) {
   if(review.collection_state==='pending')box.append(el('p',{class:'obs-notice',text:'运行中的已保存版本，可通过刷新读取最新快照。'}));
   if(!review.io_complete)box.append(el('p',{class:'obs-notice',text:'交互内容有缺口，请结合截断标记和读取诊断查看。'}));
   box.append(el('p',{text:`已知 Token：${summary.known_total_tokens??'未知'} · 主模型：${summary.main_model_tokens??'未知'} · 用量未知调用：${summary.unknown_usage_calls??'未知'}`}));
+  if(summary.rerank?.count)box.append(el('p',{text:`重排评分：${summary.rerank.count} 次 · 已知耗时 ${seconds(summary.rerank.duration_ms)} · 耗时未知 ${summary.rerank.unknown_duration_count} 次`}));
   const waitLabels={'task.queue_wait':'排队','model.retry_wait':'模型重试','interaction.wait':'人工等待'};
   for(const [name,value] of Object.entries(summary.waits||{}))box.append(el('p',{text:`${waitLabels[name]||name}：${value.count} 次 · 已知耗时 ${seconds(value.duration_ms)} · 耗时未知 ${value.unknown_duration_count} 次`}));
   if(model.root){

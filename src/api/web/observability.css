@@ -42,7 +42,7 @@ body:has(.shell.obs-detail-wide) #chat-toggle{display:none}
 .obs-detail-header h2{font-size:24px;letter-spacing:-.04em}
 .obs-conversation{padding:22px 25px;margin-bottom:12px}
 .obs-conversation p{margin:4px 0 0;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;max-width:72ch}
-.obs-detail-metrics{grid-template-columns:repeat(3,minmax(0,1fr));padding:20px 25px;margin-bottom:25px}
+.obs-detail-metrics{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));padding:20px 25px;margin-bottom:25px}
 .obs-detail-metrics .obs-metric strong{font-size:24px}
 .obs-stages{padding:22px 0 0;overflow:hidden}
 .obs-stages .obs-section-heading{padding:0 25px;margin-bottom:16px;align-items:start}

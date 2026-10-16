@@ -30,6 +30,7 @@ def TurnOverview(trace):
     loops = [n for n in main.values() if n['name'] == 'agent.iteration']
     tools = [n for n in main.values() if n['name'] == 'tool.call' or n['kind'] == 'tool']
     retrievals = [n for n in nodes.values() if n['name'] == 'memory.search']
+    reranks = [n for n in nodes.values() if n['name'] == 'model.attempt' and n['kind'] == 'rerank']
     root = trace.get('root') or {}
     saved = trace.get('payloads', {}).get(root.get('input_ref'), {}).get('data')
     text = next((saved[key].strip() for key in ('text', 'content')
@@ -40,6 +41,7 @@ def TurnOverview(trace):
     return dict(user_preview=text[:160] if text else None, user_preview_truncated=bool(text and len(text) > 160),
                 duration_ms=duration if valid_duration else None, ended=root.get('ended_at') is not None,
                 retrieval=dict(success=success(retrievals), total=len(retrievals)),
+                rerank=dict(success=sum(n['status'] == 'accepted' for n in reranks), total=len(reranks)),
                 loops=dict(completed=sum(n['status'] in {'completed', 'succeeded'} for n in loops), total=len(loops)),
                 tools=dict(success=success(tools), total=len(tools)))
 
@@ -57,6 +59,7 @@ def SessionSummary(items):
 def Summary(root, orphan_nodes=()):
     known = main = unknown = 0
     waits = {}
+    rerank = dict(count=0, duration_ms=0, unknown_duration_count=0)
     for node in TraceNodes(dict(root=root, orphan_nodes=orphan_nodes)):
         if node['name'] in {'task.queue_wait', 'model.retry_wait', 'interaction.wait'}:
             wait = waits.setdefault(node['name'], dict(count=0, duration_ms=0, unknown_duration_count=0))
@@ -66,7 +69,14 @@ def Summary(root, orphan_nodes=()):
                 wait['duration_ms'] += duration
             else:
                 wait['unknown_duration_count'] += 1
-        if node['kind'] not in {'generation', 'embedding'}:
+        if node['name'] == 'model.attempt' and node['kind'] == 'rerank':
+            rerank['count'] += 1
+            duration = node.get('duration_ms')
+            if type(duration) in (int, float) and isfinite(duration) and duration >= 0:
+                rerank['duration_ms'] += duration
+            else:
+                rerank['unknown_duration_count'] += 1
+        if node['kind'] not in {'generation', 'embedding', 'rerank'}:
             continue
         usage = node.get('usage') or {}
         if node.get('usage_status') == 'unknown' or not usage:
@@ -87,4 +97,4 @@ def Summary(root, orphan_nodes=()):
         if node['kind'] == 'generation' and node.get('purpose', 'main') == 'main':
             main += total
     return dict(known_total_tokens=known, main_model_tokens=main, unknown_usage_calls=unknown,
-                duration_ms=root.get('duration_ms') if root else None, waits=waits)
+                duration_ms=root.get('duration_ms') if root else None, waits=waits, rerank=rerank)

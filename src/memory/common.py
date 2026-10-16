@@ -1,8 +1,15 @@
-"""Small validation and controlled connection locking shared by two stores."""
+"""Validation, record identity and controlled connection locking shared by memory."""
 import unicodedata
 from datetime import datetime, timezone
 
 from ..frame.contracts import DomainError, controlled_lock
+from .contracts import MemoryRecord
+
+
+def RecordIdentity(record: MemoryRecord) -> tuple:
+    """Identify a candidate by its reference, version and unmodified semantic values."""
+    return (record.ref, record.version, record.content, record.kind, record.type,
+            record.subject, record.event_at, record.deleted, record.truncated)
 
 
 def text(value):

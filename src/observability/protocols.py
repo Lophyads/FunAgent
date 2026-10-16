@@ -18,6 +18,11 @@ class ExportSink(Protocol):
 
 
 class ObservationAccess(Protocol):
+    """Scope kind describes physical work (including rerank model attempts).
+
+    Logical model.rank scopes retain the default span kind, so summaries and
+    external-call lists count the physical attempts only.
+    """
     def PrepareInput(self, projection): ...
     def Bind(self, key): ...
     def Diagnose(self, code, task_id=None): ...

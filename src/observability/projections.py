@@ -76,6 +76,30 @@ def Memory(result):
                 queries=[Query(q) for q in islice(getattr(result, 'queries', ()), 129)])
 
 
+def Candidates(records):
+    from ..memory.prompt import RecordData
+    return [dict(index=index, **RecordData(record)) for index, record in enumerate(records)]
+
+
+def Deduplication(records, representatives, duplicates):
+    from ..memory.common import RecordIdentity
+    from ..memory.prompt import RecordData
+    identities = {}
+    for index, record in enumerate(records):
+        identities.setdefault((record.ref, record.version), {}).setdefault(
+            RecordIdentity(record), dict(index=index, **RecordData(record)))
+    return dict(representatives=Candidates(representatives),
+                duplicate_groups=[[RecordData(record) for record in group] for group in duplicates],
+                identity_conflicts=[list(group.values()) for group in identities.values() if len(group) > 1])
+
+
+def ScoredCandidates(records, scores, selected):
+    from ..memory.common import RecordIdentity
+    items = {RecordIdentity(record): dict(item, score=score)
+             for record, item, score in zip(records, Candidates(records), scores)}
+    return [items[RecordIdentity(record)] for record in selected]
+
+
 def Plan(plan):
     return {key: getattr(plan, key) for key in ('need_memory', 'need_knowledge', 'memory_query',
                                              'knowledge_query', 'variant', 'degraded', 'warnings')}

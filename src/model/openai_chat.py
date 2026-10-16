@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from threading import Condition, Event, Thread, Lock
 
-from ..frame.contracts import ControlError, DomainError, ModelReply, ToolCall, thaw
+from ..frame.contracts import ControlError, DomainError, ModelReply, ModelRequest, ToolCall, thaw
 from .protocols import Adapter, ModelError, ProviderRequest, ProviderResponse
 from .retry import RetryAfter
 from .validation import ValidateReply
@@ -29,7 +29,7 @@ def _reject_constant(value):
 
 
 
-class OpenAIChatAdapter(Adapter):
+class OpenAIChatAdapter(Adapter[ModelRequest, ModelReply]):
     @staticmethod
     def Encode(request, profile):
         messages = []

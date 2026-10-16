@@ -2,17 +2,19 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any, Generic, Protocol, TypeVar
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 
-from .contracts import ModelProfile
+from .contracts import ModelProfile, RerankRequest, RerankResult
 from ..frame.contracts import DomainError, ModelReply, ModelRequest, RunContext, RunInput, RunResult
 from ..tool.contracts import ToolSelectionRequest
 
 
 class Runner(Protocol):
     def Run(self, input: RunInput, strategy: type["ModelStrategy"], context: RunContext) -> RunResult: ...
+
+    def Rank(self, request: RerankRequest, profile_id: str, context: RunContext) -> RerankResult: ...
 
 
 @dataclass(frozen=True)
@@ -69,14 +71,18 @@ class StreamingAdapter(Protocol):
     def NewStream(self): ...
 
 
-class Adapter(ABC):
+RequestT = TypeVar('RequestT')
+ResultT = TypeVar('ResultT')
+
+
+class Adapter(Generic[RequestT, ResultT], ABC):
     @staticmethod
     @abstractmethod
-    def Encode(request: ModelRequest, profile: ModelProfile) -> ProviderRequest: ...
+    def Encode(request: RequestT, profile: ModelProfile) -> ProviderRequest: ...
 
     @staticmethod
     @abstractmethod
-    def Decode(response: ProviderResponse) -> ModelReply: ...
+    def Decode(response: ProviderResponse) -> ResultT: ...
 
 
 @dataclass(frozen=True)

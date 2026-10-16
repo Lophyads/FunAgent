@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import MappingProxyType
 import time
 
-from .contracts import ModelProfile, RunEvent
+from .contracts import ModelProfile, RerankRequest, RerankResult, RunEvent
 from ..frame.contracts import (
     ControlError, DomainError, Message, ModelRequest,
     RunContext, RunInput, RunResult, ToolResult, RecordScope,
@@ -13,7 +13,7 @@ from ..tool.protocols import ToolDispatch
 from ..persistence.protocols import RunJournal
 from .protocols import Adapter, FallbackRule, ModelError, ModelStrategy, Provider
 from .retry import Backoff, Wait
-from .validation import ValidateReply
+from .validation import ValidateReply, ValidateRerankRequest, ValidateRerankResult
 from ..frame.protocols import RunEventWriter, NullEventWriter
 from ..observability.observation_mgr import ObservationMgr
 from ..observability.projections import (Request, Wire, Usage, Reply, RunOutput, Messages, StreamHasOutput,
@@ -39,10 +39,47 @@ class Runtime:
     def Inspect(self):
         return [{"profile_id": profile.profile_id, "provider_id": profile.provider_id,
                  "adapter_id": profile.adapter_id, "model": profile.model, "timeout": profile.timeout,
-                 "streaming": profile.streaming,
+                 "streaming": profile.streaming, "task": profile.task,
                  "streaming_available": callable(getattr(self._providers[profile.provider_id], "Stream", None)),
                  "max_retries": profile.max_retries, "fallback_profiles": list(profile.fallback_profiles)}
                 for profile in self._profiles.values()]
+
+    def Rank(self, request: RerankRequest, profile_id: str, context: RunContext) -> RerankResult:
+        """Score in fixed batches under one deadline, returning no partial result."""
+        context.CheckCancelled()
+        ValidateRerankRequest(request)
+        if profile_id not in self._profiles:
+            raise DomainError('CONFIG_REFERENCE', 'Unknown scoring profile')
+        profile = self._profiles[profile_id]
+        if profile.task != 'rerank':
+            raise DomainError('INVALID_REQUEST', 'Selected profile does not support scoring')
+        if profile.streaming or profile.max_retries != 0 or profile.fallback_profiles:
+            raise DomainError('CONFIG_INVALID', 'Scoring requires a single non-streaming route')
+        deadline = time.monotonic() + profile.timeout
+        if context.deadline is not None:
+            deadline = min(deadline, context.deadline)
+        child = replace(context, deadline=deadline)
+        mgr = ObservationMgr.GetInstance()
+        counts = {'attempts': 0}
+        with mgr.Scope('model.rank', input=lambda: dict(question=request.question, texts=request.texts),
+                       profile_id=profile.profile_id, model=profile.model, input_count=len(request.texts)):
+            scores = []
+            try:
+                for offset in range(0, len(request.texts), 32):
+                    child.CheckCancelled()
+                    batch = RerankRequest(request.question, request.texts[offset:offset + 32])
+                    result = self._invoke(batch, profile, child, counts,
+                                          lambda result: ValidateRerankResult(result, len(batch.texts)))
+                    scores.extend(result.scores)
+            except ControlError:
+                context.CheckCancelled()
+                raise ModelError('TIMEOUT') from None
+            except ModelError:
+                context.CheckCancelled()
+                raise
+            result = RerankResult(tuple(scores), profile.profile_id, profile.model)
+            mgr.Complete(output=lambda: dict(scores=result.scores), attempts=counts['attempts'])
+            return result
 
     def _emit(self, context, counts, kind, payload=None, *, iteration=None):
         if context.purpose != 'main' or not context.task_id:
@@ -70,99 +107,113 @@ class Runtime:
         if error:
             raise DomainError("CLOSE_FAILED", "Provider close failed") from None
 
+    def _invoke(self, request, profile, context, counts, validate):
+        """One Encode/IO/Decode attempt; routing and task validation stay with callers."""
+        mgr = ObservationMgr.GetInstance()
+        adapter = self._adapters[profile.adapter_id]
+        context.CheckCancelled()
+        # Re-encode every attempt, including profile/adapter changes.
+        with mgr.Scope('model.encode', input=lambda: (Request(request) if profile.task == 'chat' else
+                       dict(question=request.question, texts=request.texts)), profile_id=profile.profile_id):
+            try:
+                encoded = adapter.Encode(request, profile)
+            except (ModelError, ControlError):
+                raise
+            except Exception:
+                raise ModelError('PROTOCOL') from None
+            mgr.Complete(output=lambda: Wire(encoded.payload))
+        deadline = time.monotonic() + profile.timeout
+        if context.deadline is not None:
+            deadline = min(deadline, context.deadline)
+        attempt_context = replace(context, deadline=deadline)
+        attempt_context.CheckCancelled()
+        counts["attempts"] += 1
+        if profile.task == 'chat':
+            self._emit(context, counts, 'attempt_started', {'profile_id': profile.profile_id})
+        provider = self._providers[profile.provider_id]
+        if profile.streaming:
+            if not callable(getattr(provider, 'Stream', None)) or not callable(getattr(adapter, 'NewStream', None)):
+                raise DomainError('UNSUPPORTED', 'Selected model does not support streaming')
+            try:
+                accumulator = adapter.NewStream()
+            except (DomainError, ControlError):
+                raise
+            except Exception:
+                raise ModelError('PROVIDER_FATAL') from None
+        with mgr.Scope('model.attempt', kind='generation' if profile.task == 'chat' else 'rerank',
+                       input=lambda: Wire(encoded.payload),
+                       usage_status='unknown', accepted=False, profile_id=profile.profile_id,
+                       provider_id=profile.provider_id, model=profile.model, streaming=profile.streaming,
+                       attempt_id=counts['attempts']):
+            try:
+                if profile.streaming:
+                    first_output = None
+                    received_usage = None
+                    unprocessed = None
+                    try:
+                        with provider.Stream(encoded, attempt_context) as packets:
+                            for packet in packets:
+                                # Capture receipt before the next control/protocol check.
+                                unprocessed = packet.payload
+                                if isinstance(packet.payload, Mapping) and packet.payload.get('usage') is not None:
+                                    received_usage = packet.payload['usage']
+                                if first_output is None and StreamHasOutput(packet.payload):
+                                    first_output = time.time()
+                                attempt_context.CheckCancelled()
+                                text = accumulator.Add(packet)
+                                unprocessed = None
+                                if text:
+                                    self._emit(context, counts, 'text_delta', {'text': text})
+                        reply = accumulator.Finish()
+                    finally:
+                        snapshot = getattr(accumulator, 'Snapshot', None)
+                        def partial():
+                            value = snapshot() if callable(snapshot) else {'snapshot_unavailable': True}
+                            if unprocessed is not None:
+                                value = dict(value, received_unprocessed=Wire(unprocessed))
+                            return value
+                        mgr.Update(output=partial, usage=lambda: received_usage or {},
+                                   **({'first_output_at': first_output} if first_output is not None else {}))
+                else:
+                    response = provider.Send(encoded, attempt_context)
+                    mgr.Update(output=lambda: (Wire(response.payload) if profile.task == 'chat' else response.payload),
+                               usage=lambda: Usage(response.payload),
+                               response_received=True)
+            except (DomainError, ControlError):
+                raise
+            except Exception:
+                raise ModelError("PROVIDER_FATAL") from None
+            context.CheckCancelled()
+            attempt_context.CheckCancelled()
+            try:
+                if not profile.streaming:
+                    reply = adapter.Decode(response)
+                reply = validate(reply)
+            except (ModelError, ControlError):
+                raise
+            except Exception:
+                raise ModelError("PROTOCOL") from None
+            context.CheckCancelled()
+            attempt_context.CheckCancelled()
+            mgr.Complete(status='accepted', accepted=True,
+                         decoded_reply=lambda: (Reply(reply) if profile.task == 'chat' else dict(scores=reply.scores)),
+                         usage=lambda: getattr(reply, 'usage', {}))
+            if profile.task == 'chat':
+                self._emit(context, counts, 'attempt_accepted', {'text': reply.content or '', 'profile_id': profile.profile_id})
+            return reply
+
     def _send(self, request, route, active, rule, context, counts, seen):
         mgr = ObservationMgr.GetInstance()
         last = None
         for index in range(active, len(route)):
             profile = self._profiles[route[index]]
             counts["profile_id"] = profile.profile_id
-            adapter = self._adapters[profile.adapter_id]
             for retry in range(profile.max_retries + 1):
                 context.CheckCancelled()
                 try:
-                    # Re-encode every attempt, including profile/adapter changes.
-                    with mgr.Scope('model.encode', input=lambda: Request(request), profile_id=profile.profile_id):
-                        try:
-                            encoded = adapter.Encode(request, profile)
-                        except (ModelError, ControlError):
-                            raise
-                        except Exception:
-                            raise ModelError('PROTOCOL') from None
-                        mgr.Complete(output=lambda: Wire(encoded.payload))
-                    deadline = time.monotonic() + profile.timeout
-                    if context.deadline is not None:
-                        deadline = min(deadline, context.deadline)
-                    attempt_context = replace(context, deadline=deadline)
-                    attempt_context.CheckCancelled()
-                    counts["attempts"] += 1
-                    self._emit(context, counts, 'attempt_started', {'profile_id': profile.profile_id})
-                    provider = self._providers[profile.provider_id]
-                    if profile.streaming:
-                        if not callable(getattr(provider, 'Stream', None)) or not callable(getattr(adapter, 'NewStream', None)):
-                            raise DomainError('UNSUPPORTED', 'Selected model does not support streaming')
-                        try:
-                            accumulator = adapter.NewStream()
-                        except (DomainError, ControlError):
-                            raise
-                        except Exception:
-                            raise ModelError('PROVIDER_FATAL') from None
-                    with mgr.Scope('model.attempt', kind='generation', input=lambda: Wire(encoded.payload),
-                                   usage_status='unknown', accepted=False, profile_id=profile.profile_id,
-                                   provider_id=profile.provider_id, model=profile.model, streaming=profile.streaming,
-                                   attempt_id=counts['attempts']):
-                        try:
-                            if profile.streaming:
-                                first_output = None
-                                received_usage = None
-                                unprocessed = None
-                                try:
-                                    with provider.Stream(encoded, attempt_context) as packets:
-                                        for packet in packets:
-                                            # Capture receipt before the next control/protocol check.
-                                            unprocessed = packet.payload
-                                            if isinstance(packet.payload, Mapping) and packet.payload.get('usage') is not None:
-                                                received_usage = packet.payload['usage']
-                                            if first_output is None and StreamHasOutput(packet.payload):
-                                                first_output = time.time()
-                                            attempt_context.CheckCancelled()
-                                            text = accumulator.Add(packet)
-                                            unprocessed = None
-                                            if text:
-                                                self._emit(context, counts, 'text_delta', {'text': text})
-                                    reply = accumulator.Finish()
-                                finally:
-                                    snapshot = getattr(accumulator, 'Snapshot', None)
-                                    def partial():
-                                        value = snapshot() if callable(snapshot) else {'snapshot_unavailable': True}
-                                        if unprocessed is not None:
-                                            value = dict(value, received_unprocessed=Wire(unprocessed))
-                                        return value
-                                    mgr.Update(output=partial, usage=lambda: received_usage or {},
-                                               **({'first_output_at': first_output} if first_output is not None else {}))
-                            else:
-                                response = provider.Send(encoded, attempt_context)
-                                mgr.Update(output=lambda: Wire(response.payload), usage=lambda: Usage(response.payload),
-                                           response_received=True)
-                        except (DomainError, ControlError):
-                            raise
-                        except Exception:
-                            raise ModelError("PROVIDER_FATAL") from None
-                        context.CheckCancelled()
-                        attempt_context.CheckCancelled()
-                        try:
-                            if not profile.streaming:
-                                reply = adapter.Decode(response)
-                            reply = ValidateReply(reply, seen, request.tools)
-                        except (ModelError, ControlError):
-                            raise
-                        except Exception:
-                            raise ModelError("PROTOCOL") from None
-                        context.CheckCancelled()
-                        attempt_context.CheckCancelled()
-                        mgr.Complete(status='accepted', accepted=True, decoded_reply=lambda: Reply(reply),
-                                     usage=lambda: reply.usage)
-                        self._emit(context, counts, 'attempt_accepted', {'text': reply.content or '', 'profile_id': profile.profile_id})
-                        return reply, index
+                    reply = self._invoke(request, profile, context, counts,
+                                         lambda reply: ValidateReply(reply, seen, request.tools))
+                    return reply, index
                 except ControlError:
                     self._emit(context, counts, 'attempt_reset', {'error_code': 'TIMEOUT'})
                     context.CheckCancelled()
@@ -225,6 +276,8 @@ class Runtime:
         if not set(rule.profile_ids) <= set(self._profiles[primary].fallback_profiles):
             raise DomainError("CONFIG_REFERENCE", "Fallback profile not configured")
         route = (primary, *rule.profile_ids)
+        if any(self._profiles[name].task != 'chat' for name in route):
+            raise DomainError('INVALID_REQUEST', 'Generation requires chat profiles')
         mgr.Update(route=route, max_iterations=maximum, strategy=strategy.__name__)
         dispatch = self._tool_dispatch
         from ..tool.contracts import ToolSelectionRequest

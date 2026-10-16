@@ -15,9 +15,23 @@ class ModelProfile:
     max_retries: int = 0
     fallback_profiles: tuple[str, ...] = ()
     streaming: bool = False
+    task: str = 'chat'
 
     def __post_init__(self):
         object.__setattr__(self, "fallback_profiles", tuple(self.fallback_profiles))
+
+
+@dataclass(frozen=True)
+class RerankRequest:
+    question: str
+    texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RerankResult:
+    scores: tuple[float, ...]
+    profile_id: str = ''
+    model: str = ''
 
 
 @dataclass(frozen=True)
