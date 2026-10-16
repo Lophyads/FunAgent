@@ -14,6 +14,11 @@ from .contracts import (
     MemoryRecord,
     MemoryRef,
     MemorySearchResult,
+    Topic,
+    TopicSnapshot,
+    TopicSelection,
+    TopicChange,
+    MemoryWriteReceipt,
 )
 from .protocols import (
     Embedder,
@@ -24,6 +29,9 @@ from .protocols import (
     MemoryWriter,
     ProfileReader,
     WritableMemoryStore,
+    TopicReader,
+    TopicCatalog,
+    MemoryTopicReader,
 )
 
 __all__ = [
@@ -48,4 +56,12 @@ __all__ = [
     "MemoryWriter",
     "ProfileReader",
     "WritableMemoryStore",
+    "Topic",
+    "TopicSnapshot",
+    "TopicSelection",
+    "TopicChange",
+    "MemoryWriteReceipt",
+    "TopicReader",
+    "TopicCatalog",
+    "MemoryTopicReader",
 ]

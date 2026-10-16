@@ -5,8 +5,10 @@ import time
 
 from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import ControlError, DomainError
-from .common import text, validate_query
-from .contracts import MemoryQuery, MemoryRecord, MemorySearchResult, UNSET
+from .common import text, validate_query, NormalizeTopicName
+from .contracts import (MemoryQuery, MemoryRecord, MemorySearchResult, MemoryWriteReceipt,
+                        TopicConflict, TopicSelection, TOPIC_SYNC_MESSAGE, UNSET)
+from .protocols import TopicCatalog
 from .policy import Outcome
 from ..observability.observation_mgr import ObservationMgr
 from ..observability.projections import Memory, Query
@@ -28,7 +30,7 @@ def _receipt(result):
 
 
 class MemoryManager:
-    def __init__(self, stores, *, owns_stores=True):
+    def __init__(self, stores, *, topics: TopicCatalog | None = None, owns_stores=True):
         sources = ConfMgr.GetInstance().Memory().Sources()
         if set(stores) != set(sources):
             raise DomainError("CONFIG_REFERENCE", "Invalid memory source bindings")
@@ -37,6 +39,70 @@ class MemoryManager:
                 raise DomainError("UNSUPPORTED", "Memory source requests unsupported capabilities")
         self._sources, self._stores = sources, MappingProxyType(dict(stores))
         self._owns_stores = owns_stores
+        self._topics = topics
+
+    def ReadTopics(self, source_ids, context):
+        """Read only after source/purpose authorization; never expose the JSON path."""
+        for name in source_ids:
+            self._authorize(name, "search", context)
+        if self._topics is None:
+            raise DomainError("NOT_READY", "Topic catalog is unavailable")
+        return tuple(self._topics.Snapshot(name) for name in dict.fromkeys(source_ids))
+
+    def _select_topic(self, source_id, selection):
+        if self._topics is None:
+            raise DomainError("NOT_READY", "Topic catalog is unavailable")
+        if not isinstance(selection, TopicSelection):
+            raise DomainError("INVALID_REQUEST", "Memory creation requires a topic")
+        if selection.topic_id is not None:
+            if selection.topic_id not in self._topics.Snapshot(source_id).topics:
+                raise DomainError("NOT_FOUND", "Topic does not exist in this source")
+            return selection.topic_id
+        try:
+            return self._topics.CreateTopic(source_id, selection.parent_id, selection.name, selection.description).topic.topic_id
+        except DomainError as error:
+            if error.code != "CONFLICT":
+                raise
+            # Concurrent review proposals reuse the winner without changing its description.
+            for topic in self._topics.Snapshot(source_id).topics.values():
+                if topic.parent_id == selection.parent_id and NormalizeTopicName(topic.name) == NormalizeTopicName(selection.name):
+                    return topic.topic_id
+            raise
+
+    def _sync_topic(self, source_id, record_id, topic_id=None, *, require_same=False):
+        if self._topics is None:
+            raise DomainError("NOT_READY", "Topic catalog is unavailable")
+        try:
+            if topic_id is None:
+                return self._topics.Unassign(source_id, record_id)
+            return self._assign_record(source_id, record_id, topic_id, require_same)
+        except TopicConflict:
+            if require_same:
+                raise
+            raise DomainError("TOPIC_SYNC_FAILED", TOPIC_SYNC_MESSAGE) from None
+        except Exception:
+            raise DomainError("TOPIC_SYNC_FAILED", TOPIC_SYNC_MESSAGE) from None
+
+    def _assign_record(self, source_id, record_id, topic_id, require_same):
+        # CAS prevents a concurrent human classification from being overwritten.
+        # Build the receipt from the CAS input, never from a later snapshot read.
+        for _ in range(8):
+            snapshot = self._topics.Snapshot(source_id)
+            current = snapshot.assignments.get(record_id)
+            if current is not None:
+                if require_same and current != topic_id:
+                    raise TopicConflict("This request already has a different topic; use the classification endpoint")
+                return snapshot
+            candidate = replace(snapshot, revision=snapshot.revision + 1,
+                                assignments=dict(snapshot.assignments) | {record_id: topic_id})
+            try:
+                revision = self._topics.Assign(source_id, record_id, topic_id, snapshot.revision)
+            except DomainError as error:
+                if error.code == "CONFLICT":
+                    continue
+                raise
+            return replace(candidate, revision=revision)
+        raise DomainError("MEMORY_STORAGE", "Topic catalog is busy; classification was not committed")
 
     def Close(self):
         if not self._owns_stores:
@@ -175,16 +241,22 @@ class MemoryManager:
             mgr.Complete(status='ok', output=lambda: _receipt(result))
             return result
 
-    def Write(self, draft, context):
+    def Write(self, draft, context, *, topic=None):
         mgr = ObservationMgr.GetInstance()
         with _scope(context, 'memory.operation', input=lambda: dict(operation='write', source_id=draft.source_id,
                     content=draft.content, evidence=draft.evidence, type=draft.type, write_key=draft.write_key,
                     subject=draft.subject, event_at=draft.event_at, origin=draft.origin)):
             store = self._authorize(draft.source_id, 'write', context)
             self._check_evidence(draft.evidence, context)
+            topic_id = self._select_topic(draft.source_id, topic)
             result = store.Write(draft, context)
+            mgr.Update(effect='known', response_received=True, output=lambda: _receipt(result))
+            if (not isinstance(result, MemoryRecord) or result.ref.source_id != draft.source_id
+                    or not text(result.ref.record_id) or len(result.ref.record_id) > 128):
+                raise DomainError("MEMORY_PROTOCOL", "Memory write returned an invalid receipt; verify the source before retrying")
+            snapshot = self._sync_topic(draft.source_id, result.ref.record_id, topic_id, require_same=context.purpose == "management")
             mgr.Complete(status='ok', output=lambda: _receipt(result), effect='known')
-            return result
+            return MemoryWriteReceipt(result, snapshot)
 
     def Update(self, ref, patch, expected_version, context):
         mgr = ObservationMgr.GetInstance()
@@ -211,7 +283,11 @@ class MemoryManager:
                                                            record_id=ref.record_id, expected_version=expected_version)):
             store = self._authorize(ref.source_id, 'delete', context)
             self._check_evidence(context.memory_evidence, context)
+            if self._topics is None:
+                raise DomainError("NOT_READY", "Topic catalog is unavailable")
             result = store.Delete(ref, expected_version, context)
+            mgr.Update(effect='known', response_received=True)
+            self._sync_topic(ref.source_id, ref.record_id)
             mgr.Complete(status='ok', output=lambda: _receipt(result), effect='known')
             return result
 

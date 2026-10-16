@@ -85,9 +85,16 @@ class CLIController:
         elif operation == "search":
             fields = rest.split(maxsplit=1)
             if len(fields) != 2:
-                raise DomainError("INVALID_REQUEST", "Use memory search <source|*> <text>")
+                raise DomainError("INVALID_REQUEST", "Use memory search <source> <text>")
             source, query = fields
-            value = manager.Search(MemoryQuery(query, () if source == "*" else (source,)))
+            value = manager.Search(MemoryQuery(query, (source,)))
+        elif operation == "topics":
+            value = manager.Topics(rest.strip())
+        elif operation == "create-topic":
+            fields = rest.split(maxsplit=3)
+            if len(fields) != 4:
+                raise DomainError("INVALID_REQUEST", "Use memory create-topic <source> <parent_id|null> <name> <description>")
+            value = manager.CreateTopic(fields[0], None if fields[1] == "null" else fields[1], fields[2], fields[3])
         elif operation == "list":
             fields = rest.split()
             if len(fields) not in {1, 2}:
@@ -102,10 +109,10 @@ class CLIController:
                     break
             value = {"records": records}
         elif operation == "write":
-            fields = rest.split(maxsplit=2)
-            if len(fields) != 3:
-                raise DomainError("INVALID_REQUEST", "Use memory write <source> <type> <content>")
-            value = manager.Write(MemoryDraft(fields[0], fields[2], "", (), fields[1]))
+            fields = rest.split(maxsplit=3)
+            if len(fields) != 4:
+                raise DomainError("INVALID_REQUEST", "Use memory write <source> <type> <topic_id> <content>")
+            value = manager.Write(MemoryDraft(fields[0], fields[3], "", (), fields[1]), topic_id=fields[2])
         elif operation == "update":
             fields = rest.split(maxsplit=3)
             if len(fields) != 4:

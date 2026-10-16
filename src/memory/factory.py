@@ -77,7 +77,13 @@ def RequiredBackends(conf):
                   if s["store"] == "callback" and s["callback_id"] == "mcp"})
 
 
-def Create(conf, conf_dir, own, *, backends=None):
+def CreateTopics(conf, conf_dir):
+    from .topic_catalog import JsonTopicCatalog
+    path = Path(conf.Memory().Topics().get("path", ".funagent/memory-topics.json"))
+    return JsonTopicCatalog(path if path.is_absolute() else Path(conf_dir) / path)
+
+
+def Create(conf, conf_dir, own, *, backends=None, topics=None):
     from .memory_manager import MemoryManager
     stores = {}
     for name, settings in conf.Memory().Sources().items():
@@ -93,4 +99,4 @@ def Create(conf, conf_dir, own, *, backends=None):
         if factory is None:
             raise DomainError("DRIVER_UNAVAILABLE", "Selected memory store is unavailable")
         stores[name] = own(factory(name, settings, conf_dir))
-    return MemoryManager(stores, owns_stores=False)
+    return MemoryManager(stores, topics=topics if topics is not None else CreateTopics(conf, conf_dir), owns_stores=False)

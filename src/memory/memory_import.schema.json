@@ -1,0 +1,103 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "topics",
+    "memories"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "dataset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*(?![\\s\\S])"
+    },
+    "topics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "parent_key",
+          "name",
+          "description"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*(?![\\s\\S])"
+          },
+          "parent_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*(?![\\s\\S])"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          }
+        }
+      }
+    },
+    "memories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "topic_key",
+          "type",
+          "content"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*(?![\\s\\S])"
+          },
+          "topic_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*(?![\\s\\S])"
+          },
+          "type": {
+            "const": "note"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536
+          }
+        }
+      }
+    }
+  }
+}

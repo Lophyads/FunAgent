@@ -18,6 +18,9 @@ from ..frame.event_mgr import EventMgr
 from .request_validation import Fields as _fields, Text as _text
 from . import memory_routes, diagnostic_service, data_routes, trace_routes, eval_routes
 from ..frame.web_projection import TaskView
+from ..memory.contracts import TopicConflict, TOPIC_SYNC_MESSAGE
+from ..memory.memory_import import ImportValidationError
+from .memory_import_upload import ParseUpload
 
 
 ERRORS = {
@@ -36,6 +39,7 @@ ERRORS = {
     "MANAGEMENT_STALE": (409, "This management change is no longer pending."),
     "MANAGEMENT_EXPIRED": (409, "This management change has expired."),
     "MEMORY_STORAGE": (500, "Memory operation failed."),
+    "TOPIC_SYNC_FAILED": (503, TOPIC_SYNC_MESSAGE),
     "EMBEDDING_SOURCE": (503, "文档向量化失败，尚未写入。请检查 embedding 服务、模型与超时配置。"),
     "EMBEDDING_PROTOCOL": (502, "向量化服务返回的数据无效，尚未写入。请检查 embedding 模型和向量维度。"),
     "CONFIG_CREDENTIAL": (401, "记忆服务认证失败，请检查服务端凭据配置。"),
@@ -85,7 +89,7 @@ def _page(query, kind):
 class HTTPController:
     @staticmethod
     def Handle(method, target, body=None):
-        if method not in {"GET", "POST"}:
+        if method not in {"GET", "POST", "PATCH", "DELETE"}:
             raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         try:
             parsed = urlsplit(target)
@@ -95,7 +99,7 @@ class HTTPController:
         if parsed.scheme or parsed.netloc or parsed.fragment:
             raise DomainError("INVALID_REQUEST", "Invalid request target")
         route = parsed.path
-        if method == "POST":
+        if method in {"POST", "PATCH", "DELETE"}:
             if parsed.query:
                 raise DomainError("INVALID_REQUEST", "Unexpected query")
             _fields(body, body.keys() if isinstance(body, dict) else ())
@@ -107,6 +111,8 @@ class HTTPController:
             return 200, diagnostic_service.Read(route.removeprefix("/diagnostics/"))
         if route.startswith("/memory/"):
             return memory_routes.Handle(method, route, query, body)
+        if method in {"PATCH", "DELETE"}:
+            raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         if route.startswith("/eval/"):
             return eval_routes.Handle(method, route, query, body)
         if route.startswith("/data/"):
@@ -185,8 +191,10 @@ def _json_object(pairs):
     return result
 
 
-ASSET_NAMES = ("index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "eval.css", "memory.css", "components/memory-datasets.js", "components/memory-graph.js", "components/memory-graph-model.js", "components/memory-graph-state.js", "components/memory-graph-renderer.js", "components/memory-graph-detail.js", "vendor/memory-graph-engine.js", "favicon.svg",
+ASSET_NAMES = ("components/memory-import-dialog.js", "index.html", "app.js", "api.js", "store.js", "style.css", "tokens.css", "overview.css", "observability.css", "eval.css", "memory.css", "components/memory-datasets.js", "components/memory-graph.js", "components/memory-graph-model.js", "components/memory-graph-state.js", "components/memory-graph-renderer.js", "components/memory-graph-detail.js", "vendor/memory-graph-engine.js", "favicon.svg",
                "components/chat.js", "components/ui.js", "pages/catalog.js", "pages/data.js", "pages/memory.js",
+               "components/memory-topic-tree.js", "components/memory-topic-dialog.js",
+               "components/memory-topic-state.js", "components/memory-topic-model.js",
                "pages/overview.js", "pages/overview-model.js", "pages/observability.js",
                "pages/observability-model.js", "components/trace-detail.js", "pages/eval.js")
 ASSETS = {"/" + name: (name, {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
@@ -238,11 +246,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, (Path(__file__).with_name("web") / name).read_bytes(), content_type)
                 return
             body = None
-            if self.command == "POST":
+            if self.command in {"POST", "PATCH", "DELETE"}:
                 origin = self.headers.get("Origin")
                 if origin and origin not in self.server.allowed_origins:
                     raise DomainError("FORBIDDEN", "Invalid origin")
-                if self.headers.get_content_type() != "application/json":
+                uploading = self.command == 'POST' and self.path == '/memory/imports'
+                if self.headers.get_content_type() != ('multipart/form-data' if uploading else 'application/json'):
                     raise DomainError("UNSUPPORTED_MEDIA_TYPE", "Invalid media type")
                 lengths = self.headers.get_all("Content-Length", [])
                 if len(lengths) != 1 or self.headers.get("Transfer-Encoding"):
@@ -253,13 +262,16 @@ class _Handler(BaseHTTPRequestHandler):
                     raise DomainError("INVALID_REQUEST", "Invalid body length") from None
                 if length < 0:
                     raise DomainError("INVALID_REQUEST", "Invalid body length")
-                if length > 65536:
+                if length > (2 * 1024 * 1024 + 65536 if uploading else 65536):
                     raise DomainError("PAYLOAD_TOO_LARGE", "Body too large")
                 try:
                     raw = self.rfile.read(length)
                     body_consumed = True
-                    body = json.loads(raw, object_pairs_hook=_json_object,
-                                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+                    if len(raw) != length:
+                        raise DomainError('INVALID_REQUEST', 'Incomplete body')
+                    body = (ParseUpload(self.headers['Content-Type'], raw) if uploading else
+                            json.loads(raw, object_pairs_hook=_json_object,
+                                       parse_constant=lambda value: (_ for _ in ()).throw(ValueError())))
                 except (ValueError, UnicodeError):
                     raise DomainError("INVALID_REQUEST", "Invalid JSON") from None
             status, payload = HTTPController.Handle(self.command, self.path, body)
@@ -272,9 +284,15 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as error:
             code = error.code if isinstance(error, DomainError) and error.code in ERRORS else "INTERNAL_ERROR"
             status, message = ERRORS[code]
+            if isinstance(error, TopicConflict) and urlsplit(self.path).path.startswith("/memory/"):
+                message = str(error)
+            detail = {}
+            if isinstance(error, ImportValidationError):
+                message = str(error)
+                detail['path'] = error.path
             try:
-                self._send(status, {"error": {"code": code, "message": message}})
-                if self.command == "POST" and not body_consumed:
+                self._send(status, {"error": {"code": code, "message": message, **detail}})
+                if self.command in {"POST", "PATCH", "DELETE"} and not body_consumed:
                     self._drain_rejected_body()
             except OSError:
                 self.close_connection = True

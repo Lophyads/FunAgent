@@ -49,7 +49,7 @@ class TaskProcess:
                               memory_evidence=tuple(f"session:{session.session_id}/message:{m.message_id}"
                                                     for m in snapshot.messages if m.role == "user"))
             Emit(context, 'phase_started', {'phase': 'prepare_memory'})
-            recalled = MemoryPrepare.Run(MemoryPrepareRequest(task.request.text, snapshot.messages[:-1]), context)
+            recalled = MemoryPrepare.Run(MemoryPrepareRequest(task.request.text), context)
             Emit(context, 'phase_finished', {'phase': 'prepare_memory'})
             with mgr.Scope('memory.attach', input=lambda: dict(user_message_id=snapshot.messages[-1].message_id,
                                                                evidence=Memory(recalled))):

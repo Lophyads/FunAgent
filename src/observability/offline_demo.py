@@ -55,7 +55,9 @@ def Generate(directory):
 
         try:
             queue = application.Start(conf)
-            MemoryOperationsMgr.GetInstance().Write(MemoryDraft('facts', '企鹅喜欢吃鱼', 'offline-demo', ()))
+            operations = MemoryOperationsMgr.GetInstance()
+            topic = operations.CreateTopic('facts', None, '企鹅', '离线示例中的企鹅事实')['topic']
+            operations.Write(MemoryDraft('facts', '企鹅喜欢吃鱼', 'offline-demo', ()), topic_id=topic['topic_id'])
             for name, text in [('normal', '你好'), ('tool', 'tool: 回声'),
                                ('recall', 'memory: 企鹅'), ('human_wait', 'ask: 喜欢什么颜色？')]:
                 manifest[name] = run(queue, text)

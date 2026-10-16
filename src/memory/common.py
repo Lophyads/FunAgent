@@ -13,6 +13,10 @@ def normalize(value):
     return unicodedata.normalize("NFKC", value).casefold()
 
 
+def NormalizeTopicName(value):
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
 def validate_query(query):
     if (type(query.include_deleted) is not bool or not isinstance(query.text, str) or len(query.text) > 8000 or
             type(query.limit) is not int or not 1 <= query.limit <= 100 or

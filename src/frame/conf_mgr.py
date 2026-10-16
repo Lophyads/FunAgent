@@ -47,6 +47,9 @@ class ToolConf(ABC):
 
 
 class MemoryConf(ABC):
+    def Topics(self) -> Mapping:
+        return freeze({"path": ".funagent/memory-topics.json"})
+
     @abstractmethod
     def Sources(self) -> Mapping: ...
 
@@ -127,6 +130,9 @@ class _TomlMemoryConf(MemoryConf):
     def Sources(self):
         return self._data.get("sources", MappingProxyType({}))
 
+    def Topics(self):
+        return self._data.get("topics", super().Topics())
+
     def Policy(self, purpose):
         if purpose in {"profile", "facts", "knowledge"}:
             return self._data.get("policies", {}).get(purpose, MappingProxyType({"enabled": False, "sources": ()}))
@@ -193,7 +199,7 @@ def _validate(docs):
     for key, allowed in (
         ("model", {"adapters", "providers", "profiles"}),
         ("tool", {"tools", "toolsets", "backends", "purposes", "session_access"}),
-        ("memory", {"sources", "policies"}),
+        ("memory", {"sources", "policies", "topics"}),
         ("log", {"options", "observability"}), ("serv", {"options"}),
     ):
         _require(set(docs[key]) <= allowed, key)
@@ -284,6 +290,10 @@ def _validate(docs):
         _names(names, "tool.toolsets")
     for names in _table(tool, "session_access", "tool.session_access").values():
         _names(names, "tool.session_access")
+    topics = _table(memory, "topics", "memory.topics")
+    _require(set(topics) <= {"path"}, "memory.topics")
+    if "path" in topics:
+        _text(topics["path"], "memory.topics.path")
     sources = _table(memory, "sources", "memory.sources")
     for source in sources.values():
         _require(isinstance(source, dict), "memory.sources")
@@ -351,7 +361,7 @@ def _validate(docs):
     for purpose, policy in _table(memory, "policies", "memory.policies").items():
         _require(isinstance(policy, dict), "memory.policies")
         if purpose == "recall":
-            _require(set(policy) <= {"profile", "timeout", "history_max_chars"}, "memory.policies.recall")
+            _require(set(policy) <= {"profile", "timeout", "history_max_chars", "input_max_chars"}, "memory.policies.recall")
         if purpose in {"profile", "facts", "knowledge"}:
             _require(set(policy) <= {"enabled", "sources", "max_records", "max_chars", "timeout", "max_queries"}, "memory.policies")
         if "profile" in policy:
@@ -386,6 +396,8 @@ def _validate(docs):
             _require(policy["max_queries"] <= 3, "memory.policies.max_queries")
         if "history_max_chars" in policy:
             _number(policy["history_max_chars"], "memory.policies.history_max_chars", integer=True, minimum=256)
+        if "input_max_chars" in policy:
+            _number(policy["input_max_chars"], "memory.policies.input_max_chars", integer=True, minimum=256)
     policies = memory.get("policies", {})
     if any(policies.get(branch, {}).get("enabled", False) and policies.get(branch, {}).get("sources") for branch in ("facts", "knowledge")):
         _require("profile" in policies.get("recall", {}), "memory.policies.recall.profile")

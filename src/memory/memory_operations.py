@@ -11,7 +11,10 @@ import re
 
 from ..frame.contracts import DomainError, RunContext
 from .common import text, validate_content, validate_metadata
-from .contracts import MemoryListQuery, UNSET
+from .contracts import MemoryListQuery, TopicSelection, UNSET
+from .protocols import TopicCatalog
+from .topic_projection import TopicData, TopicPath, RecordTopic
+from .topic_pagination import ReadDirectory
 from .policy import Outcome
 from .prompt import RecordData
 from ..observability.observation_mgr import ObservationMgr
@@ -30,9 +33,10 @@ def ManagementRecord(record):
 
 
 class MemoryOperations:
-    def __init__(self, memory, conf, *, clock=time.monotonic, inspection=None):
+    def __init__(self, memory, conf, *, clock=time.monotonic, inspection=None, topics: TopicCatalog | None = None):
         self._memory = memory
         self._inspection = inspection
+        self._topics = topics
         self._sources = conf.Memory().Sources()
         self._facts = tuple(conf.Memory().Policy('facts').get('sources', ()))
         self._access = conf.Tool().Access("management")
@@ -79,28 +83,113 @@ class MemoryOperations:
         return self._sources[name].get("write_access" if write else "read_access",
                                       f"memory.{name}.{'write' if write else 'read'}")
 
+    def _catalog(self, source_id, context, *, write=False):
+        context.CheckCancelled()
+        if not text(source_id) or len(source_id) > 128:
+            raise DomainError("INVALID_REQUEST", "Invalid memory source")
+        if source_id not in self._sources:
+            raise DomainError("NOT_FOUND", "Memory source not found")
+        if self._token(source_id) not in context.access or (write and self._token(source_id, True) not in context.access):
+            raise DomainError("DENIED", "Memory topic management access denied")
+        if self._topics is None:
+            raise DomainError("NOT_READY", "Topic catalog is unavailable")
+        return self._topics
+
+    @_management
+    def Topics(self, source_id):
+        snapshot = self._catalog(source_id, self._context()).Snapshot(source_id)
+        return {"source_id": source_id, "revision": snapshot.revision,
+                "topics": [TopicData(topic) for topic in snapshot.topics.values()]}
+
+    @_management
+    def CreateTopic(self, source_id, parent_id, name, description):
+        change = self._catalog(source_id, self._context(), write=True).CreateTopic(source_id, parent_id, name, description)
+        return {"topic": TopicData(change.topic), "revision": change.revision}
+
+    @_management
+    def UpdateTopic(self, source_id, topic_id, expected_revision, **changes):
+        change = self._catalog(source_id, self._context(), write=True).UpdateTopic(source_id, topic_id, expected_revision, **changes)
+        return {"topic": TopicData(change.topic), "revision": change.revision}
+
+    @_management
+    def DeleteTopic(self, source_id, topic_id, expected_revision):
+        revision = self._catalog(source_id, self._context(), write=True).DeleteTopic(source_id, topic_id, expected_revision)
+        return {"deleted": True, "revision": revision}
+
+    def _visible_record(self, ref, context):
+        cursor, visited = None, set()
+        while True:
+            context.CheckCancelled()
+            page = self._memory.List(MemoryListQuery(ref.source_id, limit=100, cursor=cursor), context)
+            record = next((r for r in page.items if r.ref == ref and not r.deleted), None)
+            if record is not None:
+                return record
+            cursor = page.next_cursor
+            if cursor is None:
+                raise DomainError("NOT_FOUND", "Memory record not found")
+            if cursor in visited:
+                raise DomainError("MEMORY_STORAGE", "Memory store returned a repeated list cursor")
+            visited.add(cursor)
+
+    @_management
+    def AssignTopic(self, ref, topic_id, expected_revision):
+        context = self._context()
+        catalog = self._catalog(ref.source_id, context, write=True)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise DomainError("INVALID_REQUEST", "Expected revision must be a nonnegative integer")
+        if not text(ref.record_id) or len(ref.record_id) > 128 or not text(topic_id) or len(topic_id) > 128:
+            raise DomainError("INVALID_REQUEST", "Invalid record or topic reference")
+        self._visible_record(ref, context)
+        snapshot = catalog.Snapshot(ref.source_id)
+        if topic_id not in snapshot.topics:
+            raise DomainError("NOT_FOUND", "Topic does not exist in this source")
+        path = TopicPath(snapshot, topic_id)
+        revision = catalog.Assign(ref.source_id, ref.record_id, topic_id, expected_revision)
+        return {"source_id": ref.source_id, "record_id": ref.record_id, "topic_id": topic_id,
+                "topic_path": path, "revision": revision}
+
     @_management
     def Search(self, query):
-        result = self._memory.Search(query, self._context())
-        return {"records": [ManagementRecord(record) for record in result.records],
-                "source_status": dict(result.source_status), "warnings": list(result.warnings)}
+        context = self._context()
+        if len(query.source_ids) != 1:
+            raise DomainError("INVALID_REQUEST", "Management search requires one source")
+        source_id = query.source_ids[0]
+        snapshot = self._catalog(source_id, context).Snapshot(source_id)
+        result = self._memory.Search(query, context)
+        return {"records": [ManagementRecord(record) | RecordTopic(snapshot, record.ref.record_id) for record in result.records],
+                "source_status": dict(result.source_status), "warnings": list(result.warnings), "revision": snapshot.revision}
 
     @_management
-    def List(self, query):
-        page = self._memory.List(query, self._context())
-        return {"records": [ManagementRecord(record) for record in page.items], "next_cursor": page.next_cursor,
-                "source_status": {query.source_id: "ok"}}
+    def List(self, query, *, topic_id=None, unclassified=False):
+        if type(unclassified) is not bool or (topic_id is not None and unclassified):
+            raise DomainError("INVALID_REQUEST", "Topic and unclassified filters are mutually exclusive")
+        if type(query.limit) is not int or not 1 <= query.limit <= 100:
+            raise DomainError("INVALID_REQUEST", "Memory limit must be between 1 and 100")
+        context = self._context()
+        snapshot = self._catalog(query.source_id, context).Snapshot(query.source_id)
+        if topic_id is not None and topic_id not in snapshot.topics:
+            raise DomainError("NOT_FOUND", "Topic does not exist in this source")
+        if "list" not in self._sources[query.source_id].get("capabilities", ()):
+            raise DomainError("UNSUPPORTED", "This memory source supports search only")
+        records, cursor = ReadDirectory(self._memory, snapshot, query, context, topic_id=topic_id, unclassified=unclassified)
+        return {"records": [ManagementRecord(record) | RecordTopic(snapshot, record.ref.record_id) for record in records],
+                "next_cursor": cursor, "source_status": {query.source_id: "ok"}, "revision": snapshot.revision}
 
     @_management
-    def Write(self, draft, request_key=None):
+    def Write(self, draft, request_key=None, *, topic_id=None):
         if request_key is not None and (not isinstance(request_key, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', request_key)):
             raise DomainError('INVALID_REQUEST', 'Invalid memory request key')
         identity = hashlib.sha256((draft.source_id + ':' + request_key).encode()).hexdigest() if request_key else None
         context = self._context(identity)
+        self._catalog(draft.source_id, context, write=True)
+        selection = TopicSelection(topic_id=topic_id)
         draft = replace(draft, write_key="management:" + context.run_id, evidence=context.memory_evidence)
-        result = ManagementRecord(self._memory.Write(draft, context))
-        self._invalidate(draft.source_id)
-        return result
+        try:
+            receipt = self._memory.Write(draft, context, topic=selection)
+        finally:
+            self._invalidate(draft.source_id)
+        record, snapshot = receipt.record, receipt.topic_snapshot
+        return ManagementRecord(record) | RecordTopic(snapshot, record.ref.record_id) | {"revision": snapshot.revision}
 
     @_management
     def Request(self, action, ref, expected_version, patch=None):
@@ -129,17 +218,9 @@ class MemoryOperations:
             raise DomainError("INVALID_REQUEST", "Delete does not accept a patch")
         # Require a visible current record as well as write authority; the writer
         # repeats source/purpose checks and CAS at confirmation time.
-        cursor = None
-        while True:
-            page = self._memory.List(MemoryListQuery(ref.source_id, limit=100, cursor=cursor), context)
-            record = next((r for r in page.items if r.ref == ref), None)
-            if record is not None:
-                if record.version != expected_version:
-                    raise DomainError("CONFLICT", "Memory version is stale")
-                break
-            cursor = page.next_cursor
-            if cursor is None:
-                raise DomainError("NOT_FOUND", "Memory record not found")
+        record = self._visible_record(ref, context)
+        if record.version != expected_version:
+            raise DomainError("CONFLICT", "Memory version is stale")
         identifier = uuid4().hex
         parameters = {"action": action, "source_id": ref.source_id, "record_id": ref.record_id,
                       "expected_version": expected_version}
@@ -181,11 +262,15 @@ class MemoryOperations:
             if Outcome(action, context.purpose) != "approval":
                 raise DomainError("DENIED", "Memory action no longer allowed")
             if action == "replace":
-                result = ManagementRecord(self._memory.Update(ref, replace(patch, evidence=context.memory_evidence), version, context))
+                snapshot = self._catalog(ref.source_id, context, write=True).Snapshot(ref.source_id)
+                record = self._memory.Update(ref, replace(patch, evidence=context.memory_evidence), version, context)
                 self._invalidate(ref.source_id)
-                return result
-            self._memory.Delete(ref, version, context)
-            self._invalidate(ref.source_id)
+                return ManagementRecord(record) | RecordTopic(snapshot, ref.record_id) | {"revision": snapshot.revision}
+            self._catalog(ref.source_id, context, write=True)
+            try:
+                self._memory.Delete(ref, version, context)
+            finally:
+                self._invalidate(ref.source_id)
             return {"deleted": True}
 
     def Close(self):

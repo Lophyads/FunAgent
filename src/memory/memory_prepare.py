@@ -11,13 +11,14 @@ from .memory_planner import MemoryPlanner
 from .prompt import FitBranch
 from .protocols import MemoryReader
 from ..observability.observation_mgr import ObservationMgr
-from ..observability.projections import Memory, Messages, Query
+from ..observability.projections import Memory, Query
+from .topic_projection import PlanningTopics
 
 class MemoryPrepare:
     @staticmethod
     def Run(request, context):
         mgr = ObservationMgr.GetInstance()
-        with mgr.Scope('memory.prepare', input=lambda: dict(text=request.text, history=Messages(request.history))):
+        with mgr.Scope('memory.prepare', input=lambda: dict(text=request.text)):
             result = MemoryPrepare._run(request, context)
             mgr.Complete(status=result.status, output=lambda: Memory(result))
             return result
@@ -45,11 +46,10 @@ class MemoryPrepare:
                         access=frozenset(sources[name].get("read_access", f"memory.{name}.read")
                                          for group in names.values() for name in group),
                         deadline=min(context.deadline or float("inf"), time.monotonic() + policy.get("timeout", 2)))
-        descriptions = tuple({"source_id": name, "kind": sources[name]["kind"],
-                              "source_description": sources[name].get("source_description", "")}
-                             for name in dict.fromkeys(name for group in names.values() for name in group))
         try:
-            plan = MemoryPlanner.Plan(request, child, descriptions)
+            selected = tuple(dict.fromkeys(name for group in names.values() for name in group))
+            snapshots = memory.ReadTopics(selected, child)
+            plan = MemoryPlanner.Plan(request, child, PlanningTopics(snapshots, sources))
         except (DomainError, ControlError) as error:
             context.CheckCancelled()
             code = error.code if error.code in {"PLAN_INVALID", "PLAN_FAILED", "DEADLINE"} else "PLAN_FAILED"

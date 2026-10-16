@@ -2,6 +2,10 @@ import {applyEvent, terminal} from './store.js';
 import {notify, confirmAction} from './components/ui.js';
 
 const types={user:'profile',note:'note',episode:'episode',knowledge:'knowledge'};
+function memoryRecordReceipt(value){
+  if(!value?.record_id||!value.version||typeof value.content!=='string')throw new Error('正文操作未返回完整记录回执，结果未确认，请刷新核对。');
+  return value;
+}
 export function memoryJSON(value){
   const body=JSON.stringify(value);
   if(new TextEncoder().encode(body).byteLength>65536){const error=new Error('请求超过 64 KiB，请缩小文档或拆成多个文件。');error.status=413;error.code='PAYLOAD_TOO_LARGE';throw error;}
@@ -16,8 +20,8 @@ export function dateISO(value){
 export class ApiClient {
   constructor(store){this.store=store;this.source=null;this.generations={};this.seq=-1;this.epoch=null;this.pending=[];
     this.historyTimers=new Map();this.historyFlights=new Map();this.closed=false;this.expiryTimer=setInterval(()=>this.interactions().catch(()=>{}),5000);}
-  async wire(path,options={}){const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
-    let data;try{data=await response.json();}catch{data={};}if(!response.ok){const e=new Error(data.error?.message||`HTTP ${response.status}`);e.status=response.status;e.code=data.error?.code;throw e;}return data;}
+  async wire(path,options={}){const response=await fetch(path,{...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...options.headers}});
+    let data;try{data=await response.json();}catch{data={};}if(!response.ok){const e=new Error(data.error?.message||`HTTP ${response.status}`);e.status=response.status;e.code=data.error?.code;e.path=data.error?.path;throw e;}return data;}
   traceSessions({limit=50,offset=0,signal}={}){return this.wire(`/trace-sessions?limit=${limit}&offset=${offset}`,{signal});}
   traceOverview({sessionId,unassigned=false,limit=50,offset=0,signal}={}){const query=new URLSearchParams({view:'overview',limit,offset});if(unassigned)query.set('unassigned','1');else if(sessionId)query.set('session_id',sessionId);return this.wire(`/traces?${query}`,{signal});}
   traceReview(taskId,{signal}={}){return this.wire(`/tasks/${encodeURIComponent(taskId)}/trace`,{signal});}
@@ -64,7 +68,19 @@ export class ApiClient {
         if(['snapshot','reset','turn.finished'].includes(item.kind))this.scheduleHistory(sid);
         if(['snapshot','reset','turn.finished'].includes(item.kind)||item.kind.startsWith('interaction.'))this.interactions().catch(()=>{});
         if(item.kind==='turn.finished')this.sessions().catch(()=>{});}});});}
+  submitMemoryImport(sourceId,file){const body=new FormData();body.append('source_id',sourceId);body.append('file',file);return this.wire('/memory/imports',{method:'POST',body});}
+  memoryImport(id){return this.wire(`/memory/imports/${encodeURIComponent(id)}`);}
+  latestMemoryImport(sourceId){return this.wire(`/memory/imports?${new URLSearchParams({source_id:sourceId})}`);}
   memorySources(){return this.wire('/memory/sources');}
+  memoryTopics(source){return this.wire(`/memory/topics?${new URLSearchParams({source_id:source.source_id})}`);}
+  createMemoryTopic(source,topic){return this.wire('/memory/topics',{method:'POST',body:memoryJSON({source_id:source.source_id,...topic})});}
+  updateMemoryTopic(source,topicId,changes,revision){return this.wire(`/memory/topics/${encodeURIComponent(topicId)}`,{method:'PATCH',body:memoryJSON({source_id:source.source_id,...changes,expected_revision:revision})});}
+  async deleteMemoryTopic(source,topicId,revision){
+    const result=await this.wire(`/memory/topics/${encodeURIComponent(topicId)}`,{method:'DELETE',body:memoryJSON({source_id:source.source_id,expected_revision:revision})});
+    if(result.deleted!==true||!Number.isInteger(result.revision))throw new Error('删除主题未返回完整回执，结果未确认，请刷新核对。');
+    return result;
+  }
+  assignMemoryTopic(source,recordId,topicId,revision){return this.wire(`/memory/records/${encodeURIComponent(recordId)}/topic`,{method:'PATCH',body:memoryJSON({source_id:source.source_id,topic_id:topicId,expected_revision:revision})});}
   inspectMemory(operation,params,{signal}={}){return this.wire(`/memory/cognee/${operation}?${new URLSearchParams(params)}`,{signal});}
   async readMemory(source,kind,params=new URLSearchParams()){
     const search=params.get('q'),capabilities=source.capabilities||[];
@@ -72,6 +88,7 @@ export class ApiClient {
     const q=new URLSearchParams({source_id:source.source_id,limit:params.get('limit')||'50'});
     if(types[kind])q.set('type',types[kind]);
     if(search)q.set('text',search);else if(params.get('cursor'))q.set('cursor',params.get('cursor'));
+    if(!search){for(const key of ['topic_id','unclassified'])if(params.has(key))q.set(key,params.get(key));}
     const data=await this.wire(`/memory/${search?'search':'records'}?${q}`);
     if(data.source_status?.[source.source_id]&&data.source_status[source.source_id]!=='ok')throw new Error('记忆来源暂时无法读取，请检查服务后重试。');
     return {...data,readonly:Boolean(search),entries:data.records.map(r=>({...r,id:r.record_id,event_timestamp:r.event_at,event_at:dateLabel(r.event_at)}))};
@@ -85,10 +102,16 @@ export class ApiClient {
     try{metadata=body.action==='remove'?null:{content:body.content,type,subject:body.subject?.trim()||null,origin:body.origin?.trim()||null,
       event_at:type==='episode'?(body.event_timestamp&&dateLabel(body.event_timestamp)===body.event_at?body.event_timestamp:dateISO(body.event_at)):body.event_timestamp||null};}
     catch(error){error.status=400;throw error;}
-    if(body.action==='add')return this.wire('/memory/records',{method:'POST',body:memoryJSON({source_id:source.source_id,...metadata,request_key:body.request_key})});
+    if(body.action==='add'){
+      if(!body.topic_id){const error=new Error('请选择所属主题；没有合适主题时请先新建主题。');error.status=400;error.code='INVALID_REQUEST';throw error;}
+      return memoryRecordReceipt(await this.wire('/memory/records',{method:'POST',body:memoryJSON({source_id:source.source_id,...metadata,topic_id:body.topic_id,request_key:body.request_key})}));
+    }
     const proposal=await this.wire('/memory/changes',{method:'POST',body:memoryJSON({action:body.action,source_id:source.source_id,record_id:body.id,expected_version:body.expected_version,...(body.action==='replace'?{patch:metadata}:{})})});
     const approve=await confirmAction(body.action==='remove'?'删除记忆':'确认修改记忆',`来源：${proposal.source_id}\n记录：${proposal.record_id}\n版本：${proposal.expected_version}\n\n${proposal.patch?.content||'确认后删除这条记录。'}`);
-    const result=await this.wire(`/memory/challenges/${proposal.challenge_id}/confirm`,{method:'POST',body:JSON.stringify({arguments_digest:proposal.arguments_digest,approve})});return {...result,declined:!approve};}
+    const result=await this.wire(`/memory/challenges/${proposal.challenge_id}/confirm`,{method:'POST',body:JSON.stringify({arguments_digest:proposal.arguments_digest,approve})});
+    if(!approve||result.declined)return {...result,declined:true};
+    if(body.action==='remove'){if(result.deleted!==true)throw new Error('删除操作未返回完整回执，结果未确认，请刷新核对。');return result;}
+    return memoryRecordReceipt(result);}
   close(){this.closed=true;this.source?.close();clearInterval(this.expiryTimer);for(const timer of this.historyTimers.values())clearTimeout(timer);if(this.frame)cancelAnimationFrame(this.frame);}
 }
 export function createCommands(store,api){return {

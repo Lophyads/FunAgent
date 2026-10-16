@@ -27,10 +27,11 @@ class DemoProvider:
             if message.role == "tool":
                 reply = ModelReply("Review complete")
             else:
-                history = json.loads(message.content.split("\n\nMemory evidence", 1)[0])
+                history = json.loads(message.content.split("\n\nMemory evidence", 1)[0])["history"]
                 facts = [m for m in history if m["role"] == "user" and m["content"].startswith("remember:") and m["content"][9:].strip()]
                 reply = (ModelReply(calls=tuple(ToolCall(uuid4().hex, "memory", {"action": "add",
-                    "source": "facts", "message_ids": [m["message_id"]], "type": "note", "content": m["content"][9:].strip()})
+                    "source": "facts", "message_ids": [m["message_id"]], "type": "note", "content": m["content"][9:].strip(),
+                    "topic": {"parent_id": None, "name": "Demo facts", "description": "Facts saved by the offline demonstration"}})
                     for m in facts), finish_reason="tool_calls") if facts else ModelReply("No durable facts"))
         elif context.purpose == "recall":
             question = json.loads(message.content)["question"]
