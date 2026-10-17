@@ -16,6 +16,8 @@ from .search import Terms, Rank
 
 
 class SQLiteMemoryStore:
+    supported_types = None
+    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, path, source_id="facts", kind="episodic"):

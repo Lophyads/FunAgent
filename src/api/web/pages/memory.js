@@ -5,7 +5,7 @@ import {mountInspection} from '../components/memory-datasets.js';
 import {mountTopicTree} from '../components/memory-topic-tree.js';
 import {mountTopicDialog} from '../components/memory-topic-dialog.js';
 import {createTopicState} from '../components/memory-topic-state.js';
-import {UNCLASSIFIED, nodeKey, topicPath} from '../components/memory-topic-model.js';
+import {UNCLASSIFIED, nodeKey, topicPath, memoryFailureDraft, memoryReconciledDraft} from '../components/memory-topic-model.js';
 
 const labels = {all:'全部', user:'用户事实', note:'长期笔记', episode:'历史事件', knowledge:'知识文档'};
 const recordTypes = {user:'profile', note:'note', episode:'episode', knowledge:'knowledge'};
@@ -68,7 +68,12 @@ export function mount(root, {store, api}) {
   const reconciled = button('已核对，继续编辑', async () => {
     const own = target(), current = draft(), gen = scopeGeneration;
     const approved = await confirmAction('核对操作结果', '请先刷新目录并核对正文是否已经写入、修改或删除。确认后允许继续编辑；新增原样重试仍使用原请求标识。');
-    if (approved && !disposed && gen === scopeGeneration && own === target()) setDraft({...current, uncertain:false, failure:null});
+    if (approved && !disposed && gen === scopeGeneration && own === target()) {
+      const latest = findRecord(current.id || current.verified_ref?.record_id);
+      const next = memoryReconciledDraft(current, latest, sourceId);
+      if (!next) {notify('请先刷新并读取当前记录版本。', true); return;}
+      setDraft(next);
+    }
   });
   const save = button('保存', () => write(), 'primary'), remove = button('删除条目', () => write('remove'), 'danger');
   const editor = el('div', {class:'memory-panel memory-editor-form'}, title, version, conflict, subject, origin, eventDate,
@@ -108,14 +113,14 @@ export function mount(root, {store, api}) {
       event_at:dateLabel(record.event_timestamp || record.event_at), event_timestamp:record.event_timestamp || record.event_at, dirty:false};
   }
   async function allowReplaceDraft(current = draft()) {
-    const hasChanges = current?.dirty || current?.uncertain || current?.sync_failed || (current?.dirty === undefined && current?.content);
+    const hasChanges = current?.dirty || current?.uncertain || current?.sync_failed || current?.saved_unconfirmed || (current?.dirty === undefined && current?.content);
     return !hasChanges ||
       await confirmAction('保留或放弃草稿', '当前正文有未保存内容或待核对的操作结果。可取消后先保存、核对；确认将放弃当前草稿并打开所选条目。');
   }
   async function selectRecord(record) {
     if (busy()) return;
     const id = record.id || record.record_id, gen = scopeGeneration;
-    if (draft()?.id !== id || draft()?.sync_failed || (draft()?.action === 'view') !== Boolean(state.results)) {
+    if (draft()?.id !== id || draft()?.sync_failed || draft()?.saved_unconfirmed || (draft()?.action === 'view') !== Boolean(state.results)) {
       if (!await allowReplaceDraft() || disposed || gen !== scopeGeneration) return;
       setDraft(recordDraft(record, Boolean(state.results)));
     }
@@ -258,7 +263,7 @@ export function mount(root, {store, api}) {
 
   async function write(action) {
     const current = draft();
-    if (busy() || !current || current.action === 'view' || current.uncertain || current.sync_failed) return;
+    if (busy() || !current || current.action === 'view' || current.uncertain || current.sync_failed || current.saved_unconfirmed) return;
     const ownSource = source(), ownKind = kind, own = target(), gen = scopeGeneration;
     action ||= current.action;
     const body = {...current, action};
@@ -290,16 +295,14 @@ export function mount(root, {store, api}) {
         await refreshPage();
       }
     } catch (error) {
-      const partial = error.code === 'TOPIC_SYNC_FAILED';
-      const uncertain = !partial && (!error.status || error.status >= 500) && !['EMBEDDING_SOURCE','EMBEDDING_PROTOCOL'].includes(error.code);
-      const accepted = commitDraft({...submittedDraft,
-        conflict:error.status === 409 || error.status === 404, failure:error.message,
-        uncertain, uncertain_action:uncertain ? action : undefined, sync_failed:partial ? action : undefined});
+      const partial = error.effect === 'known' || error.code === 'TOPIC_SYNC_FAILED';
+      const accepted = commitDraft(memoryFailureDraft(submittedDraft, error, action, ownSource.source_id));
       if (!disposed && gen === scopeGeneration && accepted) {
-        notify(partial ? error.message + ' 请刷新核对；新增记录可从未归类找到后归类。' : error.message, true);
-        if (partial && action === 'add') selection = {kind:'unclassified'};
+        notify(error.message, true);
+        const topicFailed = error.code === 'TOPIC_SYNC_FAILED' || error.issues?.some(issue => issue.code === 'TOPIC_SYNC_FAILED');
+        if (partial && action === 'add') selection = topicFailed || !current.topic_id ? {kind:'unclassified'} : {kind:'topic', topicId:current.topic_id};
         await reads.refresh();
-        if (partial && action === 'add') await reads.loadNode(UNCLASSIFIED);
+        if (partial && action === 'add') await reads.loadNode(nodeKey(selection));
       }
     } finally {saving = false; if (!disposed) render(true);}
   }
@@ -317,7 +320,7 @@ export function mount(root, {store, api}) {
     const adding = current.action === 'add', latest = findRecord(current.id);
     const changed = current.action === 'replace' && latest && latest.version !== current.expected_version;
     const readonly = current.action === 'view' || !can(adding ? 'write' : 'update');
-    const locked = busy() || readonly || current.uncertain || Boolean(current.sync_failed);
+    const locked = busy() || readonly || current.uncertain || Boolean(current.sync_failed || current.saved_unconfirmed);
     title.textContent = current.action === 'view' ? '查看检索结果' : adding ? current.imported ? '导入 Markdown' : '新增条目' : '编辑记忆';
     version.textContent = current.id ? `来源 ${sourceId} · 记录 ${current.id} · 版本 ${current.expected_version || '只读'}` : `目标：${sourceId}`;
     for (const [node, key] of [[textarea,'content'],[subject,'subject'],[origin,'origin'],[eventDate,'event_at']]) {
@@ -339,9 +342,10 @@ export function mount(root, {store, api}) {
     save.textContent = adding && current.imported ? '导入文档' : '保存';
     save.disabled = Boolean(locked || !current.type || !current.content?.trim() || changed || current.conflict ||
       adding && (!current.topic_id || !state.topics.some(topic => topic.topic_id === current.topic_id)));
-    remove.hidden = current.action !== 'replace'; remove.disabled = busy() || Boolean(current.uncertain || current.sync_failed || changed || current.conflict) || !can('delete');
-    reconciled.hidden = !current.uncertain; reconciled.disabled = busy();
-    status.textContent = saving ? '保存处理中…' : importing ? '读取文档…' : current.sync_failed ?
+    remove.hidden = current.action !== 'replace'; remove.disabled = busy() || Boolean(current.uncertain || current.sync_failed || current.saved_unconfirmed || changed || current.conflict) || !can('delete');
+    reconciled.hidden = !(current.uncertain || current.saved_unconfirmed || current.sync_failed); reconciled.disabled = busy();
+    status.textContent = saving ? '保存处理中…' : importing ? '读取文档…' : current.saved_unconfirmed ?
+      (current.failure || '正文已保存，索引未确认完成。') + ' 草稿与请求标识已保留，请刷新核对。' : current.sync_failed ?
       '正文已经变化，但目录同步未完成。草稿已保留，请刷新核对。新增记录请从未归类找到后更换主题，避免重复新增。' + (current.failure || '') : current.uncertain ?
       '操作结果未确认，草稿与请求标识已保留。请先刷新核对，再继续编辑或原样重试。' : current.failure ? current.failure + ' 草稿已保留。' :
       current.action === 'view' ? '搜索为有限召回，结果只读；请返回目录选择条目进行编辑。' :
@@ -351,13 +355,15 @@ export function mount(root, {store, api}) {
     resultsRoot.replaceChildren(); const results = state.results;
     if (!results) return;
     if (results.error) {resultsRoot.append(errorBox(results.error, () => reads.search(results.text))); return;}
+    const incomplete = Object.values(results.source_status || {}).some(status => status !== 'ok');
+    if (incomplete) resultsRoot.append(el('p', {class:'muted', text:`检索结果不完整：${(results.issues || []).map(issue => issue.code).join(' · ') || '部分路径未确认'}`}));
     for (const record of results.entries) {
       const item = button('', () => selectRecord(record), 'memory-entry'); item.disabled = busy();
       const path = (record.topic_path || []).map(item => typeof item === 'string' ? item : item.name).join(' / ');
       item.append(el('strong', {text:record.subject || record.origin || record.type}), el('small', {text:path || '未归类'}),
         el('p', {class:'memory-summary', text:(record.content || '').slice(0, 160)})); resultsRoot.append(item);
     }
-    if (!results.loading && !results.entries.length) resultsRoot.append(el('p', {class:'empty', text:'本次搜索未命中记忆。'}));
+    if (!results.loading && !results.entries.length) resultsRoot.append(el('p', {class:'empty', text:incomplete ? '本次检索尚未获得可用记录，请检查来源诊断。' : '本次搜索未命中记忆。'}));
   }
   function render(force = false) {
     if (disposed) return;

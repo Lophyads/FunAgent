@@ -11,9 +11,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 from src.libs.embedding.base_embedding import BaseEmbedding
+from src.libs.embedding.validation import validate_vector, EmbeddingSourceError
 
 
-class OllamaEmbeddingError(RuntimeError):
+class OllamaEmbeddingError(EmbeddingSourceError):
     """Raised when Ollama Embeddings API call fails.
     
     This exception provides clear error messages without exposing
@@ -142,7 +143,7 @@ class OllamaEmbedding(BaseEmbedding):
                             f"Expected 'embedding' field but got: {list(result.keys())}"
                         )
                     
-                    embeddings.append(result["embedding"])
+                    embeddings.append(validate_vector(result["embedding"], self.get_dimension()))
                     
             except httpx.HTTPStatusError as e:
                 # HTTP error (4xx, 5xx)

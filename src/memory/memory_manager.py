@@ -1,5 +1,7 @@
 """Source authorization and physical memory dispatch."""
 from dataclasses import replace
+from datetime import datetime, timezone
+from contextlib import contextmanager
 from types import MappingProxyType
 import time
 
@@ -7,7 +9,8 @@ from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import ControlError, DomainError
 from .common import text, validate_query, NormalizeTopicName
 from .contracts import (MemoryQuery, MemoryRecord, MemorySearchResult, MemoryWriteReceipt,
-                        TopicConflict, TopicSelection, TOPIC_SYNC_MESSAGE, UNSET)
+                        MemoryFailure, TopicConflict, TopicSelection, TOPIC_SYNC_MESSAGE, UNSET)
+from .failure import BindIssue, ErrorIssue, FailureData, IssueData, IssueWarnings
 from .protocols import TopicCatalog
 from .policy import Outcome
 from ..observability.observation_mgr import ObservationMgr
@@ -15,10 +18,17 @@ from ..observability.projections import Memory, Query
 from .prompt import RecordData
 
 
+@contextmanager
 def _scope(context, name, **fields):
     mgr = ObservationMgr.GetInstance()
-    return mgr.Suspend() if context.purpose in {'review', 'management'} else mgr.Scope(
+    scope = mgr.Suspend() if context.purpose in {'review', 'management'} else mgr.Scope(
         name, run_id=context.run_id, purpose=context.purpose, **fields)
+    with scope:
+        try:
+            yield
+        except MemoryFailure as error:
+            mgr.Update(effect=error.issue.effect, output=lambda: FailureData(error))
+            raise
 
 
 def _receipt(result):
@@ -76,6 +86,8 @@ class MemoryManager:
             if topic_id is None:
                 return self._topics.Unassign(source_id, record_id)
             return self._assign_record(source_id, record_id, topic_id, require_same)
+        except ControlError:
+            raise
         except TopicConflict:
             if require_same:
                 raise
@@ -152,9 +164,42 @@ class MemoryManager:
         mgr = ObservationMgr.GetInstance()
         with _scope(context, 'memory.search', kind='retriever', input=lambda: Query(query)):
             result = self._search(query, context)
-            status = 'ok' if all(s == 'ok' for s in result.source_status.values()) else 'partial' if result.records else 'failed'
+            from .common import SearchStatus
+            status = SearchStatus(result.source_status)
             mgr.Complete(status=status, output=lambda: Memory(result))
             return result
+
+    def Check(self, source_ids, context):
+        """Explicit authorized probe. Evidence stays inside Search and is never returned."""
+        context.CheckCancelled()
+        if context.purpose != "management":
+            raise DomainError("DENIED", "Memory checks require management access")
+        names = tuple(dict.fromkeys(source_ids))
+        # Authorize the whole selection before any IO, including later sources.
+        for name in names:
+            self._authorize(name, "search", context)
+        sources = []
+        for name in names:
+            context.CheckCancelled()
+            result = self.Search(MemoryQuery("FunAgent memory connectivity check", (name,), limit=1), context)
+            status = result.source_status.get(name, "failed")
+            issues = result.issues
+            if status == "timeout" and not issues:
+                issues = (ErrorIssue(DomainError("MEMORY_TIMEOUT", ""), source_id=name, stage="search"),)
+            observed = status in {"ok", "partial"}
+            store = self._sources[name].get("store")
+            sources.append({"source_id": name, "status": status,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "stages": {"search": "verified" if observed else "not_verified",
+                    "embedding": ("not_applicable" if store == "sqlite" else
+                                  "verified" if store == "supabase" and observed else "not_verified"),
+                    "model_identity": "not_applicable" if store == "sqlite" else "not_verified",
+                    "profile_coverage": ("verified" if store == "supabase" and observed else
+                                         "not_applicable" if store == "sqlite" else "not_verified"),
+                    "index": "not_verified",
+                    "write": "not_verified"},
+                "issues": [IssueData(issue) for issue in issues]})
+        return {"sources": sources}
 
     def _search(self, query, context):
         mgr = ObservationMgr.GetInstance()
@@ -171,13 +216,14 @@ class MemoryManager:
                 self._authorize(name, "search", context)
                 if name not in selected:
                     selected.append(name)
-        groups, statuses, warnings = [], {}, []
+        groups, statuses, warnings, issues = [], {}, [], []
 
         def finish():
             # Preserve source-local ordering; scores are never compared.
             records = tuple(group[index] for index in range(max((len(g) for g in groups), default=0))
                             for group in groups if index < len(group))[:query.limit]
-            result = MemorySearchResult(records, statuses, tuple(warnings))
+            result = MemorySearchResult(records, statuses, tuple(dict.fromkeys((*warnings, *IssueWarnings(issues)))),
+                                        issues=tuple(dict.fromkeys(issues)))
             return result
 
         for name in selected:
@@ -199,12 +245,17 @@ class MemoryManager:
                                 any(not text(v) for v in (record.ref.record_id, record.content, record.type, record.citation))):
                             raise DomainError("MEMORY_PROTOCOL", "Invalid memory evidence")
                         seen.add(record.ref)
+                    status = result.source_status.get(name, "ok")
+                    if (set(result.source_status) - {name} or status not in {"ok", "partial"} or len(result.issues) > 16):
+                        raise DomainError("MEMORY_PROTOCOL", "Invalid memory source result")
+                    bound = tuple(BindIssue(issue, name, read=True) for issue in result.issues)
                     groups.append(result.records)
-                    statuses[name] = "ok"
+                    statuses[name] = "partial" if bound or status == "partial" else "ok"
+                    issues.extend(bound)
                     # Warnings are generated here; driver strings cannot leak credentials.
                     if f"{name}:FTS_UNAVAILABLE" in result.warnings:
                         warnings.append(f"{name}:FTS_UNAVAILABLE")
-                    mgr.Complete(status='ok')
+                    mgr.Complete(status=statuses[name])
                 except ControlError:
                     statuses[name] = "timeout"
                     warnings.append(f"{name}:DEADLINE")
@@ -216,21 +267,48 @@ class MemoryManager:
                     mgr.Complete(status='timeout', error_code='DEADLINE')
                 except DomainError as error:
                     context.CheckCancelled()
+                    issue = ErrorIssue(error, source_id=name, stage="search")
+                    issues.append(issue)
+                    if isinstance(error, MemoryFailure):
+                        issues.extend(BindIssue(i, name, read=True) for i in error.related)
                     if error.code == "MEMORY_TIMEOUT":
                         mgr.Complete(status='timeout', error_code=error.code)
                         statuses[name] = "timeout"
-                        warnings.append(f"{name}:DEADLINE")
+                        warnings.append(f"{name}:MEMORY_TIMEOUT")
                         continue
                     statuses[name] = "failed"
-                    code = error.code if error.code in {"MEMORY_PROTOCOL", "MEMORY_STORAGE", "MEMORY_SOURCE", "NOT_READY"} else "MEMORY_SOURCE"
+                    code = issue.code
                     warnings.append(f"{name}:{code}")
                     mgr.Complete(status='failed', error_code=code)
                 except Exception:
                     context.CheckCancelled()
                     statuses[name] = "failed"
                     warnings.append(f"{name}:MEMORY_SOURCE")
+                    issues.append(ErrorIssue(None, source_id=name, stage="search"))
                     mgr.Complete(status='failed', error_code='MEMORY_SOURCE')
         return finish()
+
+    @staticmethod
+    def _change(store, operation, source_id, context, *args):
+        """Preserve structured failures; legacy stores cannot prove post-dispatch failure is harmless."""
+        try:
+            return getattr(store, operation)(*args, context)
+        except ControlError:
+            raise
+        except MemoryFailure as error:
+            if error.ref is not None and error.ref.source_id != source_id:
+                raise MemoryFailure(ErrorIssue(DomainError('MEMORY_PROTOCOL', ''), source_id=source_id,
+                                               stage='verify', effect='unknown')) from None
+            raise MemoryFailure(BindIssue(error.issue, source_id), ref=error.ref, version=error.version,
+                                related=tuple(BindIssue(i, source_id) for i in error.related)) from None
+        except DomainError as error:
+            harmless = error.code in {'INVALID_REQUEST', 'DENIED', 'UNSUPPORTED', 'NOT_FOUND', 'CONFLICT',
+                'CONFIG_CREDENTIAL', 'NOT_READY'} or error.code.startswith('EMBEDDING_')
+            raise MemoryFailure(ErrorIssue(error, source_id=source_id,
+                effect='none' if harmless else 'unknown')) from None
+        except Exception:
+            context.CheckCancelled()
+            raise MemoryFailure(ErrorIssue(None, source_id=source_id, effect='unknown')) from None
 
     def List(self, query, context):
         mgr = ObservationMgr.GetInstance()
@@ -249,12 +327,34 @@ class MemoryManager:
             store = self._authorize(draft.source_id, 'write', context)
             self._check_evidence(draft.evidence, context)
             topic_id = self._select_topic(draft.source_id, topic)
-            result = store.Write(draft, context)
+            try:
+                result = self._change(store, 'Write', draft.source_id, context, draft)
+            except MemoryFailure as error:
+                mgr.Update(effect=error.issue.effect, output=lambda: FailureData(error))
+                if (error.code in {'INDEX_NOT_READY', 'INDEX_STATE_UNKNOWN'} and
+                        error.issue.effect == 'known' and error.ref is not None and error.version is not None):
+                    context.CheckCancelled()
+                    try:
+                        self._sync_topic(draft.source_id, error.ref.record_id, topic_id,
+                                         require_same=context.purpose == 'management')
+                    except ControlError:
+                        raise
+                    except DomainError:
+                        raise MemoryFailure(error.issue, ref=error.ref, version=error.version,
+                            related=(*error.related[:15], ErrorIssue(DomainError('TOPIC_SYNC_FAILED', ''),
+                                source_id=draft.source_id, stage='topic', effect='known'))) from None
+                raise
             mgr.Update(effect='known', response_received=True, output=lambda: _receipt(result))
             if (not isinstance(result, MemoryRecord) or result.ref.source_id != draft.source_id
                     or not text(result.ref.record_id) or len(result.ref.record_id) > 128):
-                raise DomainError("MEMORY_PROTOCOL", "Memory write returned an invalid receipt; verify the source before retrying")
-            snapshot = self._sync_topic(draft.source_id, result.ref.record_id, topic_id, require_same=context.purpose == "management")
+                raise MemoryFailure(ErrorIssue(DomainError('MEMORY_PROTOCOL', ''), source_id=draft.source_id, effect='unknown'))
+            try:
+                snapshot = self._sync_topic(draft.source_id, result.ref.record_id, topic_id, require_same=context.purpose == "management")
+            except ControlError:
+                raise
+            except DomainError as error:
+                raise MemoryFailure(ErrorIssue(error, source_id=draft.source_id, stage='topic', effect='known'),
+                                    ref=result.ref, version=result.version) from None
             mgr.Complete(status='ok', output=lambda: _receipt(result), effect='known')
             return MemoryWriteReceipt(result, snapshot)
 
@@ -266,7 +366,7 @@ class MemoryManager:
                     **{key: getattr(patch, key) for key in ('subject', 'event_at', 'origin') if getattr(patch, key) != UNSET})):
             store = self._authorize(ref.source_id, 'update', context)
             self._check_evidence(patch.evidence, context)
-            result = store.Update(ref, patch, expected_version, context)
+            result = self._change(store, 'Update', ref.source_id, context, ref, patch, expected_version)
             mgr.Complete(status='ok', output=lambda: _receipt(result), effect='known')
             return result
 
@@ -285,9 +385,14 @@ class MemoryManager:
             self._check_evidence(context.memory_evidence, context)
             if self._topics is None:
                 raise DomainError("NOT_READY", "Topic catalog is unavailable")
-            result = store.Delete(ref, expected_version, context)
+            result = self._change(store, 'Delete', ref.source_id, context, ref, expected_version)
             mgr.Update(effect='known', response_received=True)
-            self._sync_topic(ref.source_id, ref.record_id)
+            try:
+                self._sync_topic(ref.source_id, ref.record_id)
+            except ControlError:
+                raise
+            except DomainError as error:
+                raise MemoryFailure(ErrorIssue(error, source_id=ref.source_id, stage='topic', effect='known')) from None
             mgr.Complete(status='ok', output=lambda: _receipt(result), effect='known')
             return result
 
@@ -305,6 +410,8 @@ class MemoryManager:
             return ()
         result = self.Search(MemoryQuery(source_ids=names, kind="episodic", types=("profile",), limit=policy.get("max_records", 10)), context)
         if any(result.source_status.get(name) != "ok" for name in names):
+            if result.issues:
+                raise MemoryFailure(result.issues[0], related=result.issues[1:17])
             raise DomainError("MEMORY_SOURCE", "Profile source failed")
         from .prompt import FitBranch
         return FitBranch("profile", result.records, {name: "ready" if any(r.ref.source_id == name for r in result.records) else "empty" for name in names},

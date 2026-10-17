@@ -10,6 +10,8 @@ from ...memory.contracts import MemoryDraft, MemoryListQuery, MemoryPatch, Memor
 from ...memory.topic_projection import TopicData
 from ...memory.policy import Outcome
 from ...memory.prompt import RecordData
+from ...memory.contracts import MemoryFailure
+from ...memory.failure import CODES, ErrorIssue, FailureData, IssueData
 from ...memory.protocols import MemoryReader, MemoryWriter
 from ..tool_registrar import ToolEntry
 from ..contracts import ToolDecision
@@ -97,10 +99,12 @@ class MemoryHandler:
                 value = {"records": [RecordData(r) for r in page.items], "next_cursor": page.next_cursor}
             elif action == "search":
                 result = reader.Search(MemoryQuery(args["text"], (source,), types=args.get("types", ()), limit=args.get("limit", 10), **filters), context)
-                if context.purpose == "review" and (result.warnings or result.source_status.get(source) != "ok"):
-                    raise DomainError("MEMORY_STORAGE", "Review memory search did not complete")
+                if context.purpose == "review" and (result.warnings or result.issues or result.source_status.get(source) != "ok"):
+                    raise MemoryFailure(result.issues[0] if result.issues else
+                                        ErrorIssue(DomainError('MEMORY_SOURCE', ''), source_id=source, stage='search'))
                 value = {"records": [RecordData(r) for r in result.records],
-                         "source_status": dict(result.source_status), "warnings": result.warnings}
+                         "source_status": dict(result.source_status), "warnings": result.warnings,
+                         "issues": [IssueData(i) for i in result.issues]}
             elif action == "add":
                 selection = TopicSelection.FromData(args.get("topic"))
                 evidence = _evidence(args, context)
@@ -131,13 +135,18 @@ class MemoryHandler:
                               "known" if action in {"add", "replace", "remove"} else "none")
         except ControlError:
             raise
+        except MemoryFailure as error:
+            effect = error.issue.effect
+            status = 'unknown' if effect == 'unknown' else 'denied' if error.code == 'DENIED' and effect == 'none' else 'error'
+            return ToolResult('', status, json.dumps(FailureData(error), ensure_ascii=False), effect)
         except DomainError as error:
-            if error.code == "TOPIC_SYNC_FAILED":
-                return ToolResult("", "error", json.dumps({"code": error.code, "message": str(error)}, ensure_ascii=False), "known")
-            if error.code in {"MEMORY_TIMEOUT", "MEMORY_PROTOCOL"}:
-                return ToolResult("", "unknown", json.dumps({"code": error.code}), "unknown")
-            code = error.code if error.code in {"DENIED", "UNSUPPORTED", "NOT_FOUND", "CONFLICT", "INVALID_REQUEST", "MEMORY_STORAGE"} else "MEMORY_STORAGE"
-            return ToolResult("", "denied" if code == "DENIED" else "error", json.dumps({"code": code}))
+            code = error.code if error.code in CODES else "MEMORY_STORAGE"
+            mutation = args.get('action') in {'add', 'replace', 'remove'}
+            effect = 'known' if code == 'TOPIC_SYNC_FAILED' else 'unknown' if mutation and code in {
+                'MEMORY_TIMEOUT', 'MEMORY_PROTOCOL', 'MEMORY_SOURCE', 'MEMORY_STORAGE'} else 'none'
+            failure = MemoryFailure(ErrorIssue(DomainError(code, ''), effect=effect))
+            status = 'unknown' if effect == 'unknown' else 'denied' if code == 'DENIED' else 'error'
+            return ToolResult('', status, json.dumps(FailureData(failure), ensure_ascii=False), effect)
 
 
 class MemoryPolicy:

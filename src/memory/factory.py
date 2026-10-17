@@ -62,6 +62,34 @@ def _cognee(source_id, settings, conf_dir):
 STORES["cognee"] = _cognee
 
 
+def SourceSemantics(settings):
+    """Static configuration query; never instantiate a driver or perform IO."""
+    from .sqlite import SQLiteMemoryStore
+    from .supabase import SupabaseMemoryStore
+    from .cognee import CogneeMemoryStore
+    from .callback import CallbackMemoryStore
+    driver = {"sqlite": SQLiteMemoryStore, "supabase": SupabaseMemoryStore,
+              "cognee": CogneeMemoryStore, "callback": CallbackMemoryStore}.get(settings["store"])
+    return (driver.supported_types, driver.supports_deleted_read) if driver else (None, False)
+
+
+def ValidatePolicies(sources, policies):
+    """Reject semantic disconnections before constructing clients or loading credentials."""
+    for purpose, required_type in (("profile", "profile"), ("review", None)):
+        policy = policies.get(purpose, {})
+        if not policy.get("enabled", False):
+            continue
+        for name in policy.get("sources", ()):
+            types, deleted = SourceSemantics(sources[name])
+            if (required_type is not None and types is not None and required_type not in types or
+                    purpose == "review" and not deleted):
+                raise DomainError("CONFIG_REFERENCE", f"Memory source {name} cannot serve {purpose}")
+    review, facts = policies.get("review", {}), policies.get("facts", {})
+    if review.get("enabled", False) and (not facts.get("enabled", False) or
+            not set(review.get("sources", ())) <= set(facts.get("sources", ()))):
+        raise DomainError("CONFIG_REFERENCE", "Review write sources must be enabled facts sources")
+
+
 def CreateInspection(conf, own):
     from .inspection import MemoryInspection
     from .cognee_inspection import CogneeInspection

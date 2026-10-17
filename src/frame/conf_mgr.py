@@ -434,6 +434,8 @@ def _validate(docs):
         if "input_max_chars" in policy:
             _number(policy["input_max_chars"], "memory.policies.input_max_chars", integer=True, minimum=256)
     policies = memory.get("policies", {})
+    from ..memory.factory import ValidatePolicies
+    ValidatePolicies(sources, policies)
     if any(policies.get(branch, {}).get("enabled", False) and policies.get(branch, {}).get("sources") for branch in ("facts", "knowledge")):
         _require("profile" in policies.get("recall", {}), "memory.policies.recall.profile")
     log_options = _table(log, "options", "log.options", required=True)

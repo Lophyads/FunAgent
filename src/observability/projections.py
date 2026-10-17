@@ -70,8 +70,10 @@ def Query(query):
 
 def Memory(result):
     from ..memory.prompt import RecordData
+    from ..memory.failure import IssueData
     return dict(records=[RecordData(r) for r in islice(result.records, 129)],
                 source_status=result.source_status, warnings=result.warnings,
+                issues=[IssueData(i) for i in result.issues],
                 status=getattr(result, 'status', None),
                 queries=[Query(q) for q in islice(getattr(result, 'queries', ()), 129)])
 

@@ -6,6 +6,35 @@ from ..frame.contracts import DomainError, controlled_lock
 from .contracts import MemoryRecord
 
 
+def SearchStatus(statuses):
+    values = tuple(statuses.values())
+    if not values or all(value == 'ok' for value in values):
+        return 'ok'
+    if all(value in {'failed', 'timeout', 'skipped'} for value in values):
+        return 'failed'
+    return 'partial'
+
+
+def MergeSourceStatus(previous, current):
+    if previous is None or previous == 'skipped':
+        return current
+    if current == 'skipped' or previous == current:
+        return previous
+    if previous in {'failed', 'timeout'} and current in {'failed', 'timeout'}:
+        return 'failed'
+    return 'partial'
+
+
+def BranchStatus(records, statuses, warnings):
+    if statuses and all(value == 'skipped' for value in statuses.values()):
+        return 'skipped'
+    if statuses and all(value in {'failed', 'timeout', 'skipped'} for value in statuses.values()):
+        return 'partial' if records else 'failed'
+    if warnings or 'partial' in statuses.values():
+        return 'partial'
+    return 'ready' if records else 'empty'
+
+
 def RecordIdentity(record: MemoryRecord) -> tuple:
     """Identify a candidate by its reference, version and unmodified semantic values."""
     return (record.ref, record.version, record.content, record.kind, record.type,

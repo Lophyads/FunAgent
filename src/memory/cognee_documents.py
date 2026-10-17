@@ -16,8 +16,9 @@ from urllib.parse import quote
 from uuid import UUID
 
 from ..frame.contracts import ControlError, DomainError, Page
-from .common import text, timestamp, validate_content, validate_filters, validate_metadata
-from .contracts import MemoryRecord, MemoryRef, UNSET
+from .common import text, timestamp, validate_content, validate_filters, validate_metadata, controlled_lock
+from .contracts import MemoryFailure, MemoryIssue, MemoryRecord, MemoryRef, UNSET
+from .failure import ErrorIssue
 
 
 MARKER = "<!-- funagent-memory-v1:"
@@ -164,43 +165,128 @@ class CogneeDocuments:
             query.event_from is None or record.event_at is not None and record.event_at >= timestamp(query.event_from)) and (
             query.event_to is None or record.event_at is not None and record.event_at <= timestamp(query.event_to))
 
+    def _completion(self, data_ids, context):
+        """Fresh per-operation observations, independent of inspection TTL caches."""
+        payload = self._http.Request('GET', f'/datasets/{self._document_dataset}/processing-status',
+                                     context, stage='verify')
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise DomainError('MEMORY_PROTOCOL', 'Invalid Cognee completion response')
+        states = {}
+        for item in payload['items']:
+            if not isinstance(item, dict) or type(item.get('completed')) is not bool:
+                raise DomainError('MEMORY_PROTOCOL', 'Invalid Cognee completion observation')
+            identifier = _uuid(item.get('id'))
+            if identifier in states:
+                raise DomainError('MEMORY_PROTOCOL', 'Duplicate Cognee completion observation')
+            states[identifier] = item['completed']
+        return states if data_ids is None else {identifier: states.get(identifier) for identifier in data_ids}
+
+    def _index_failure(self, code, record, *, related=()):
+        return MemoryFailure(MemoryIssue(code=code, stage='verify', source_id=self.source_id, effect='known'),
+                             ref=record.ref, version=record.version, related=related)
+
+    def _verify_indexed(self, ref, expected_version, context, *, synchronous=False):
+        record = self._find(ref.record_id, context)
+        if record.version != expected_version:
+            raise MemoryFailure(MemoryIssue(code='INDEX_STATE_UNKNOWN', stage='verify', effect='unknown'))
+        try:
+            completed = self._completion((ref.record_id,), context)[ref.record_id]
+        except ControlError:
+            raise
+        except DomainError as error:
+            raise self._index_failure('INDEX_STATE_UNKNOWN', record,
+                related=(ErrorIssue(error, source_id=self.source_id, stage='verify'),)) from None
+        if completed is False:
+            raise self._index_failure('INDEX_NOT_READY', record)
+        # Only a fresh synchronous remember receipt binds this observation to raw.
+        # The installed upstream has no verified update/idempotent version contract.
+        if completed is not True or not synchronous:
+            raise self._index_failure('INDEX_STATE_UNKNOWN', record)
+        current = self._find(ref.record_id, context)
+        if current.version != expected_version:
+            raise MemoryFailure(MemoryIssue(code='INDEX_STATE_UNKNOWN', stage='verify', effect='unknown'))
+        return current
+
+    def _written(self, name, raw, context):
+        found = None
+        for _, row in self._rows(context):
+            if row['name'].removesuffix('.txt') == name.removesuffix('.txt'):
+                if found is not None:
+                    raise DomainError('MEMORY_PROTOCOL', 'Duplicate Cognee document identity')
+                record = self._record(row, context)
+                if record is not None and record.version == sha256(raw).hexdigest():
+                    found = record
+                else:
+                    raise DomainError('CONFLICT', 'Memory write identity already used')
+        return found
+
+    def _reconcile(self, error, name, raw, context):
+        """Read back once within the original deadline; never resubmit a mutation."""
+        context.CheckCancelled()
+        try:
+            record = self._written(name, raw, context)
+            if record is not None:
+                try:
+                    self._verify_indexed(record.ref, record.version, context)
+                except MemoryFailure as verified:
+                    raise MemoryFailure(verified.issue, ref=verified.ref, version=verified.version,
+                        related=(*verified.related, ErrorIssue(error, source_id=self.source_id, effect='unknown'))[:16]) from None
+        except ControlError:
+            raise
+        except MemoryFailure as verified:
+            if verified.issue.effect == 'known':
+                raise
+        except DomainError:
+            pass
+        raise error
+
     def Write(self, draft, context):
         validate_content(draft.content, draft.evidence, draft.type)
-        if draft.type != "note":
-            raise DomainError("UNSUPPORTED", "Cognee stores only note memories")
+        if draft.type != 'note':
+            raise DomainError('UNSUPPORTED', 'Cognee stores only note memories')
         subject, event_at, origin = validate_metadata(draft.subject, draft.event_at, draft.origin)
         if draft.source_id != self.source_id or not text(draft.write_key):
-            raise DomainError("INVALID_REQUEST", "Invalid memory write identity")
-        metadata = {"source_id": self.source_id, "write_key": draft.write_key, "type": draft.type,
-                    "evidence": list(draft.evidence), "subject": subject, "event_at": event_at, "origin": origin}
-        raw = _pack(draft.content, metadata)
+            raise DomainError('INVALID_REQUEST', 'Invalid memory write identity')
+        raw = _pack(draft.content, dict(source_id=self.source_id, write_key=draft.write_key, type=draft.type,
+            evidence=list(draft.evidence), subject=subject, event_at=event_at, origin=origin))
         if len(raw) > 2 * 1024 * 1024:
-            raise DomainError("INVALID_REQUEST", "Cognee memory document is too large")
-        name = "funagent-" + sha256((self.source_id + ":" + draft.write_key).encode()).hexdigest() + ".txt"
-        child = self._document_context(context, "write")
+            raise DomainError('INVALID_REQUEST', 'Cognee memory document is too large')
+        name = 'funagent-' + sha256((self.source_id + ':' + draft.write_key).encode()).hexdigest() + '.txt'
+        child = self._document_context(context, 'write')
+        submitted = False
         try:
-            with self._document_lock, self._http.Borrow(child):
-                for _, row in self._rows(child):
-                    if row["name"].removesuffix(".txt") == name.removesuffix(".txt"):
-                        record = self._record(row, child)
-                        if record is not None and self._raw(record.ref.record_id, child) == raw:
-                            return record
-                        raise DomainError("CONFLICT", "Memory write identity already used")
-                result = self._http.Request("POST", "/remember", child,
-                    data={"datasetId": self._document_dataset, "run_in_background": "false", "self_improvement": "false"},
-                    files=[("data", (name, raw, "text/plain"))])
-                if not isinstance(result, dict) or result.get("status") != "completed" or (
-                        result.get("dataset_id") is not None and _uuid(result["dataset_id"]) != self._document_dataset):
-                    raise DomainError("MEMORY_SOURCE", "Cognee document indexing did not complete")
-                for _, row in self._rows(child):
-                    if row["name"].removesuffix(".txt") == name.removesuffix(".txt"):
-                        record = self._record(row, child)
-                        if record is not None and self._raw(record.ref.record_id, child) == raw:
-                            return record
-                raise DomainError("MEMORY_PROTOCOL", "Cognee did not return the written document")
+            with controlled_lock(self._document_lock, child), self._http.Borrow(child):
+                existing = self._written(name, raw, child)
+                if existing is not None:
+                    return self._verify_indexed(existing.ref, existing.version, child)
+                try:
+                    result = self._http.Request('POST', '/remember', child, mutation=True, stage='index',
+                        data={'datasetId': self._document_dataset, 'run_in_background': 'false', 'self_improvement': 'false'},
+                        files=[('data', (name, raw, 'text/plain'))])
+                    submitted = True
+                except ControlError:
+                    raise
+                except MemoryFailure as error:
+                    if error.issue.effect == 'unknown':
+                        self._reconcile(error, name, raw, child)
+                    raise
+                record = self._written(name, raw, child)
+                if record is None:
+                    raise MemoryFailure(MemoryIssue(code='MEMORY_PROTOCOL', stage='verify', effect='unknown'))
+                valid = (isinstance(result, dict) and result.get('status') == 'completed' and
+                         result.get('dataset_id', self._document_dataset) == self._document_dataset and
+                         result.get('data_id', record.ref.record_id) == record.ref.record_id)
+                return self._verify_indexed(record.ref, record.version, child, synchronous=valid)
         except ControlError:
-            context.CheckCancelled()
-            raise DomainError("MEMORY_TIMEOUT", "Cognee memory write timed out") from None
+            raise
+        except MemoryFailure as error:
+            if submitted and error.issue.effect == 'none':
+                raise MemoryFailure(replace(error.issue, effect='unknown'), related=error.related) from None
+            raise
+        except DomainError as error:
+            if submitted:
+                raise MemoryFailure(ErrorIssue(error, stage='verify', effect='unknown')) from None
+            raise
 
     def _current(self, ref, expected_version, context):
         if ref.source_id != self.source_id or not text(expected_version):
@@ -211,49 +297,63 @@ class CogneeDocuments:
         return record
 
     def Update(self, ref, patch, expected_version, context):
-        child = self._document_context(context, "update")
+        child = self._document_context(context, 'update')
+        submitted = False
         try:
-            with self._document_lock, self._http.Borrow(child):
+            with controlled_lock(self._document_lock, child), self._http.Borrow(child):
                 old = self._current(ref, expected_version, child)
                 category = old.type if patch.type is None else patch.type
                 validate_content(patch.content, patch.evidence, category)
-                if category != "note":
-                    raise DomainError("UNSUPPORTED", "Cognee stores only note memories")
+                if category != 'note':
+                    raise DomainError('UNSUPPORTED', 'Cognee stores only note memories')
                 subject, event_at, origin = validate_metadata(*(getattr(old, key) if getattr(patch, key) is UNSET
-                                                                else getattr(patch, key) for key in ("subject", "event_at", "origin")))
+                    else getattr(patch, key) for key in ('subject', 'event_at', 'origin')))
                 raw = self._raw(old.ref.record_id, child)
                 if sha256(raw).hexdigest() != expected_version:
-                    raise DomainError("CONFLICT", "Memory version changed")
+                    raise DomainError('CONFLICT', 'Memory version changed')
                 _, metadata = _unpack(raw)
-                metadata.update(type=category, evidence=list(patch.evidence), subject=subject,
-                                event_at=event_at, origin=origin)
+                metadata.update(type=category, evidence=list(patch.evidence), subject=subject, event_at=event_at, origin=origin)
                 revised = _pack(patch.content, metadata)
                 if len(revised) > 2 * 1024 * 1024:
-                    raise DomainError("INVALID_REQUEST", "Cognee memory document is too large")
-                result = self._http.Request("PATCH", "/update", child,
-                    params={"dataset_id": self._document_dataset, "data_id": old.ref.record_id},
-                    files=[("data", ("funagent-" + sha256((self.source_id + ":" + metadata["write_key"]).encode()).hexdigest() + ".txt",
-                                     revised, "text/plain"))], status_codes={404: "NOT_FOUND"})
-                if not isinstance(result, dict) or result.get("status") not in {"incremental", "unchanged", "full_rebuild"} or (
-                        result.get("data_id") is not None and _uuid(result["data_id"]) != old.ref.record_id):
-                    raise DomainError("MEMORY_SOURCE", "Cognee document update failed")
-                record = self._find(old.ref.record_id, child)
-                if (record.content != patch.content or record.evidence != tuple(patch.evidence) or
-                        record.type != category or (record.subject, record.event_at, record.origin) !=
-                        (subject, event_at, origin)):
-                    raise DomainError("MEMORY_PROTOCOL", "Cognee document update was not visible")
-                return record
+                    raise DomainError('INVALID_REQUEST', 'Cognee memory document is too large')
+                name = 'funagent-' + sha256((self.source_id + ':' + metadata['write_key']).encode()).hexdigest() + '.txt'
+                try:
+                    result = self._http.Request('PATCH', '/update', child, mutation=True, stage='index',
+                        params={'dataset_id': self._document_dataset, 'data_id': old.ref.record_id},
+                        files=[('data', (name, revised, 'text/plain'))], status_codes={404: 'NOT_FOUND'})
+                    submitted = True
+                except ControlError:
+                    raise
+                except MemoryFailure as error:
+                    if error.issue.effect == 'unknown':
+                        self._reconcile(error, name, revised, child)
+                    raise
+                record = self._find(ref.record_id, child)
+                if record.version != sha256(revised).hexdigest():
+                    raise MemoryFailure(MemoryIssue(code='INDEX_STATE_UNKNOWN', stage='verify', effect='unknown'))
+                if (not isinstance(result, dict) or result.get('data_id', ref.record_id) != ref.record_id or
+                        result.get('dataset_id', self._document_dataset) != self._document_dataset):
+                    raise self._index_failure('INDEX_STATE_UNKNOWN', record,
+                        related=(MemoryIssue(code='MEMORY_PROTOCOL', stage='index', effect='known'),))
+                return self._verify_indexed(record.ref, record.version, child)
         except ControlError:
-            context.CheckCancelled()
-            raise DomainError("MEMORY_TIMEOUT", "Cognee memory update timed out") from None
+            raise
+        except MemoryFailure as error:
+            if submitted and error.issue.effect == 'none':
+                raise MemoryFailure(replace(error.issue, effect='unknown'), related=error.related) from None
+            raise
+        except DomainError as error:
+            if submitted:
+                raise MemoryFailure(ErrorIssue(error, stage='verify', effect='unknown')) from None
+            raise
 
     def Delete(self, ref, expected_version, context):
         child = self._document_context(context, "delete")
         try:
-            with self._document_lock, self._http.Borrow(child):
+            with controlled_lock(self._document_lock, child), self._http.Borrow(child):
                 self._current(ref, expected_version, child)
                 self._http.Request("DELETE", f"/datasets/{self._document_dataset}/data/{_uuid(ref.record_id)}",
-                                   child, response_mode="bytes", status_codes={404: "NOT_FOUND"})
+                                   child, mutation=True, response_mode="bytes", status_codes={404: "NOT_FOUND"})
         except ControlError:
             context.CheckCancelled()
             raise DomainError("MEMORY_TIMEOUT", "Cognee memory delete timed out") from None

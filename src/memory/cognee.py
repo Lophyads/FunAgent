@@ -6,8 +6,9 @@ import re
 from uuid import UUID
 
 from ..frame.contracts import ControlError, DomainError
-from .common import text, validate_query
-from .contracts import MemorySearchResult
+from .common import text, validate_query, controlled_lock
+from .contracts import MemoryIssue, MemorySearchResult
+from .failure import ErrorIssue, IssueWarnings
 from .transport import JSONHTTP, ValidateConnection
 from .cognee_documents import CogneeDocuments, _uuid
 from .cognee_datasets import CogneeDataset
@@ -60,6 +61,8 @@ def Headers(settings):
 
 
 class CogneeMemoryStore(CogneeDocuments):
+    supported_types = frozenset({"note"})
+    supports_deleted_read = False
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, settings, source_id, *, transport=None, _dataset_id=None):
@@ -97,28 +100,43 @@ class CogneeMemoryStore(CogneeDocuments):
             raise DomainError("UNSUPPORTED", "Cognee physically deletes notes; deleted receipts are unavailable")
         child = self._document_context(context, "search")
         try:
-            with self._document_lock, self._http.Borrow(child):
+            with controlled_lock(self._document_lock, child), self._http.Borrow(child):
                 candidates = None
                 if query.text.strip():
                     payload = self._http.Post("/recall", {"query": query.text, "search_type": self._search_type,
                         "scope": ["graph"], "top_k": 100, "only_context": False, "stream": False,
-                        "dataset_ids": [self._document_dataset]}, child)
+                        "dataset_ids": [self._document_dataset]}, child, stage="search")
                     candidates = self._candidates(payload)
-                    if not candidates:
-                        return MemorySearchResult((), {self.source_id: "ok"})
-                rows = self._rows(child)
+                rows = tuple(self._rows(child))
+                identifiers = tuple(dict.fromkeys((*(_uuid(row.get('id')) for _, row in rows), *(candidates or ()))))
+                issues = []
+                try:
+                    states = self._completion(None, child)
+                    states = {**states, **{identifier: states.get(identifier) for identifier in identifiers}}
+                except ControlError:
+                    raise
+                except DomainError as error:
+                    states = {identifier: None for identifier in identifiers}
+                    issues.append(MemoryIssue(code='INDEX_STATE_UNKNOWN', stage='verify', source_id=self.source_id))
+                    issues.append(ErrorIssue(error, source_id=self.source_id, stage='verify'))
+                for code, observed in (('INDEX_NOT_READY', False), ('INDEX_STATE_UNKNOWN', None)):
+                    if any(value is observed for value in states.values()):
+                        issues.append(MemoryIssue(code=code, stage='verify', source_id=self.source_id))
                 if candidates is not None:
                     by_id = {_uuid(row.get("id")): row for _, row in rows}
                     rows = ((0, by_id[identifier]) for identifier in candidates if identifier in by_id)
                 records = []
                 for _, row in rows:
+                    if states.get(_uuid(row.get('id'))) is not True:
+                        continue
                     record = self._record(row, child)
                     if record is not None and self._matches(record, query):
                         records.append(record)
                         if len(records) == query.limit:
                             break
                 child.CheckCancelled()
-                return MemorySearchResult(tuple(records), {self.source_id: "ok"})
+                return MemorySearchResult(tuple(records), {self.source_id: "partial" if issues else "ok"},
+                                          IssueWarnings(issues), issues=tuple(issues))
         except ControlError:
             context.CheckCancelled()
             raise DomainError("MEMORY_TIMEOUT", "Cognee memory search timed out") from None

@@ -4,7 +4,7 @@ from math import isfinite
 from collections.abc import Mapping
 
 from ..frame.contracts import DomainError
-from .contracts import EmbeddingProfile
+from .contracts import EmbeddingProfile, MemoryFailure, MemoryIssue
 from .common import text
 from .transport import JSONHTTP
 from ..observability.observation_mgr import ObservationMgr
@@ -20,7 +20,10 @@ def ValidateProfile(profile):
 
 
 def ValidateVector(vector, dimensions):
-    if (not isinstance(vector, (list, tuple)) or len(vector) != dimensions or
+    if isinstance(vector, (list, tuple)) and len(vector) != dimensions:
+        raise MemoryFailure(MemoryIssue(code="EMBEDDING_DIMENSION_MISMATCH", stage="embedding",
+                            expected_dimensions=dimensions, actual_dimensions=len(vector)))
+    if (not isinstance(vector, (list, tuple)) or
             any(type(value) not in (int, float) or not isfinite(value) for value in vector) or
             not any(vector)):
         raise DomainError("EMBEDDING_PROTOCOL", "Invalid embedding vector")

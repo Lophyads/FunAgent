@@ -21,7 +21,8 @@ export class ApiClient {
   constructor(store){this.store=store;this.source=null;this.generations={};this.seq=-1;this.epoch=null;this.pending=[];
     this.historyTimers=new Map();this.historyFlights=new Map();this.closed=false;this.expiryTimer=setInterval(()=>this.interactions().catch(()=>{}),5000);}
   async wire(path,options={}){const response=await fetch(path,{...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...options.headers}});
-    let data;try{data=await response.json();}catch{data={};}if(!response.ok){const e=new Error(data.error?.message||`HTTP ${response.status}`);e.status=response.status;e.code=data.error?.code;e.path=data.error?.path;throw e;}return data;}
+    let data;try{data=await response.json();}catch{data={};}if(!response.ok){const e=new Error(data.error?.message||`HTTP ${response.status}`);e.status=response.status;e.code=data.error?.code;e.path=data.error?.path;
+      for(const key of ['effect','ref','version','issues'])e[key]=data.error?.[key];throw e;}return data;}
   traceSessions({limit=50,offset=0,signal}={}){return this.wire(`/trace-sessions?limit=${limit}&offset=${offset}`,{signal});}
   traceOverview({sessionId,unassigned=false,limit=50,offset=0,signal}={}){const query=new URLSearchParams({view:'overview',limit,offset});if(unassigned)query.set('unassigned','1');else if(sessionId)query.set('session_id',sessionId);return this.wire(`/traces?${query}`,{signal});}
   traceReview(taskId,{signal}={}){return this.wire(`/tasks/${encodeURIComponent(taskId)}/trace`,{signal});}
@@ -90,7 +91,10 @@ export class ApiClient {
     if(search)q.set('text',search);else if(params.get('cursor'))q.set('cursor',params.get('cursor'));
     if(!search){for(const key of ['topic_id','unclassified'])if(params.has(key))q.set(key,params.get(key));}
     const data=await this.wire(`/memory/${search?'search':'records'}?${q}`);
-    if(data.source_status?.[source.source_id]&&data.source_status[source.source_id]!=='ok')throw new Error('记忆来源暂时无法读取，请检查服务后重试。');
+    if(['failed','timeout'].includes(data.source_status?.[source.source_id])){
+      const issue=data.issues?.[0],error=new Error(`记忆检索未完成${issue?.code?'：'+issue.code:''}，请检查服务后重试。`);
+      error.code=issue?.code;error.issues=data.issues;error.effect='none';throw error;
+    }
     return {...data,readonly:Boolean(search),entries:data.records.map(r=>({...r,id:r.record_id,event_timestamp:r.event_at,event_at:dateLabel(r.event_at)}))};
   }
   async writeMemory(source,kind,body){

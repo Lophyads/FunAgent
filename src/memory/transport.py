@@ -5,7 +5,9 @@ from threading import Condition, Lock
 from urllib.parse import urlsplit
 import json
 
-from ..frame.contracts import DomainError
+from ..frame.contracts import ControlError, DomainError
+from .contracts import MemoryFailure, MemoryIssue
+from .failure import CODES, HTTPIssue
 
 
 def ValidateConnection(endpoint, timeout):
@@ -51,21 +53,31 @@ class JSONHTTP:
                 self._active -= 1
                 self._condition.notify_all()
 
-    def Post(self, path, payload, context):
-        return self.Request("POST", path, context, json=payload)
+    def Post(self, path, payload, context, *, mutation=False, stage=None):
+        return self.Request("POST", path, context, json=payload, mutation=mutation, stage=stage)
 
-    def Request(self, method, path, context, *, response_mode="json", status_codes=None, **kwargs):
+    def Request(self, method, path, context, *, response_mode="json", status_codes=None,
+                mutation=False, stage=None, **kwargs):
         """Bounded JSON responses, also for eval uploads and status queries."""
+        stage = stage or ('embedding' if self._protocol == 'EMBEDDING_PROTOCOL' else 'request')
         with self.Borrow(context):
+            dispatched, status = False, None
+            def failure(code, *, retryable=False, effect=None):
+                if code not in CODES:
+                    return DomainError(code, "Memory request failed")
+                return MemoryFailure(MemoryIssue(code=code, stage=stage, http_status=status,
+                    retryable=retryable, effect=effect or ('unknown' if mutation and dispatched else 'none')))
             try:
                 context.CheckCancelled()
+                dispatched = True
                 with self._response(method, path, context, **kwargs) as response:
+                    status = response.status_code
                     parts, size = [], 0
                     for part in response.iter_bytes():
                         context.CheckCancelled()
                         size += len(part)
                         if size > 2 * 1024 * 1024:
-                            raise DomainError('INSPECTION_TOO_LARGE' if self._protocol == 'INSPECTION_PROTOCOL' else self._protocol, "Memory response is too large")
+                            raise failure('INSPECTION_TOO_LARGE' if self._protocol == 'INSPECTION_PROTOCOL' else self._protocol)
                         parts.append(part)
                     context.CheckCancelled()
                     body = b"".join(parts)
@@ -79,20 +91,30 @@ class JSONHTTP:
                                         "42501": "DENIED"}.get(json.loads(body).get("code"), code)
                             except (ValueError, AttributeError):
                                 pass
-                        raise DomainError((status_codes or {}).get(response.status_code, code), "Memory request failed")
+                        code = (status_codes or {}).get(response.status_code, code)
+                        if code not in CODES:
+                            raise DomainError(code, "Memory request failed")
+                        raise MemoryFailure(HTTPIssue(response.status_code, source=self._source, stage=stage,
+                            mutation=mutation, code=code))
                     if response_mode == "bytes":
                         return body
                     return json.loads(body)
+            except ControlError:
+                raise
             except DomainError:
                 raise
             except (ValueError, UnicodeError):
-                raise DomainError(self._protocol, "Invalid memory response") from None
-            except self._httpx.TimeoutException:
+                raise failure(self._protocol) from None
+            except self._httpx.TimeoutException as error:
                 context.CheckCancelled()
-                raise DomainError('INSPECTION_TIMEOUT' if self._source == 'INSPECTION_SOURCE' else self._source, "Memory request timed out") from None
-            except Exception:
+                code = ('INSPECTION_TIMEOUT' if self._source == 'INSPECTION_SOURCE' else
+                        'MEMORY_TIMEOUT' if self._source == 'MEMORY_SOURCE' else self._source)
+                raise failure(code, retryable=True, effect='none' if isinstance(error,
+                    (self._httpx.ConnectTimeout, self._httpx.PoolTimeout)) else None) from None
+            except Exception as error:
                 context.CheckCancelled()
-                raise DomainError(self._source, "Memory connection failed") from None
+                raise failure(self._source, retryable=True,
+                              effect='none' if isinstance(error, self._httpx.ConnectError) else None) from None
 
     @contextmanager
     def _response(self, method, path, context, **kwargs):

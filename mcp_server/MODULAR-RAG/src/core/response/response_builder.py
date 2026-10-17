@@ -35,6 +35,7 @@ class MCPToolResponse:
     is_empty: bool = False
     image_contents: List[types.ImageContent] = field(default_factory=list)
     evidence_results: Optional[List[Dict[str, Any]]] = None
+    retrieval: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for MCP protocol.
@@ -54,12 +55,16 @@ class MCPToolResponse:
             "metadata": dict(self.metadata),
             "isEmpty": self.is_empty,
         }
-        if self.evidence_results is not None:
-            payload.update({
-                "version": 1,
+        payload.update({
+                "version": 2,
                 "collection": self.metadata.get("collection", ""),
-                "result_count": len(self.evidence_results),
-                "results": [dict(item) for item in self.evidence_results],
+                "result_count": len(self.evidence_results or []),
+                "results": [dict(item) for item in (self.evidence_results or [])],
+                "retrieval": self.retrieval or {
+                    "status": "failed" if self.metadata.get('error') else "empty" if self.is_empty else "ready",
+                    "paths": {"dense": "failed" if self.metadata.get('error') else "ok", "sparse": "skipped"},
+                    "issues": [{"code": "MEMORY_SOURCE", "stage": "search"}] if self.metadata.get('error') else [],
+                },
             })
         return payload
     

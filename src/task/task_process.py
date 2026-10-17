@@ -10,7 +10,7 @@ from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import TaskStore
 from ..frame.session_mgr import SessionMgr
 from ..memory.contracts import MemoryPrepareRequest
-from ..memory.prompt import AttachRecall
+from ..memory.prompt import AttachRecall, WithRecallRules
 from ..memory.memory_prepare import MemoryPrepare
 from ..frame.review_scheduler import ReviewScheduler
 from ..frame.event_mgr import EventMgr, Emit
@@ -56,7 +56,7 @@ class TaskProcess:
                 messages = AttachRecall(snapshot.messages, snapshot.messages[-1].message_id, recalled)
                 mgr.Complete(output=lambda: Messages(messages))
             # BeginTurn already contains this user; only this Run sees evidence.
-            result = ModelRuntime.GetInstance().Run(RunInput(messages, snapshot.session.prompt), MainStrategy, context)
+            result = ModelRuntime.GetInstance().Run(RunInput(messages, WithRecallRules(snapshot.session.prompt)), MainStrategy, context)
         except ControlError as error:
             result = RunResult("cancelled", reason=error.code)
         except DomainError as error:

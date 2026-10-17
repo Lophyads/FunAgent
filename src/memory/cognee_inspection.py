@@ -6,7 +6,7 @@ import math
 import re
 import hashlib
 
-from ..frame.contracts import DomainError
+from ..frame.contracts import ControlError, DomainError
 from .cognee import Headers
 from .cognee_datasets import CogneeDataset
 from .cognee_documents import _unpack
@@ -114,6 +114,26 @@ class CogneeInspection:
                 'mime_type': v.get('mimeType'), 'size': size, 'created_at': v.get('createdAt'),
                 'updated_at': v.get('updatedAt'), 'tags': safe_metadata(v.get('label')),
                 'metadata': safe_metadata(v.get('externalMetadata'))})
+        # This is a timestamped observation for browsing, never write evidence.
+        completed, issue = {}, None
+        try:
+            payload = self.request(f'/datasets/{identifier}/processing-status', context)
+            if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+                protocol()
+            for item in payload['items']:
+                if (not isinstance(item, dict) or not isinstance(item.get('id'), str) or
+                        type(item.get('completed')) is not bool or item['id'] in completed):
+                    protocol()
+                completed[item['id']] = item['completed']
+        except ControlError:
+            raise
+        except DomainError as error:
+            completed, issue = {}, error.code
+        checked = now()
+        for row in result:
+            row.update(completed=completed.get(row['data_id']), checked_at=checked)
+            if issue:
+                row['completion_issue'] = issue
         return result
 
     def Count(self, name, context):

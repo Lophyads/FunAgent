@@ -10,9 +10,10 @@ import os
 from typing import Any, List, Optional
 
 from src.libs.embedding.base_embedding import BaseEmbedding
+from src.libs.embedding.validation import decode_batch, EmbeddingSourceError
 
 
-class OpenAIEmbeddingError(RuntimeError):
+class OpenAIEmbeddingError(EmbeddingSourceError):
     """Raised when OpenAI Embeddings API call fails."""
 
 
@@ -162,24 +163,11 @@ class OpenAIEmbedding(BaseEmbedding):
             raise OpenAIEmbeddingError(
                 f"OpenAI Embeddings API call failed: {e}"
             ) from e
+        finally:
+            client.close()
         
-        # Extract embeddings from response
-        # Response format: response.data is a list of objects with .embedding attribute
-        try:
-            embeddings = [item.embedding for item in response.data]
-        except (AttributeError, KeyError) as e:
-            raise OpenAIEmbeddingError(
-                f"Failed to parse OpenAI Embeddings API response: {e}"
-            ) from e
-        
-        # Verify output matches input length
-        if len(embeddings) != len(texts):
-            raise OpenAIEmbeddingError(
-                f"Output length mismatch: expected {len(texts)}, got {len(embeddings)}"
-            )
-        
-        return embeddings
-    
+        return decode_batch(getattr(response, 'data', None), len(texts), self.get_dimension())
+
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension for the configured model.
         

@@ -14,6 +14,7 @@ function memoryRecords(value) {
   if(!Array.isArray(value?.records))return null;
   const list=el('div',{class:'obs-memory-results'},el('p',{class:'obs-memory-summary',text:`${value.records.length} 条结果 · ${Object.entries(value.source_status||{}).map(([k,v])=>`${k}：${resultText(v)}`).join(' · ')||'来源状态未记录'}`}));
   if(value.warnings?.length)list.append(el('p',{class:'obs-notice',text:value.warnings.join(' · ')}));
+  if(value.issues?.length)list.append(rawDetails('检索诊断',value.issues));
   if(!value.records.length)list.append(el('p',{class:'obs-memory-summary',text:'没有检索到记录'}));
   for(const [i,r] of value.records.entries()){
     const ref=r.ref||r;

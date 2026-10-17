@@ -9,7 +9,8 @@ from collections.abc import Callable
 from jsonschema import Draft202012Validator
 from ..frame.contracts import DomainError
 from .common import NormalizeTopicName
-from .contracts import MemoryDraft, MemoryListQuery
+from .contracts import MemoryDraft, MemoryFailure, MemoryListQuery
+from .failure import CODES, FailureData
 from .protocols import MemoryOperationsAccess
 
 MAX_FILE = 2 * 1024 * 1024
@@ -165,12 +166,13 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
         if len(matches) > 1 or (matches and matches[0]['description'] != topic['description']):
             raise DomainError('CONFLICT', '主题说明冲突。')
         return matches[0]['topic_id'] if matches else None
-    def verify(memory, existing, topic_id):
+    def verify(memory, existing, topic_id, *, preflight=False):
         if len(existing) != 1:
             raise DomainError('CONFLICT', '记忆身份不唯一或记录不存在。')
         record = existing[0]
-        if (topic_id is None or record.get('source_id') != source_id or record.get('content') != memory['content'] or
-            record.get('type') != memory['type'] or record.get('topic_id') != topic_id or
+        if (not preflight and topic_id is None or record.get('source_id') != source_id or record.get('content') != memory['content'] or
+            record.get('type') != memory['type'] or
+            (record.get('topic_id') != topic_id and not (preflight and record.get('topic_id') is None)) or
             record.get('origin') != Identity(document.dataset_id, memory['key']) or
             not record.get('record_id') or record.get('truncated') or record.get('deleted')):
             raise DomainError('CONFLICT', '记忆正文、类型或所属主题冲突。')
@@ -191,7 +193,7 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
             key = memory['key']
             matches = existing.get(Identity(document.dataset_id, key), [])
             if matches:
-                verify(memory, matches, mapping[memory['topic_key']])
+                verify(memory, matches, mapping[memory['topic_key']], preflight=True)
         stage = 'topic'
         for topic in document.topics:
             check()
@@ -219,12 +221,13 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
             identity = Identity(document.dataset_id, key)
             topic_id = mapping[memory['topic_key']]
             matches = existing.get(identity, [])
-            if not matches:
-                check()
-                receipt = operations.Write(MemoryDraft(source_id, memory['content'], identity, (),
-                                                       type=memory['type'], origin=identity),
-                                           request_key=identity, topic_id=topic_id)
-                matches = existing[identity] = [receipt]
+            check()
+            receipt = operations.Write(MemoryDraft(source_id, memory['content'], identity, (),
+                                                   type=memory['type'], origin=identity),
+                                       request_key=identity, topic_id=topic_id)
+            if matches and receipt.get('record_id') != matches[0].get('record_id'):
+                raise DomainError('CONFLICT', '重复导入的记录身份发生变化。')
+            matches = existing[identity] = [receipt]
             record = verify(memory, matches, topic_id)
             result['memories'].append(dict(key=key, record_id=record['record_id'], topic_id=topic_id))
             result['progress']['memories_done'] += 1
@@ -247,11 +250,14 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
         code = error.code if isinstance(error, DomainError) else 'MEMORY_STORAGE'
         allowed = {'CONFLICT', 'STOPPING', 'DENIED', 'UNSUPPORTED', 'NOT_FOUND', 'NOT_READY',
                    'MEMORY_STORAGE', 'TOPIC_SYNC_FAILED', 'TIMEOUT', 'DEADLINE', 'TRANSPORT',
-                   'EMBEDDING_SOURCE', 'EMBEDDING_PROTOCOL', 'CONFIG_CREDENTIAL'}
+                   'EMBEDDING_SOURCE', 'EMBEDDING_PROTOCOL', 'CONFIG_CREDENTIAL', 'CANCELLED'} | CODES
         code = code if code in allowed else 'MEMORY_STORAGE'
         result['status'] = 'stopped'
         result['error'] = dict(stage=stage, key=key, code=code,
                                message='导入停止；请核对正文和主题目录后重新导入。' if code != 'CONFLICT'
                                else '已有数据与导入内容冲突，请核对正文、类型、主题和说明。')
+        if isinstance(error, MemoryFailure):
+            # Keep the import cursor stage; the exact driver stage lives in issues.
+            result['error'].update(FailureData(error))
     publish()
     return result

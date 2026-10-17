@@ -82,7 +82,7 @@ export function createTopicState({api, onChange, currentNode}) {
       results = {...value, loading:false, error:null, text};
     } catch (failure) {
       if (!valid(gen) || id !== searchId) return;
-      results = {entries:[], loading:false, error:failure.message, text};
+      results = {entries:[], loading:false, error:failure.message, text, issues:failure.issues, code:failure.code};
     }
     emit();
   }

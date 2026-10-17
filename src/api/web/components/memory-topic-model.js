@@ -35,3 +35,25 @@ export function mergeRecords(sourceId, previous, next) {
   return [...new Map([...previous, ...next].map(record =>
     [recordKey(sourceId, record.id || record.record_id), record])).values()];
 }
+
+/** Preserve the submitted identity and draft; only a refreshed record can supply a new edit version. */
+export function memoryFailureDraft(draft, error, action, sourceId) {
+  const known = error.effect === 'known' || !error.effect && error.code === 'TOPIC_SYNC_FAILED';
+  const uncertain = error.effect === 'unknown' || !error.effect && !known && (!error.status || error.status >= 500);
+  const ref = error.ref?.source_id === sourceId ? error.ref : undefined;
+  return {...draft, conflict:error.status === 409 || error.status === 404, failure:error.message,
+    effect:error.effect, issues:error.issues, verified_ref:ref, verified_version:ref ? error.version : undefined,
+    uncertain, uncertain_action:uncertain ? action : undefined,
+    sync_failed:known && error.code === 'TOPIC_SYNC_FAILED' ? action : undefined,
+    saved_unconfirmed:known && error.code !== 'TOPIC_SYNC_FAILED' ? action : undefined};
+}
+
+/** Adopt a freshly read version after the user has inspected the saved body. */
+export function memoryReconciledDraft(draft, record, sourceId) {
+  const id = draft.id || draft.verified_ref?.record_id;
+  if (record && (record.source_id !== sourceId || (id && (record.id || record.record_id) !== id))) return null;
+  if ((draft.action === 'replace' || draft.saved_unconfirmed || draft.sync_failed || id) && !record?.version) return null;
+  return {...draft, uncertain:false, saved_unconfirmed:undefined, sync_failed:undefined,
+    failure:null, conflict:false, ...(record?.version ? {action:'replace', id:record.id || record.record_id,
+      expected_version:record.version, topic_id:record.topic_id, topic_path:record.topic_path} : {})};
+}

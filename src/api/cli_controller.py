@@ -70,8 +70,12 @@ class CLIController:
     @staticmethod
     def _memory(line, output):
         parts = line.strip().split(maxsplit=2)
+        if len(parts) >= 2 and parts[1] == "check":
+            value = MemoryOperationsMgr.GetInstance().Check(parts[2] if len(parts) == 3 else None)
+            print(json.dumps(value, ensure_ascii=False), file=output)
+            return
         if len(parts) < 3:
-            raise DomainError("INVALID_REQUEST", "Use memory search/list/write/update/delete/confirm/export")
+            raise DomainError("INVALID_REQUEST", "Use memory check/search/list/write/update/delete/confirm/export")
         _, operation, rest = parts
         manager = MemoryOperationsMgr.GetInstance()
         if operation == "export":
@@ -203,7 +207,7 @@ class CLIController:
         elif command in diagnostic_service.KINDS and len(parts) == 1:
             print(json.dumps(diagnostic_service.Read(command), ensure_ascii=False), file=output)
         elif command == "help" and len(parts) == 1:
-            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | trace <task_id> [json|markdown|path] | traces [session_id] | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
+            print("new [title] | sessions | submit <session_id> <text> | get <task_id> | wait <task_id> | cancel <task_id> | history <session_id> | pending <task_id> | answer <task_id> <interaction_id> <text> | review <session_id> | trace <task_id> [json|markdown|path] | traces [session_id] | memory check [source_id] | memory search/list/write/update/delete/confirm/export | tools doctor | connections/models/config/status | logs tail/follow | quit", file=output)
         elif command == "new":
             title = line.strip().partition(" ")[2].strip() or "New session"
             workspace = ConfMgr.GetInstance().Serv().Options()["workspace"]

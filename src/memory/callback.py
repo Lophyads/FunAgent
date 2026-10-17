@@ -3,11 +3,14 @@ from collections.abc import Mapping
 from threading import Lock
 
 from ..frame.contracts import ControlError, DomainError
-from .contracts import MemoryRecord, MemoryRef, MemorySearchResult
+from .contracts import MemoryQueryBatch, MemoryRecord, MemoryRef, MemorySearchResult
+from .failure import BindIssue, IssueWarnings
 from .common import controlled_lock, text, validate_query, validate_metadata, timestamp
 
 
 class CallbackMemoryStore:
+    supported_types = frozenset({"knowledge"})
+    supports_deleted_read = False
     capabilities = frozenset({"search"})
 
     def __init__(self, source_id, query_callback, kind="semantic"):
@@ -33,10 +36,14 @@ class CallbackMemoryStore:
             except Exception:
                 context.CheckCancelled()
                 raise DomainError("MEMORY_SOURCE", "Memory query failed") from None
-        if not isinstance(rows, (list, tuple)) or len(rows) > 1000:
+        if isinstance(rows, (list, tuple)):
+            rows = MemoryQueryBatch(rows=rows)
+        if not isinstance(rows, MemoryQueryBatch):
             raise DomainError("MEMORY_PROTOCOL", "Invalid memory evidence")
+        batch = rows
+        issues = tuple(BindIssue(issue, self.source_id, read=True) for issue in batch.issues)
         records, seen = [], set()
-        for row in rows:
+        for row in batch.rows:
             if (not isinstance(row, Mapping) or
                     any(not text(row.get(key)) for key in ("record_id", "type", "content", "citation")) or
                     row.get("source_id", self.source_id) != self.source_id or
@@ -58,7 +65,8 @@ class CallbackMemoryStore:
                 records.append(MemoryRecord(MemoryRef(self.source_id, row["record_id"]), self.kind,
                                             row["type"], row["content"], row["citation"], row.get("version"),
                                             subject=subject, event_at=event_at, created_at=created_at, updated_at=updated_at, origin=origin))
-        return MemorySearchResult(tuple(records[:query.limit]), {self.source_id: "ok"})
+        return MemorySearchResult(tuple(records[:query.limit]),
+            {self.source_id: "partial" if issues else batch.status}, IssueWarnings(issues), issues=issues)
 
     def Close(self):
         with self._lock:

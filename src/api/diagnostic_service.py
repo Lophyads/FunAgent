@@ -4,10 +4,11 @@ from .diagnostics_mgr import DiagnosticsMgr
 from ..model.protocols import ModelDiagnostics
 from ..tool.protocols import ToolDiagnostics
 from ..task.protocols import TaskDiagnostics
+from ..memory.protocols import MemoryOperationsAccess
 from dataclasses import asdict
 from urllib.parse import urlsplit, urlunsplit
 
-KINDS = frozenset({"tools", "connections", "models", "config", "status"})
+KINDS = frozenset({"tools", "connections", "models", "config", "status", "memory"})
 
 
 def Sanitized(value, key=''):
@@ -36,12 +37,13 @@ def Sanitized(value, key=''):
 
 
 class DiagnosticService:
-    def __init__(self, conf, tools: ToolDiagnostics, models: ModelDiagnostics, tasks: TaskDiagnostics, *, logs, redact, traces=None, observation=None):
+    def __init__(self, conf, tools: ToolDiagnostics, models: ModelDiagnostics, tasks: TaskDiagnostics, *, logs, redact, traces=None, observation=None, memory: MemoryOperationsAccess | None = None):
         self._conf, self._tools, self._models, self._tasks = conf, tools, models, tasks
         self._redact = redact
         self._logs = logs
         self._traces, self._observation = traces, observation
         self._closed = False
+        self._memory = memory
 
     def Read(self, kind):
         def safe(value):
@@ -60,6 +62,10 @@ class DiagnosticService:
         if kind not in KINDS:
             raise DomainError("NOT_FOUND", "Diagnostic view not found")
         conf = self._conf
+        if kind == "memory":
+            if self._memory is None:
+                raise DomainError("NOT_READY", "Memory diagnostics unavailable")
+            return self._memory.Check()
         if kind == "tools":
             context = RunContext(purpose="main", access=conf.Tool().Access("management"))
             return {"tools": self._tools.Inspect(conf.Tool().Selection("main"), context)}

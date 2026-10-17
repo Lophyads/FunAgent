@@ -5,6 +5,9 @@ from .memory_mgr import MemoryMgr
 from .memory_operations_mgr import MemoryOperationsMgr
 from .contracts import (
     EmbeddingProfile,
+    MemoryIssue,
+    MemoryFailure,
+    MemoryQueryBatch,
     MemoryContext,
     MemoryDraft,
     MemoryListQuery,
@@ -38,6 +41,9 @@ __all__ = [
     "DomainError",
     "Embedder",
     "EmbeddingProfile",
+    "MemoryIssue",
+    "MemoryFailure",
+    "MemoryQueryBatch",
     "MemoryAccess",
     "MemoryContext",
     "MemoryDraft",

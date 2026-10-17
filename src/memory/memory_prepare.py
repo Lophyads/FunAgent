@@ -4,8 +4,8 @@ from uuid import uuid4
 import time
 from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, ControlError
-from .contracts import MemoryContext, MemoryBranch, MemoryQuery
-from .common import normalize, RecordIdentity
+from .contracts import MemoryContext, MemoryBranch, MemoryQuery, MemoryIssue
+from .common import normalize, RecordIdentity, MergeSourceStatus
 from .candidate_selection import DeduplicateRecords, SelectByScore
 from .memory_mgr import MemoryMgr
 from .memory_planner import MemoryPlanner
@@ -76,7 +76,7 @@ class MemoryPrepare:
                 queries = tuple(MemoryQuery(text, selected, "episodic" if branch == "facts" else "semantic",
                                            ("note", "episode") if branch == "facts" else (),
                                            policies[branch].get("candidate_limit", min(100, policies[branch].get("max_records", 10) + 1))) for text in texts)
-                groups, statuses, warnings = {name: [] for name in selected}, {}, list(plan.warnings)
+                groups, statuses, warnings, issues = {name: [] for name in selected}, {}, list(plan.warnings), []
                 branch_deadline = min(child.deadline, time.monotonic() + policies[branch].get("timeout", 2))
                 for query in queries:
                     with mgr.Scope('memory.query', input=lambda: Query(query)):
@@ -88,18 +88,17 @@ class MemoryPrepare:
                                 groups[name].extend(result.records)
                                 previous = statuses.get(name)
                                 current = result.source_status.get(name, "failed")
-                                statuses[name] = current if previous in {None, "ok"} else previous
+                                statuses[name] = MergeSourceStatus(previous, current)
                                 warnings.extend(result.warnings)
+                                issues.extend(result.issues)
                             except ControlError:
                                 context.CheckCancelled()
-                                statuses[name] = "failed"
+                                statuses[name] = MergeSourceStatus(statuses.get(name), "timeout")
                                 warnings.append(f"{name}:DEADLINE")
                 # Preserve local ordering and interleave sources without comparing scores.
                 groups = [tuple(group) for group in groups.values()]
                 ordered = tuple(group[index] for index in range(max((len(g) for g in groups), default=0))
                                 for group in groups if index < len(group))
-                statuses = {name: ("partial" if groups[index] else "failed") if statuses.get(name) != "ok" else
-                            "ready" if groups[index] else "empty" for index, name in enumerate(selected)}
                 candidates = ordered
                 with mgr.Scope('memory.deduplicate', input=lambda: dict(records=Candidates(candidates))):
                     ordered, duplicates = DeduplicateRecords(candidates)
@@ -107,17 +106,21 @@ class MemoryPrepare:
                 rerank = conf.Policy("rerank")
                 if ordered and rerank.get("enabled", False):
                     scoring_context = replace(child, deadline=branch_deadline)
-                    scoring_context.CheckCancelled()
                     try:
+                        scoring_context.CheckCancelled()
                         scores = ModelRuntime.GetInstance().Rank(
                             RerankRequest(request.text, tuple(r.content for r in ordered)),
                             rerank["profile"], scoring_context).scores
-                    except ModelError as error:
                         scoring_context.CheckCancelled()
-                        warnings.append(f"{branch}:RERANK_FAILED")
+                    except (ControlError, ModelError) as error:
+                        if isinstance(error, ControlError) and error.code != 'DEADLINE':
+                            raise
+                        context.CheckCancelled()
+                        expired = isinstance(error, ControlError) or time.monotonic() >= scoring_context.deadline
+                        warnings.append(f"{branch}:DEADLINE" if expired else f"{branch}:RERANK_FAILED")
+                        issues.append(MemoryIssue(code='MEMORY_TIMEOUT' if expired else 'RERANK_FAILED', stage='rerank'))
                         mgr.Event('memory.rerank_failed', error_code=error.code, warning=warnings[-1])
                     else:
-                        scoring_context.CheckCancelled()
                         candidates = ordered
                         threshold = policies[branch].get("min_score")
                         with mgr.Scope('memory.filter', min_score=threshold,
@@ -130,7 +133,7 @@ class MemoryPrepare:
                                                               chars=sum(len(r.content) for r in ordered)),
                                max_records=policies[branch].get('max_records', 10), max_chars=policies[branch].get('max_chars', 16000)):
                     branches[branch] = FitBranch(branch, ordered, statuses, warnings, queries,
-                                                policies[branch].get("max_records", 10), policies[branch].get("max_chars", 16000))
+                                                policies[branch].get("max_records", 10), policies[branch].get("max_chars", 16000), issues=issues)
                     mgr.Complete(status=branches[branch].status, output=lambda: Memory(branches[branch]))
                 mgr.Complete(status=branches[branch].status, output=lambda: Memory(branches[branch]))
         facts, knowledge = branches["facts"], branches["knowledge"]
@@ -144,7 +147,8 @@ class MemoryPrepare:
                   else "partial" if warnings or any(branch.status in {"partial", "failed"} for branch in active)
                   else "ready" if records else "empty")
         return MemoryContext(records, {**facts.source_status, **knowledge.source_status}, warnings, status,
-                             (*facts.queries, *knowledge.queries), facts, knowledge)
+                             (*facts.queries, *knowledge.queries), facts, knowledge,
+                             issues=tuple(dict.fromkeys((*facts.issues, *knowledge.issues))))
 
 
 def Queries(texts, maximum):

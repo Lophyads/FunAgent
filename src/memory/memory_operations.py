@@ -17,6 +17,7 @@ from .topic_projection import TopicData, TopicPath, RecordTopic
 from .topic_pagination import ReadDirectory
 from .policy import Outcome
 from .prompt import RecordData
+from .failure import IssueData
 from ..observability.observation_mgr import ObservationMgr
 
 
@@ -67,6 +68,15 @@ class MemoryOperations:
         self._context()
         return next((name for name in self._facts if self._sources[name]['kind'] == 'episodic'
                      and self._token(name) in self._access), None)
+
+    @_management
+    def Check(self, source_id=None):
+        context = self._context()
+        if source_id is not None and (not text(source_id) or len(source_id) > 128):
+            raise DomainError("INVALID_REQUEST", "Invalid memory source")
+        names = ((source_id,) if source_id is not None else
+                 tuple(name for name in self._sources if self._token(name) in self._access))
+        return self._memory.Check(names, context)
 
     @_management
     def Inspect(self, operation, query):
@@ -157,7 +167,8 @@ class MemoryOperations:
         snapshot = self._catalog(source_id, context).Snapshot(source_id)
         result = self._memory.Search(query, context)
         return {"records": [ManagementRecord(record) | RecordTopic(snapshot, record.ref.record_id) for record in result.records],
-                "source_status": dict(result.source_status), "warnings": list(result.warnings), "revision": snapshot.revision}
+                "source_status": dict(result.source_status), "warnings": list(result.warnings),
+                "issues": [IssueData(i) for i in result.issues], "revision": snapshot.revision}
 
     @_management
     def List(self, query, *, topic_id=None, unclassified=False):

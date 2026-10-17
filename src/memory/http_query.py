@@ -6,6 +6,8 @@ import urllib.parse
 import urllib.request
 
 from ..frame.contracts import ControlError, DomainError
+from .contracts import MemoryQueryBatch
+from .failure import ReadIssues
 
 
 class HTTPMemoryQuery:
@@ -39,7 +41,8 @@ class HTTPMemoryQuery:
             payload = json.loads(body)
             if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
                 raise DomainError("MEMORY_PROTOCOL", "Invalid memory query response")
-            return payload["records"]
+            return MemoryQueryBatch(rows=payload["records"], status=payload.get("status", "ok"),
+                                    issues=ReadIssues(payload.get("issues", [])))
         except (ControlError, DomainError):
             raise
         except (UnicodeError, ValueError):

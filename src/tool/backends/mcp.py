@@ -205,12 +205,13 @@ class MCPBackend:
         effect = spec.decision.effect
         try:
             result = self._call("call_tool", {"name": operation, "arguments": thaw(args)}, context)
-            if result.isError:
+            if result.isError and (operation != 'query_knowledge_hub' or effect != 'none' or
+                                   not getattr(result, 'structuredContent', None)):
                 return BackendResult("error", '{"code":"MCP_TOOL_ERROR"}', effect)
             encoded = json.dumps(result.model_dump(by_alias=True, mode="json", exclude_none=True), ensure_ascii=False)
             if len(encoded.encode("utf8")) > 1048576:
                 raise DomainError("MCP_PROTOCOL", "MCP result is too large")
-            return BackendResult("ok", encoded, effect)
+            return BackendResult("error" if result.isError else "ok", encoded, effect)
         except ControlError:
             if effect == "none":
                 raise

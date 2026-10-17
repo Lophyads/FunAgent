@@ -14,6 +14,8 @@ class Embedder(Protocol):
 
 class MemoryStore(Protocol):
     capabilities: frozenset[str]
+    supported_types: frozenset[str] | None
+    supports_deleted_read: bool
 
     def Search(self, query: MemoryQuery, context: RunContext) -> MemorySearchResult: ...
     def Close(self) -> None: ...
@@ -59,7 +61,7 @@ class ProfileReader(Protocol):
 
 
 class MemoryAccess(MemoryReader, MemoryWriter, ProfileReader, Protocol):
-    pass
+    def Check(self, source_ids: tuple[str, ...], context: RunContext) -> dict: ...
 
 
 class MemoryImportAccess(Protocol):
@@ -72,6 +74,7 @@ class MemoryImportAccess(Protocol):
 
 
 class MemoryOperationsAccess(Protocol):
+    def Check(self, source_id: str | None = None) -> dict: ...
     def Inspect(self, operation: str, query) -> dict: ...
     def DefaultSource(self) -> str | None: ...
     def Sources(self) -> list[dict]: ...

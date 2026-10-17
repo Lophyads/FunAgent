@@ -4,6 +4,21 @@ export function mount(root,{store,api,page}) {
   let disposed=false,generation=0;
   pageHeader(root,titles[page],'当前进程的只读视图。配置文件修改后，重启服务生效。',button('刷新',()=>load()));
   const content=el('div',{class:'catalog-grid'});root.append(content);
+  if(page==='config'){
+    const result=el('div',{'aria-live':'polite'});
+    const check=button('检查记忆检索',async()=>{
+      check.disabled=true;result.replaceChildren(el('p',{text:'正在检查记忆来源…'}));
+      try{const data=await api.request('/diagnostics/memory');if(disposed)return;
+        result.replaceChildren(...data.sources.map(source=>el('article',{class:'card'},
+          el('h3',{text:`${source.source_id} · ${source.status}`}),
+          el('p',{text:`检查时间：${source.checked_at}`}),jsonView(source))));
+        if(!data.sources.length)result.replaceChildren(el('p',{text:'没有可检查的授权来源。'}));
+      }catch(error){if(!disposed)result.replaceChildren(errorBox(error.message));}
+      finally{if(!disposed)check.disabled=false;}
+    });
+    root.append(el('section',{'aria-label':'记忆检索检查'},el('h2',{text:'记忆检索检查'}),
+      el('p',{class:'muted',text:'手动执行只读检索，显示各来源的检查时间和结果。应用就绪仅表示初始化完成。'}),check,result));
+  }
   async function load(){const gen=++generation;content.classList.add('loading');try{
     const data=await api.request(`/api/${page}`);if(disposed||gen!==generation)return;store.server('catalog',{...store.get().server.catalog,[page]:data});content.replaceChildren();
     if(page==='tools')for(const tool of data.tools){const card=el('article',{class:'card catalog-item'},el('header',{},el('h2',{text:tool.name}),el('span',{class:'badge',text:tool.toolset})),el('p',{text:tool.description}),el('div',{class:'tags'},el('span',{class:'badge',text:tool.requires_approval?'需要审批':'按调用策略执行'}),el('span',{class:'badge',text:`副作用：${tool.side_effects}`})),el('details',{},el('summary',{text:'参数与权限'}),jsonView(tool)));content.append(card);}

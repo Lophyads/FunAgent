@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.core.types import ProcessedQuery, RetrievalResult
+from src.libs.embedding.validation import error_issue
 
 if TYPE_CHECKING:
     from src.core.query_engine.dense_retriever import DenseRetriever
@@ -99,6 +100,28 @@ class HybridSearchResult:
     sparse_error: Optional[str] = None
     used_fallback: bool = False
     processed_query: Optional[ProcessedQuery] = None
+    paths: Dict[str, str] = field(default_factory=dict)
+    issues: List[Dict[str, Any]] = field(default_factory=list)
+
+    def retrieval(self):
+        paths = self.paths or {
+            'dense': 'failed' if self.dense_error else 'ok' if self.dense_results is not None else 'skipped',
+            'sparse': 'failed' if self.sparse_error else 'ok' if self.sparse_results is not None else 'skipped',
+        }
+        issues = list(self.issues)
+        if not issues and (self.dense_error or self.sparse_error):
+            issues = [{'code': 'MEMORY_SOURCE', 'stage': 'search'}]
+        status = ('failed' if 'ok' not in paths.values() else 'partial' if issues or 'failed' in paths.values()
+                  else 'ready' if self.results else 'empty')
+        if status == 'failed' and not issues:
+            issues = [{'code': 'MEMORY_SOURCE', 'stage': 'search'}]
+        return {'status': status, 'paths': paths, 'issues': issues}
+
+
+class RetrievalFailure(RuntimeError):
+    def __init__(self, retrieval):
+        self.retrieval = retrieval
+        super().__init__('MEMORY_SOURCE')
 
 
 class HybridSearch:
@@ -261,13 +284,15 @@ class HybridSearch:
         
         # Step 3: Handle fallback scenarios
         used_fallback = False
-        if dense_error and sparse_error:
-            # Both failed - raise error
-            raise RuntimeError(
-                f"Both retrieval paths failed. "
-                f"Dense error: {dense_error}. Sparse error: {sparse_error}"
-            )
-        elif dense_error:
+        paths = {
+            'dense': 'failed' if dense_error else 'ok' if dense_results is not None else 'skipped',
+            'sparse': 'failed' if sparse_error else 'ok' if sparse_results is not None else 'skipped',
+        }
+        issues = [error_issue(error) for error in (dense_error, sparse_error) if error]
+        if 'ok' not in paths.values():
+            raise RetrievalFailure({'status': 'failed', 'paths': paths,
+                                    'issues': issues or [{'code': 'MEMORY_SOURCE', 'stage': 'search'}]})
+        if dense_error:
             # Dense failed, use sparse only
             logger.warning(f"Dense retrieval failed, using sparse only: {dense_error}")
             used_fallback = True
@@ -303,10 +328,11 @@ class HybridSearch:
                 results=final_results,
                 dense_results=dense_results,
                 sparse_results=sparse_results,
-                dense_error=dense_error,
-                sparse_error=sparse_error,
+                dense_error=error_issue(dense_error)['code'] if dense_error else None,
+                sparse_error=error_issue(sparse_error)['code'] if sparse_error else None,
                 used_fallback=used_fallback,
                 processed_query=processed_query,
+                paths=paths, issues=issues,
             )
         
         return final_results
@@ -392,11 +418,14 @@ class HybridSearch:
             and processed_query.keywords  # Need keywords for sparse
         )
         
+        if self.config.enable_dense and self.dense_retriever is None:
+            dense_error = RuntimeError('MEMORY_SOURCE')
+        if self.config.enable_sparse and self.sparse_retriever is None:
+            sparse_error = RuntimeError('MEMORY_SOURCE')
+        elif self.config.enable_sparse and not processed_query.keywords:
+            sparse_results = []
         if not run_dense and not run_sparse:
             # Nothing to run
-            if self.dense_retriever is None and self.sparse_retriever is None:
-                dense_error = "No retriever configured"
-                sparse_error = "No retriever configured"
             return dense_results, sparse_results, dense_error, sparse_error
         
         if self.config.parallel_retrieval and run_dense and run_sparse:
@@ -477,9 +506,9 @@ class HybridSearch:
                     error_msg = f"{name} retrieval failed with exception: {e}"
                     logger.error(error_msg)
                     if name == 'dense':
-                        dense_error = error_msg
+                        dense_error = e
                     else:
-                        sparse_error = error_msg
+                        sparse_error = e
         
         return dense_results, sparse_results, dense_error, sparse_error
     
@@ -526,10 +555,10 @@ class HybridSearch:
             if trace is not None:
                 trace.record_stage("dense_retrieval", {
                     "method": "dense",
-                    "error": error_msg,
+                    "error": error_issue(e),
                     "result_count": 0,
                 })
-            return None, error_msg
+            return None, e
     
     def _run_sparse_retrieval(
         self,
@@ -577,7 +606,7 @@ class HybridSearch:
         except Exception as e:
             error_msg = f"Sparse retrieval error: {e}"
             logger.error(error_msg)
-            return None, error_msg
+            return None, e
     
     def _fuse_results(
         self,

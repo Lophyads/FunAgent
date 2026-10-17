@@ -11,9 +11,10 @@ import os
 from typing import Any, List, Optional
 
 from src.libs.embedding.base_embedding import BaseEmbedding
+from src.libs.embedding.validation import decode_batch, EmbeddingSourceError
 
 
-class AzureEmbeddingError(RuntimeError):
+class AzureEmbeddingError(EmbeddingSourceError):
     """Raised when Azure OpenAI Embeddings API call fails."""
 
 
@@ -164,24 +165,11 @@ class AzureEmbedding(BaseEmbedding):
             raise AzureEmbeddingError(
                 f"Azure OpenAI Embeddings API call failed: {e}"
             ) from e
+        finally:
+            client.close()
         
-        # Extract embeddings from response
-        # Response format is identical to OpenAI
-        try:
-            embeddings = [item.embedding for item in response.data]
-        except (AttributeError, KeyError) as e:
-            raise AzureEmbeddingError(
-                f"Failed to parse Azure OpenAI Embeddings API response: {e}"
-            ) from e
-        
-        # Verify output matches input length
-        if len(embeddings) != len(texts):
-            raise AzureEmbeddingError(
-                f"Output length mismatch: expected {len(texts)}, got {len(embeddings)}"
-            )
-        
-        return embeddings
-    
+        return decode_batch(getattr(response, 'data', None), len(texts), self.get_dimension())
+
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension for the configured deployment.
         

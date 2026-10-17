@@ -118,7 +118,8 @@ def Start(conf_dir):
         queue.Start()
         owner.Bind(DiagnosticsMgr, DiagnosticService(conf, tools, ModelRuntime.GetInstance(), queue,
                                                      logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact,
-                                                     traces=observation.Reader(store.GetTask), observation=observation))
+                                                     traces=observation.Reader(store.GetTask), observation=observation,
+                                                     memory=MemoryOperationsMgr.GetInstance()))
         if options["mode"] in {"web", "both"}:
             _http_server = owner.HTTP(HttpServer(options["host"], options["port"]))
             _http_server.Start()

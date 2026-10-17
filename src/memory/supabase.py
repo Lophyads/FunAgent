@@ -6,13 +6,16 @@ from dataclasses import asdict
 from math import isfinite
 
 from ..frame.contracts import DomainError, Page
-from .contracts import MemoryRecord, MemoryRef, MemorySearchResult, UNSET
+from .contracts import MemoryRecord, MemoryRef, MemorySearchResult, MemoryIssue, MemoryFailure, UNSET
+from .failure import IssueWarnings
 from .common import text, validate_filters, timestamp, validate_query, validate_content, validate_metadata, normalize
 from .embedding import ValidateProfile, ValidateVector
 from .transport import JSONHTTP, ValidateConnection
 
 
 class SupabaseMemoryStore:
+    supported_types = None
+    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, settings, source_id, embedder, *, transport=None, owns_embedder=False):
@@ -39,7 +42,9 @@ class SupabaseMemoryStore:
 
     def _rpc(self, name, values, context):
         return self._http.Post("/rpc/funagent_memory_" + name,
-                               {"p_namespace": self._namespace, "p_source_id": self.source_id} | values, context)
+                               {"p_namespace": self._namespace, "p_source_id": self.source_id} | values, context,
+                               mutation=name in {"add", "replace", "remove"},
+                               stage="search" if name.startswith("search") else "request")
 
     def _record(self, row):
         try:
@@ -103,13 +108,34 @@ class SupabaseMemoryStore:
             if (query.source_ids and self.source_id not in query.source_ids) or (query.kind and query.kind != self.kind):
                 return MemorySearchResult()
             vector = self._vector(query.text, "query", context) if query.text.strip() else None
-            payload = self._rpc("search", {"p_types": list(query.types), "p_limit": query.limit,
-                "p_include_deleted": query.include_deleted, "p_profile": asdict(self._profile),
-                "p_vector": vector, "p_threshold": self._threshold} | self._filters(query), context)
-            records = self._rows(payload, query.limit)
+            try:
+                payload = self._rpc("search_v2", {"p_types": list(query.types), "p_limit": query.limit,
+                    "p_include_deleted": query.include_deleted, "p_profile": asdict(self._profile),
+                    "p_vector": vector, "p_threshold": self._threshold} | self._filters(query), context)
+            except MemoryFailure as error:
+                if error.issue.http_status == 404:
+                    raise MemoryFailure(MemoryIssue(code="MEMORY_PROTOCOL", stage="search",
+                        source_id=self.source_id, http_status=404)) from None
+                raise
+            if not isinstance(payload, dict) or set(payload) != {"records", "profile_coverage"}:
+                raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase search v2 response")
+            coverage = payload["profile_coverage"]
+            if (not isinstance(coverage, dict) or set(coverage) != {"matching", "incompatible"} or
+                    any(type(v) is not int or v < 0 for v in coverage.values())):
+                raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase profile coverage")
+            records = self._rows(payload["records"], query.limit)
+            if len(records) > coverage["matching"]:
+                raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase coverage count")
             if not query.include_deleted and any(r.deleted for r in records):
                 raise DomainError("MEMORY_PROTOCOL", "Unexpected deleted memory record")
-            return MemorySearchResult(records, {self.source_id: "ok"})
+            issues = ()
+            if vector is not None and coverage["incompatible"]:
+                issue = MemoryIssue(code="EMBEDDING_PROFILE_MISMATCH", stage="search", source_id=self.source_id)
+                if not coverage["matching"]:
+                    raise MemoryFailure(issue)
+                issues = (issue,)
+            return MemorySearchResult(records, {self.source_id: "partial" if issues else "ok"},
+                                      IssueWarnings(issues), issues=issues)
 
     def _vector(self, content, purpose, context):
         if self._embedder.profile != self._profile:

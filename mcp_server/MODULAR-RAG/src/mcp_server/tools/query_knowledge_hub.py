@@ -25,6 +25,8 @@ from src.core.response.response_builder import ResponseBuilder, MCPToolResponse
 from src.core.settings import load_settings, resolve_path, Settings
 from src.core.trace import TraceContext, TraceCollector
 from src.core.types import RetrievalResult
+from src.core.query_engine.hybrid_search import HybridSearchResult, RetrievalFailure
+from src.libs.embedding.validation import error_issue
 
 if TYPE_CHECKING:
     from src.core.query_engine.hybrid_search import HybridSearch
@@ -271,16 +273,25 @@ class QueryKnowledgeHubTool:
             }, elapsed_ms=_init_elapsed)
             
             # Perform hybrid search (blocking: embedding API + DB queries)
-            results = await asyncio.to_thread(
+            details = await asyncio.to_thread(
                 self._perform_search, query, effective_top_k, trace,
             )
             
+            retrieval = details.retrieval()
+            if retrieval['status'] == 'failed':
+                raise RetrievalFailure(retrieval)
+            results = details.results
             # Apply reranking if enabled (may call LLM API)
             if self.config.enable_rerank and results:
                 results = await asyncio.to_thread(
-                    self._apply_rerank, query, results, effective_top_k, trace,
+                    self._apply_rerank, query, results, effective_top_k, trace, retrieval['issues'],
                 )
             
+            results = results[:effective_top_k]
+            if retrieval['issues']:
+                retrieval['status'] = 'partial'
+            elif retrieval['status'] != 'failed':
+                retrieval['status'] = 'ready' if results else 'empty'
             # Build response
             response = self._response_builder.build(
                 results=results,
@@ -288,6 +299,10 @@ class QueryKnowledgeHubTool:
                 collection=effective_collection,
             )
             
+            response.retrieval = retrieval
+            if retrieval['status'] == 'partial':
+                response.content = '## 检索未完整完成\n\n' + (response.content if results else
+                    '本次没有可验证候选，无法确认完整空结果。')
             # Store final results in trace for dashboard display
             trace.metadata["final_results"] = [
                 {
@@ -312,14 +327,14 @@ class QueryKnowledgeHubTool:
             logger.exception(f"query_knowledge_hub failed: {e}")
             TraceCollector().collect(trace)
             # Return error response
-            return self._build_error_response(query, effective_collection, str(e))
+            return self._build_error_response(query, effective_collection, e)
     
     def _perform_search(
         self,
         query: str,
         top_k: int,
         trace: Optional[Any] = None,
-    ) -> List[RetrievalResult]:
+    ) -> HybridSearchResult:
         """Perform hybrid search.
         
         Args:
@@ -336,25 +351,20 @@ class QueryKnowledgeHubTool:
         # Use a larger initial retrieval for reranking
         initial_top_k = top_k * 2 if self.config.enable_rerank else top_k
         
-        try:
-            results = self._hybrid_search.search(
-                query=query,
-                top_k=initial_top_k,
-                filters=None,
-                trace=trace,
-                return_details=False,
-            )
-            return results if isinstance(results, list) else results.results
-        except Exception as e:
-            logger.warning(f"Hybrid search failed: {e}")
-            return []
-    
+        details = self._hybrid_search.search(
+            query=query, top_k=initial_top_k, filters=None, trace=trace, return_details=True,
+        )
+        if not isinstance(details, HybridSearchResult):
+            raise RuntimeError('MEMORY_PROTOCOL')
+        return details
+
     def _apply_rerank(
         self,
         query: str,
         results: List[RetrievalResult],
         top_k: int,
         trace: Optional[Any] = None,
+        issues: Optional[List[Dict[str, Any]]] = None,
     ) -> List[RetrievalResult]:
         """Apply reranking to search results.
         
@@ -379,13 +389,17 @@ class QueryKnowledgeHubTool:
             )
             
             if rerank_result.used_fallback:
+                if issues is not None:
+                    issues.append({'code': 'RERANK_FAILED', 'stage': 'rerank'})
                 logger.warning(
                     f"Reranker fallback: {rerank_result.fallback_reason}"
                 )
             
             return rerank_result.results
         except Exception as e:
-            logger.warning(f"Reranking failed, using original order: {e}")
+            logger.warning('Reranking failed, using original order')
+            if issues is not None:
+                issues.append({'code': 'RERANK_FAILED', 'stage': 'rerank'})
             return results[:top_k]
     
     def _build_error_response(
@@ -404,24 +418,15 @@ class QueryKnowledgeHubTool:
         Returns:
             MCPToolResponse indicating error.
         """
-        content = f"## 查询失败\n\n"
-        content += f"查询: **{query}**\n"
-        content += f"集合: `{collection}`\n\n"
-        content += f"**错误信息:** {error_message}\n\n"
-        content += "请检查:\n"
-        content += "- 数据库连接是否正常\n"
-        content += "- 集合是否已创建并包含数据\n"
-        content += "- 配置文件是否正确\n"
-        
+        retrieval = (error_message.retrieval if isinstance(error_message, RetrievalFailure) else {
+            'status': 'failed', 'paths': {'dense': 'failed', 'sparse': 'failed'},
+            'issues': [error_issue(error_message)],
+        })
+        code = retrieval['issues'][0]['code']
         return MCPToolResponse(
-            content=content,
-            citations=[],
-            metadata={
-                "query": query,
-                "collection": collection,
-                "error": error_message,
-            },
-            is_empty=True,
+            content=f'## 查询失败\n\n检索未完成（{code}），请检查服务配置与索引状态。',
+            citations=[], metadata={'query': query, 'collection': collection, 'error': code},
+            is_empty=True, evidence_results=[], retrieval=retrieval,
         )
 
 
@@ -483,29 +488,10 @@ async def query_knowledge_hub_handler(
             isError=response.is_empty and "error" in response.metadata,
         )
         
-    except ValueError as e:
-        # Invalid parameters
-        return types.CallToolResult(
-            content=[
-                types.TextContent(
-                    type="text",
-                    text=f"参数错误: {e}",
-                )
-            ],
-            isError=True,
-        )
-    except Exception as e:
-        # Internal error
-        logger.exception(f"query_knowledge_hub handler error: {e}")
-        return types.CallToolResult(
-            content=[
-                types.TextContent(
-                    type="text",
-                    text=f"内部错误: 查询处理失败",
-                )
-            ],
-            isError=True,
-        )
+    except Exception as error:
+        response = tool._build_error_response(query, collection or tool.config.default_collection, error)
+        return types.CallToolResult(content=response.to_mcp_content(),
+            structuredContent=response.to_structured_content(), isError=True)
 
 
 def register_tool(protocol_handler) -> None:

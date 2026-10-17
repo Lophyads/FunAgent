@@ -36,6 +36,50 @@ class MemoryRef:
     record_id: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class MemoryIssue:
+    code: str
+    stage: str
+    source_id: str | None = None
+    http_status: int | None = None
+    retryable: bool = False
+    effect: str = "none"
+    expected_dimensions: int | None = None
+    actual_dimensions: int | None = None
+
+    def __post_init__(self):
+        from .failure import ValidateIssue
+        ValidateIssue(self)
+
+
+class MemoryFailure(DomainError):
+    def __init__(self, issue: MemoryIssue, *, ref: MemoryRef | None = None,
+                 version: str | None = None, related: tuple[MemoryIssue, ...] = ()):
+        from .failure import FailureMessage, ValidateFailure
+        self.issue, self.ref, self.version, self.related = issue, ref, version, tuple(related)
+        ValidateFailure(self)
+        super().__init__(issue.code, FailureMessage(issue))
+
+
+@dataclass(frozen=True, kw_only=True)
+class MemoryQueryBatch:
+    rows: tuple[Mapping, ...]
+    status: str = "ok"
+    issues: tuple[MemoryIssue, ...] = ()
+
+    def __post_init__(self):
+        from .failure import ValidateIssue
+        if (not isinstance(self.status, str) or self.status not in {"ok", "partial"} or
+                not isinstance(self.rows, (list, tuple)) or len(self.rows) > 1000 or
+                any(not isinstance(row, Mapping) for row in self.rows) or
+                not isinstance(self.issues, (list, tuple)) or len(self.issues) > 16):
+            raise DomainError("MEMORY_PROTOCOL", "Invalid memory batch status")
+        for issue in self.issues:
+            ValidateIssue(issue)
+        object.__setattr__(self, "rows", tuple(freeze(row) for row in self.rows))
+        object.__setattr__(self, "issues", tuple(self.issues))
+
+
 @dataclass(frozen=True)
 class MemoryRecord:
     ref: MemoryRef
@@ -120,11 +164,13 @@ class MemorySearchResult:
     records: tuple[MemoryRecord, ...] = ()
     source_status: Mapping[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    issues: tuple[MemoryIssue, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self):
         object.__setattr__(self, "records", tuple(self.records))
         object.__setattr__(self, "source_status", freeze(self.source_status))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "issues", tuple(self.issues))
 
 
 @dataclass(frozen=True)

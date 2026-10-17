@@ -19,6 +19,8 @@ from .request_validation import Fields as _fields, Text as _text
 from . import memory_routes, diagnostic_service, data_routes, trace_routes, eval_routes
 from ..frame.web_projection import TaskView
 from ..memory.contracts import TopicConflict, TOPIC_SYNC_MESSAGE
+from ..memory.contracts import MemoryFailure
+from ..memory.failure import FailureData
 from ..memory.memory_import import ImportValidationError
 from .memory_import_upload import ParseUpload
 
@@ -40,9 +42,20 @@ ERRORS = {
     "MANAGEMENT_EXPIRED": (409, "This management change has expired."),
     "MEMORY_STORAGE": (500, "Memory operation failed."),
     "TOPIC_SYNC_FAILED": (503, TOPIC_SYNC_MESSAGE),
-    "EMBEDDING_SOURCE": (503, "文档向量化失败，尚未写入。请检查 embedding 服务、模型与超时配置。"),
-    "EMBEDDING_PROTOCOL": (502, "向量化服务返回的数据无效，尚未写入。请检查 embedding 模型和向量维度。"),
-    "CONFIG_CREDENTIAL": (401, "记忆服务认证失败，请检查服务端凭据配置。"),
+    "EMBEDDING_SOURCE": (503, "向量化服务请求失败，请检查 embedding 服务、模型与超时配置。"),
+    "EMBEDDING_PROTOCOL": (502, "向量化服务返回的数据无效，请检查 embedding 模型和向量维度。"),
+    "EMBEDDING_DIMENSION_MISMATCH": (503, "实际向量维度与配置不一致。"),
+    "EMBEDDING_PROFILE_MISMATCH": (503, "存量索引与当前向量配置不兼容。"),
+    "INDEX_NOT_READY": (503, "索引尚未确认完成。"),
+    "INDEX_STATE_UNKNOWN": (503, "无法确认当前正文版本的索引状态。"),
+    "RETRIEVAL_UNVERIFIED": (503, "检索协议无法确认结果完整性。"),
+    "MEMORY_SOURCE": (502, "记忆来源请求失败。"),
+    "MEMORY_PROTOCOL": (502, "记忆来源响应无效。"),
+    "MEMORY_TIMEOUT": (504, "记忆来源请求超时。"),
+    "PLAN_INVALID": (502, "记忆检索规划响应无效。"),
+    "PLAN_FAILED": (503, "记忆检索规划失败。"),
+    "RERANK_FAILED": (503, "记忆重排失败。"),
+    "CONFIG_CREDENTIAL": (502, "远端记忆服务认证失败，请检查服务端凭据配置。"),
     "CONFLICT": (409, "Operation conflicts with current state."),
     "INTERACTION_STALE": (409, "This request is no longer pending for this task."),
     "INTERACTION_EXPIRED": (409, "This request has expired."),
@@ -287,6 +300,12 @@ class _Handler(BaseHTTPRequestHandler):
             if isinstance(error, TopicConflict) and urlsplit(self.path).path.startswith("/memory/"):
                 message = str(error)
             detail = {}
+            if isinstance(error, MemoryFailure):
+                detail = FailureData(error)
+                message = detail.pop('message')
+                if (error.issue.effect == 'none' and error.issue.stage == 'embedding' and
+                        self.command == 'POST' and urlsplit(self.path).path == '/memory/records'):
+                    message += ' 本次请求尚未写入。'
             if isinstance(error, ImportValidationError):
                 message = str(error)
                 detail['path'] = error.path
