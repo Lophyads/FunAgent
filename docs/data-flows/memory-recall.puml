@@ -1,0 +1,53 @@
+@startuml memory_recall
+title 记忆召回：授权、规划与证据准备
+hide footbox
+autonumber
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName Microsoft YaHei
+skinparam sequenceArrowColor #4A6FA5
+
+participant "TaskProcess" as Task
+participant "MemoryPrepare" as Prepare
+participant "MemoryManager" as Memory
+participant "MemoryPlanner" as Planner
+participant "ModelRuntime" as Runtime
+participant "记忆 / 知识来源" as Source
+
+Task -> Prepare: 当前问题、来源权限、总期限
+Prepare -> Prepare: 筛选已启用且授权的 facts / knowledge 来源
+alt 没有可用来源
+    Prepare --> Task: MemoryContext(status=skipped)
+else 存在可用来源
+    Prepare -> Memory: ReadTopics(授权来源)
+    Memory --> Prepare: 主题目录与来源说明
+    Prepare -> Planner: Plan(当前问题, 授权目录)
+    Planner -> Runtime: Run(无工具召回规划策略)
+    Runtime --> Planner: 规划 JSON
+    Planner -> Planner: 校验字段与类型
+    alt 规划失败或子期限耗尽
+        Planner --> Prepare: PLAN_FAILED / PLAN_INVALID / DEADLINE
+        Prepare --> Task: skipped 与 warnings
+    else 规划有效
+        Planner --> Prepare: 是否检索、查询文本与变体
+        loop facts、knowledge 分支；仅处理需要检索的分支
+            Prepare -> Prepare: 查询去重，按分支限制查询数量
+            Prepare -> Memory: Search(来源、类型、查询与候选上限)
+            Memory -> Memory: 再次校验来源权限与能力
+            Memory -> Source: 查询授权来源
+            Source --> Memory: 记录、引用、来源状态
+            Memory --> Prepare: records、source_status、warnings
+            Prepare -> Prepare: 记录去重与多来源交错排序
+            opt 启用 rerank 且存在候选
+                Prepare -> Runtime: Rank(原问题, 候选正文)
+                Runtime --> Prepare: 评分；失败时保留候选并记录警告
+            end
+            Prepare -> Prepare: 按记录数和字符预算裁剪
+        end
+        Prepare --> Task: MemoryContext：证据、查询、状态与 warnings
+    end
+end
+
+Task -> Task: AttachRecall：只增强本次模型输入
+note over Task: 持久历史保留原始用户输入；父任务取消或总超时终止本轮
+@enduml

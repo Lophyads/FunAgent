@@ -20,6 +20,11 @@ class MemoryMgr:
         return cls._instance
 
     @classmethod
+    def Replace(cls, memory: MemoryAccess | None):
+        previous, cls._instance = cls._instance, memory
+        return previous
+
+    @classmethod
     def Close(cls) -> None:
         instance, cls._instance = cls._instance, None
         if instance is not None:

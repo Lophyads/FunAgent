@@ -26,7 +26,7 @@ def main(argv=None):
                 print(f"FunAgent Web: {server.url}", flush=True)
             if mode in {"cli", "both"}:
                 from ..api.cli_controller import CLIController
-                result = CLIController.Run()
+                result = CLIController.Run(memory_settings=application.GetMemorySettings())
             else:
                 server.Wait()
     except DomainError as error:

@@ -233,7 +233,7 @@ def _validate(docs):
               profiles, "model.profiles.fallback_profiles")
         task = profile.get("task", "chat")
         _require(task in {"chat", "rerank"}, "model.profiles.task")
-        _require((task == "rerank") == (profile["adapter_id"] == "tei_rerank"), "model.profiles.adapter_id")
+        _require((task == "rerank") == (profile["adapter_id"] in {"tei_rerank", "qwen3_rerank"}), "model.profiles.adapter_id")
         if task == "rerank":
             _require(providers[profile["provider_id"]]["kind"] == "http_json", "model.profiles.provider_id")
             _require(not profile.get("streaming", False) and profile.get("max_retries", 0) == 0 and
@@ -319,6 +319,7 @@ def _validate(docs):
         _require(isinstance(source, dict), "memory.sources")
         _require(source["kind"] in {"semantic", "episodic"}, "memory.sources.kind")
         _text(source["store"], "memory.sources.store")
+        _require("write_confirmation" not in source or source["store"] == "cognee", "memory.sources.write_confirmation")
         capabilities = _names(source.get("capabilities", ["search"]), "memory.sources.capabilities")
         _require("search" in capabilities and set(capabilities) <= {"search", "list", "write", "update", "delete"}, "memory.sources.capabilities")
         for key in ("read_access", "write_access"):
@@ -395,7 +396,10 @@ def _validate(docs):
             _refs([policy["profile"]], profiles, "memory.policies.profile")
             _require(profiles[policy["profile"]].get("task", "chat") ==
                      ("rerank" if purpose == "rerank" else "chat"), "memory.policies.profile.task")
-        _refs(_names(policy.get("sources", []), "memory.policies.sources"), sources, "memory.policies.sources")
+        source_field = f"memory.policies.{purpose}.sources"
+        policy_sources = _names(policy.get("sources", []), source_field)
+        for name in policy_sources:
+            _require(name in sources, f"{source_field}[{name}] (unknown source)", "CONFIG_REFERENCE")
         if "enabled" in policy:
             _require(type(policy["enabled"]) is bool, "memory.policies.enabled")
         if purpose in {"recall", "review"} and policy.get("enabled", True) and policy.get("sources"):
@@ -414,8 +418,10 @@ def _validate(docs):
             if key in policy:
                 _number(policy[key], f"memory.policies.{key}", strict=True, integer=key != "timeout")
         if purpose in {"profile", "facts", "knowledge"}:
-            _require(all(sources[name]["kind"] == ("semantic" if purpose == "knowledge" else "episodic")
-                         for name in policy.get("sources", ())), "memory.policies.sources")
+            expected_kind = "semantic" if purpose == "knowledge" else "episodic"
+            for name in policy_sources:
+                _require(sources[name]["kind"] == expected_kind,
+                         f"{source_field}[{name}] (expected kind={expected_kind})")
             if policy.get("enabled", False):
                 from ..memory.prompt import MinimumBranchBudget
                 _require(policy.get("max_chars", 16000) >= MinimumBranchBudget(purpose, policy.get("sources", ())),
@@ -498,17 +504,34 @@ class ConfMgr:
                     raise DomainError("CONFIG_MISSING", f"Missing configuration: {file}") from None
                 except (OSError, UnicodeError, tomllib.TOMLDecodeError):
                     raise DomainError("CONFIG_INVALID", f"Invalid configuration: {file}") from None
-            try:
-                _validate(docs)
-            except (KeyError, TypeError, ValueError, OverflowError):
-                raise DomainError("CONFIG_INVALID", "Invalid configuration structure") from None
-            instance = cls()
-            instance._model = _TomlModelConf(docs["model"])
-            instance._tool = _TomlToolConf(docs["tool"])
-            instance._memory = _TomlMemoryConf(docs["memory"])
-            instance._log = _TomlLogConf(docs["log"])
-            instance._serv = _TomlServConf(docs["serv"])
-            cls._instance = instance
+            cls._instance = cls._FromDocuments(docs)
+
+    @classmethod
+    def _FromDocuments(cls, docs):
+        try:
+            _validate(docs)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise DomainError("CONFIG_INVALID", "Invalid configuration structure") from None
+        instance = cls()
+        instance._docs = docs
+        instance._model = _TomlModelConf(docs["model"])
+        instance._tool = _TomlToolConf(docs["tool"])
+        instance._memory = _TomlMemoryConf(docs["memory"])
+        instance._log = _TomlLogConf(docs["log"])
+        instance._serv = _TomlServConf(docs["serv"])
+        return instance
+
+    def WithMemory(self, content):
+        """Validate a candidate against the other effective configuration documents."""
+        try:
+            memory = tomllib.loads(content)
+        except (TypeError, tomllib.TOMLDecodeError):
+            raise DomainError("CONFIG_INVALID", "Invalid memory.conf TOML") from None
+        return self._FromDocuments(dict(self._docs, memory=memory))
+
+    def ReplaceMemory(self, candidate):
+        self._docs = dict(self._docs, memory=candidate._docs["memory"])
+        self._memory = candidate.Memory()
 
     @classmethod
     def GetInstance(cls):

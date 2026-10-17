@@ -16,6 +16,12 @@ let disposePage=()=>{};
 function route(){const hash=location.hash.slice(1),separator=hash.indexOf('?'),name=(separator<0?hash:hash.slice(0,separator))||'overview',page=pages[name]?name:'overview',routeParams=new URLSearchParams(separator<0?'':hash.slice(separator+1));disposePage();store.ui('activePage',page);disposePage=pages[page](pageRoot,{...context,page,routeParams});
   for(const link of document.querySelectorAll('#sidebar a')){const active=link.hash===`#${page}`;link.classList.toggle('active',active);if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current');}}
 window.addEventListener('hashchange',route);route();const disposeChat=chat(document.querySelector('#chat'),context);
+let memoryReload=store.get().ui.memoryReload;
+store.subscribe(s=>s.ui.memoryReload,value=>{
+  if(value===memoryReload)return;
+  memoryReload=value;
+  if(['memory','eval','models'].includes(store.get().ui.activePage))route();
+});
 store.subscribe(s=>s.ui.connectionStatus,value=>{const node=document.querySelector('#connection');node.textContent={connecting:'连接中',connected:'已连接',reconnecting:'重连中'}[value];node.className=`badge ${value}`;});
 let theme=localStorage.getItem('funagent.theme')||'dark';document.documentElement.dataset.theme=theme;
 document.querySelector('#theme-toggle').addEventListener('click',()=>{theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;localStorage.setItem('funagent.theme',theme);});

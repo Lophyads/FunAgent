@@ -41,7 +41,7 @@ class MemoryPrepare:
                                if policy.get("enabled", False) and
                                sources[name].get("read_access", f"memory.{name}.read") in context.access)
                  for branch, policy in policies.items()}
-        mgr.Update(policies=policies, authorized_sources=names)
+        mgr.Update(policies=policies, authorized_sources=names, rerank_policy=conf.Policy("rerank"))
         if not any(names.values()):
             mgr.Update(skip_reason='no_authorized_enabled_source')
             return MemoryContext(status="skipped")
@@ -105,29 +105,41 @@ class MemoryPrepare:
                     mgr.Complete(output=lambda: Deduplication(candidates, ordered, duplicates))
                 rerank = conf.Policy("rerank")
                 if ordered and rerank.get("enabled", False):
+                    candidates = ordered
                     scoring_context = replace(child, deadline=branch_deadline)
-                    try:
-                        scoring_context.CheckCancelled()
-                        scores = ModelRuntime.GetInstance().Rank(
-                            RerankRequest(request.text, tuple(r.content for r in ordered)),
-                            rerank["profile"], scoring_context).scores
-                        scoring_context.CheckCancelled()
-                    except (ControlError, ModelError) as error:
-                        if isinstance(error, ControlError) and error.code != 'DEADLINE':
-                            raise
-                        context.CheckCancelled()
-                        expired = isinstance(error, ControlError) or time.monotonic() >= scoring_context.deadline
-                        warnings.append(f"{branch}:DEADLINE" if expired else f"{branch}:RERANK_FAILED")
-                        issues.append(MemoryIssue(code='MEMORY_TIMEOUT' if expired else 'RERANK_FAILED', stage='rerank'))
-                        mgr.Event('memory.rerank_failed', error_code=error.code, warning=warnings[-1])
-                    else:
-                        candidates = ordered
-                        threshold = policies[branch].get("min_score")
-                        with mgr.Scope('memory.filter', min_score=threshold,
-                                       input=lambda: dict(items=ScoredCandidates(candidates, scores, candidates))):
-                            ordered, rejected = SelectByScore(candidates, scores, threshold)
-                            mgr.Complete(output=lambda: dict(selected=ScoredCandidates(candidates, scores, ordered),
-                                                             rejected=ScoredCandidates(candidates, scores, rejected)))
+                    threshold = policies[branch].get("min_score")
+                    with mgr.Scope('memory.rerank', branch=branch, profile_id=rerank["profile"],
+                                   min_score=threshold, candidate_count=len(candidates),
+                                   input=lambda: dict(question=request.text, records=Candidates(candidates))):
+                        try:
+                            scoring_context.CheckCancelled()
+                            ranked = ModelRuntime.GetInstance().Rank(
+                                RerankRequest(request.text, tuple(r.content for r in candidates)),
+                                rerank["profile"], scoring_context)
+                            scoring_context.CheckCancelled()
+                        except (ControlError, ModelError) as error:
+                            if isinstance(error, ControlError) and error.code != 'DEADLINE':
+                                raise
+                            context.CheckCancelled()
+                            expired = isinstance(error, ControlError) or time.monotonic() >= scoring_context.deadline
+                            warnings.append(f"{branch}:DEADLINE" if expired else f"{branch}:RERANK_FAILED")
+                            code = 'MEMORY_TIMEOUT' if expired else 'RERANK_FAILED'
+                            issues.append(MemoryIssue(code=code, stage='rerank'))
+                            mgr.Event('memory.rerank_failed', error_code=error.code, warning=warnings[-1])
+                            mgr.Complete(status='partial', error_code=code,
+                                         output=lambda: dict(mode='fallback', scores=None, error_code=code,
+                                                             records=Candidates(candidates)))
+                        else:
+                            scores = ranked.scores
+                            with mgr.Scope('memory.filter', min_score=threshold,
+                                           input=lambda: dict(items=ScoredCandidates(candidates, scores, candidates))):
+                                ordered, rejected = SelectByScore(candidates, scores, threshold)
+                                mgr.Complete(output=lambda: dict(selected=ScoredCandidates(candidates, scores, ordered),
+                                                                 rejected=ScoredCandidates(candidates, scores, rejected)))
+                            mgr.Complete(profile_id=ranked.profile_id, model=ranked.model,
+                                         output=lambda: dict(mode='reranked', scores=scores,
+                                             selected=ScoredCandidates(candidates, scores, ordered),
+                                             rejected=ScoredCandidates(candidates, scores, rejected)))
                 with mgr.Scope('memory.fit', input=lambda: dict(record_refs=[dict(source_id=r.ref.source_id, record_id=r.ref.record_id)
                                                                            for r in ordered], count=len(ordered),
                                                               chars=sum(len(r.content) for r in ordered)),

@@ -1,0 +1,34 @@
+sequenceDiagram
+    autonumber
+    actor User as 用户 Web
+    participant Eval as EvalService
+    participant Memory as MemoryManager
+    participant Source as 记忆来源
+    participant Judge as RetrievalJudge<br/>Runtime
+    participant Repo as EvalRepository
+
+    User->>Eval: 提交问题、来源与 top_k
+    Eval->>Eval: 检查管理权限<br/>检查任务容量
+    Eval->>Repo: 保存 queued 评估任务
+    Eval-->>User: 返回 run_id
+    Note over Eval: 独立评估 worker 取出任务
+    Eval->>Repo: 标记 running
+    par 来源 A 的独立检索
+        Eval->>Memory: Search(问题, 来源 A, top_k)
+        Memory->>Source: 查询来源 A
+        Source-->>Memory: 候选与来源状态
+        Memory-->>Eval: 返回检索结果
+        Eval->>Repo: 保存候选、状态与耗时
+    and 其他选定来源
+        Note over Eval,Source: 其他来源重复同样流程<br/>线程池整体最多 4 路并发
+    end
+    loop 顺序评分检索成功且非空的来源
+        Eval->>Judge: Grade(问题, 候选正文)
+        Judge-->>Eval: 相关性、回答支持度或失败状态
+        Eval->>Repo: 保存评分与模型用量
+    end
+    Eval->>Repo: 汇总 completed / partial / failed 状态
+    User->>Eval: 查询评估结果
+    Eval->>Repo: 读取 run_id
+    Repo-->>Eval: 候选、评分与状态
+    Eval-->>User: 展示来源对比与结果

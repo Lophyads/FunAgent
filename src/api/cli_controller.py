@@ -164,7 +164,16 @@ class CLIController:
             print(line, file=output, flush=True)
 
     @staticmethod
-    def Execute(line, output=None, read_answer=None):
+    def Execute(line, output=None, read_answer=None, *, memory_settings=None):
+        command = line.strip().split(maxsplit=1)[:1]
+        if memory_settings is not None and command and command[0] in {
+                "memory", "submit", "review", "new", *diagnostic_service.KINDS}:
+            with memory_settings.Scope():
+                return CLIController._Execute(line, output, read_answer)
+        return CLIController._Execute(line, output, read_answer)
+
+    @staticmethod
+    def _Execute(line, output=None, read_answer=None):
         output = output or sys.stdout
         read_answer = read_answer or input
         if line.strip().split(maxsplit=1)[:1] == ["memory"]:
@@ -277,7 +286,7 @@ class CLIController:
             raise DomainError("INVALID_REQUEST", "Invalid CLI command; type help")
 
     @staticmethod
-    def Run(read_command=None, output=None):
+    def Run(read_command=None, output=None, *, memory_settings=None):
         read_command = read_command or input
         output = output or sys.stdout
         print("FunAgent CLI. Type help for commands.", file=output)
@@ -289,6 +298,6 @@ class CLIController:
             if line.strip() in {"quit", "exit"}:
                 return 0
             try:
-                CLIController.Execute(line, output, read_answer=read_command)
+                CLIController.Execute(line, output, read_answer=read_command, memory_settings=memory_settings)
             except DomainError as error:
                 print(f"{error.code}: {error}", file=output)

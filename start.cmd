@@ -12,13 +12,15 @@ if errorlevel 1 (
 set "cognee_token_file=%CD%\.funagent\cognee-session.env"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\ensure-cognee.ps1" -ProjectRoot "%CD%" -TokenFile "%cognee_token_file%" -TimeoutSeconds 30
 if errorlevel 1 (
-    echo [FunAgent] Cognee startup failed; continuing without a reachable Cognee source. 1>&2
-    set "COGNEE_MEMORY_TOKEN=cognee-unavailable"
+    echo [FunAgent] Cognee startup failed; application startup aborted. 1>&2
+    popd
+    exit /b 1
 ) else (
     for /f "usebackq tokens=1,* delims==" %%A in ("%cognee_token_file%") do if /i "%%A"=="COGNEE_MEMORY_TOKEN" set "COGNEE_MEMORY_TOKEN=%%B"
     if not defined COGNEE_MEMORY_TOKEN (
-        echo [FunAgent] Cognee token was not loaded; continuing without a reachable Cognee source. 1>&2
-        set "COGNEE_MEMORY_TOKEN=cognee-unavailable"
+        echo [FunAgent] Cognee token was not loaded; application startup aborted. 1>&2
+        popd
+        exit /b 1
     )
 )
 

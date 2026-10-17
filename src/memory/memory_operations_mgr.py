@@ -22,6 +22,11 @@ class MemoryOperationsMgr:
         return cls._instance
 
     @classmethod
+    def Replace(cls, operations: MemoryOperationsAccess | None):
+        previous, cls._instance = cls._instance, operations
+        return previous
+
+    @classmethod
     def Close(cls) -> None:
         instance, cls._instance = cls._instance, None
         if instance is not None:

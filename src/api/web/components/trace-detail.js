@@ -32,7 +32,7 @@ function payloadCard(trace,node,side) {
   const title=side==='input'?'请求 / 输入':'返回 / 输出';
   const head=el('div',{class:'obs-payload-head'},el('span',{text:title}),el('div',{class:'obs-payload-actions'},saved?.truncated?el('small',{text:'采集时已截断'}):null,copyButton(text)));
   const card=el('div',{class:'obs-payload'},head);
-  const records=side==='output'&&node.name.startsWith('memory.')?memoryRecords(value):null;
+  const records=side==='output'&&node.name.startsWith('memory.')&&node.name!=='memory.rerank'?memoryRecords(value):null;
   card.append(records||textBlock(text));
   if(records||text!==raw)card.append(rawDetails('原始返回 / JSON',saved?value:undefined));
   return card;

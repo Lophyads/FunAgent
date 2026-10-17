@@ -15,6 +15,15 @@ class MemoryImportService:
         self._lock, self._stop = RLock(), Event()
         self._latest, self._thread, self._active = {}, None, None
 
+    def IsBusy(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def RebindMemory(self, operations):
+        with self._lock:
+            self.operations = operations
+            self._latest.clear()
+
     def Submit(self, source_id, raw):
         document = Parse(raw)
         CheckSource(self.operations, source_id)

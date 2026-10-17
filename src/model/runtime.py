@@ -64,10 +64,11 @@ class Runtime:
         with mgr.Scope('model.rank', input=lambda: dict(question=request.question, texts=request.texts),
                        profile_id=profile.profile_id, model=profile.model, input_count=len(request.texts)):
             scores = []
+            batch_size = getattr(self._adapters[profile.adapter_id], 'batch_size', 32)
             try:
-                for offset in range(0, len(request.texts), 32):
+                for offset in range(0, len(request.texts), batch_size):
                     child.CheckCancelled()
-                    batch = RerankRequest(request.question, request.texts[offset:offset + 32])
+                    batch = RerankRequest(request.question, request.texts[offset:offset + batch_size])
                     result = self._invoke(batch, profile, child, counts,
                                           lambda result: ValidateRerankResult(result, len(batch.texts)))
                     scores.extend(result.scores)

@@ -1,0 +1,49 @@
+sequenceDiagram
+    autonumber
+    participant Runtime as Runtime
+    participant Model as 模型驱动
+    participant DB as 主数据库
+    participant Tools as ToolRegistry
+    participant Human as InteractionMgr
+    actor User as 用户 CLI / Web
+    participant Backend as handler / 后端
+
+    loop 在迭代上限与任务期限内
+        Runtime->>Model: 系统提示、消息与可用工具定义
+        Model-->>Runtime: 最终文本或工具调用
+        alt 返回最终文本
+            Note over Runtime: 返回 RunResult，由 TaskProcess 提交
+        else 返回工具调用
+            Runtime->>DB: AppendToolCalls，保存请求与 call_id
+            loop 顺序执行本批工具
+                Runtime->>Tools: Execute(call, selection, context)
+                Tools->>Tools: 校验选择、用途与权限<br/>校验参数与后端能力
+                alt 校验失败或策略拒绝
+                    Tools-->>Runtime: invalid / denied
+                else 进入操作处理
+                    opt 策略要求单次批准
+                        Tools->>Human: Wait(approval)<br/>绑定任务、运行、调用与参数摘要
+                        Human-->>User: 展示本次操作
+                        User->>Human: 批准或拒绝
+                        Human-->>Tools: 返回决定
+                        Tools->>Tools: 获批后复核参数、策略与可用性
+                    end
+                    alt 获得执行许可
+                        Tools->>Backend: Execute(args, context)
+                        opt 当前工具为 clarify
+                            Backend->>Human: Wait(clarify)<br/>提交结构化问题
+                            Human-->>User: 展示问题与选项
+                            User->>Human: 提交带问题 ID 的答案
+                            Human-->>Backend: 返回经校验的答案
+                        end
+                        Backend-->>Tools: status、content、effect
+                        Tools-->>Runtime: 配对的 ToolResult
+                    else 未获批准、等待中断或复核失败
+                        Tools-->>Runtime: 对应的拒绝、取消或错误结果
+                    end
+                end
+                Runtime->>DB: AppendToolResult，按 call_id 保存结果
+                Runtime->>Runtime: 追加 tool 消息，继续模型请求
+            end
+        end
+    end

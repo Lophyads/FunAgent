@@ -1,0 +1,59 @@
+@startuml tools_and_interaction
+title 模型、工具与人工交互闭环
+hide footbox
+autonumber
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName Microsoft YaHei
+skinparam sequenceArrowColor #4A6FA5
+
+participant "Runtime" as Runtime
+participant "模型驱动" as Model
+database "主数据库" as DB
+participant "ToolRegistry" as Tools
+participant "InteractionMgr" as Human
+actor "用户 CLI / Web" as User
+participant "工具 handler / 后端" as Backend
+
+loop 在迭代上限和任务期限内
+    Runtime -> Model: 系统提示、消息序列、可用工具定义
+    Model --> Runtime: 最终文本或工具调用
+    alt 最终文本
+        note over Runtime: 结束循环，将 RunResult 交给 TaskProcess 提交
+    else 工具调用
+        Runtime -> DB: AppendToolCalls：保存请求与 call_id
+        loop 顺序执行本批工具调用
+            Runtime -> Tools: Execute(call, selection, context)
+            Tools -> Tools: 校验工具选择、用途、权限、参数与能力
+            alt 校验失败或策略拒绝
+                Tools --> Runtime: invalid / denied 工具结果
+            else 进入操作处理
+                opt 策略要求单次批准
+                    Tools -> Human: Wait(approval)，绑定 task / run / call / 参数摘要
+                    Human --> User: 展示本次操作及参数
+                    User -> Human: 批准或拒绝
+                    Human --> Tools: 决定
+                    Tools -> Tools: 获批后复核参数、策略与可用性
+                end
+                alt 获得执行许可
+                    Tools -> Backend: Execute(args, context)
+                    opt 当前工具为 clarify
+                        Backend -> Human: Wait(clarify)，提交结构化问题
+                        Human --> User: 展示问题与选项
+                        User -> Human: 提交带问题 ID 的答案
+                        Human --> Backend: 经校验的答案
+                    end
+                    Backend --> Tools: status、content、effect
+                    Tools --> Runtime: 配对的 ToolResult
+                else 未获批准、过期、取消或复核失败
+                    Tools --> Runtime: denied / cancelled 工具结果
+                end
+            end
+            Runtime -> DB: AppendToolResult：按 call_id 保存结果
+            Runtime -> Runtime: 追加 tool 消息，继续下一次模型请求
+        end
+    end
+end
+
+note over DB: 图示为主任务记录路径；召回规划无工具，复盘使用临时消息
+@enduml

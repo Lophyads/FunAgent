@@ -1,0 +1,31 @@
+sequenceDiagram
+    autonumber
+    actor User as 用户 CLI / Web
+    participant Import as MemoryImportService
+    participant Operations as MemoryOperations
+    participant Memory as MemoryManager<br/>主题目录
+    participant Source as 记忆来源
+
+    alt 日常记忆管理
+        User->>Operations: 查询或提交记忆变更
+        Operations->>Operations: 检查 management 权限<br/>校验变更确认策略
+        Operations->>Memory: 执行获准的来源或主题操作
+        Memory->>Source: 读取或写入记忆
+        Source-->>Memory: 记录、版本与操作结果
+        Memory-->>Operations: 返回结果
+        Operations-->>User: 展示记录或变更结果
+    else Web 批量导入
+        User->>Import: Submit(source_id, 导入文件)
+        Import->>Import: 解析文件与检查来源<br/>检查单任务容量
+        Import-->>User: 返回 import_id
+        loop 后台处理主题与记忆
+            Import->>Operations: 查询已有数据<br/>创建主题或写入记忆
+            Operations->>Memory: 校验权限并分发
+            Memory->>Source: 查询或写入
+            Source-->>Memory: 已确认结果
+            Memory-->>Operations: 记录或主题映射
+            Operations-->>Import: 更新进度与映射
+        end
+        User->>Import: 查询导入状态
+        Import-->>User: 进度、结果或失败信息
+    end

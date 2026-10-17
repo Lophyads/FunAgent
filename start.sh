@@ -25,4 +25,5 @@ exec "$UV_COMMAND" run --locked \
     --extra mcp \
     --extra supabase \
     --extra embedding \
+    --extra cognee \
     funagent --conf-dir "$CONF_DIR" "$@"

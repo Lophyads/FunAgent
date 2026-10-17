@@ -40,6 +40,15 @@ class ReviewScheduler:
     def Start(self):
         self._worker.start()
 
+    def IsBusy(self):
+        with self._condition:
+            return bool(self._pending) or self._running is not None
+
+    def Reconfigure(self, policy):
+        with self._condition:
+            self._capacity = policy.get("capacity", 16)
+            self._timeout = policy.get("timeout", 30)
+
     @classmethod
     def GetInstance(cls) -> ReviewQueue:
         if cls._instance is None:

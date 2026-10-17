@@ -40,8 +40,9 @@ def _receipt(result):
 
 
 class MemoryManager:
-    def __init__(self, stores, *, topics: TopicCatalog | None = None, owns_stores=True):
-        sources = ConfMgr.GetInstance().Memory().Sources()
+    def __init__(self, stores, *, topics: TopicCatalog | None = None, owns_stores=True, conf=None):
+        self._conf = conf if conf is not None else ConfMgr.GetInstance().Memory()
+        sources = self._conf.Sources()
         if set(stores) != set(sources):
             raise DomainError("CONFIG_REFERENCE", "Invalid memory source bindings")
         for name, store in stores.items():
@@ -50,6 +51,11 @@ class MemoryManager:
         self._sources, self._stores = sources, MappingProxyType(dict(stores))
         self._owns_stores = owns_stores
         self._topics = topics
+
+    def SupportedTypes(self, source_ids, context):
+        stores = {name: self._authorize(name, "search", context) for name in source_ids}
+        return {name: None if store.supported_types is None else tuple(sorted(store.supported_types))
+                for name, store in stores.items()}
 
     def ReadTopics(self, source_ids, context):
         """Read only after source/purpose authorization; never expose the JSON path."""
@@ -349,6 +355,7 @@ class MemoryManager:
                     or not text(result.ref.record_id) or len(result.ref.record_id) > 128):
                 raise MemoryFailure(ErrorIssue(DomainError('MEMORY_PROTOCOL', ''), source_id=draft.source_id, effect='unknown'))
             try:
+                context.CheckCancelled()
                 snapshot = self._sync_topic(draft.source_id, result.ref.record_id, topic_id, require_same=context.purpose == "management")
             except ControlError:
                 raise
@@ -404,7 +411,7 @@ class MemoryManager:
             return result
 
     def _get_profile(self, context):
-        policy = ConfMgr.GetInstance().Memory().Policy("profile")
+        policy = self._conf.Policy("profile")
         names = tuple(name for name in policy.get("sources", ()) if policy.get("enabled", False))
         if not names:
             return ()

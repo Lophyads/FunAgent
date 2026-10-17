@@ -1,0 +1,37 @@
+sequenceDiagram
+    autonumber
+    participant Task as TaskProcess
+    participant DB as 主数据库
+    participant Scheduler as ReviewScheduler
+    participant Review as ReviewProcess
+    participant Runtime as Runtime
+    participant Memory as MemoryManager
+
+    Note over Task,DB: 主任务已 completed<br/>回复与终态已提交
+    opt 启用 review 且配置目标来源
+        Task->>DB: ObserveReviewTurn，累计成功轮次
+        alt 达到 every_turns 阈值
+            DB-->>Task: through_message_id
+            Task->>Scheduler: 异步 Schedule<br/>(session_id, through_message_id)
+            Scheduler->>Review: 独立 worker 执行固定历史范围
+            Review->>DB: 读取上次水位、新历史与只读锚点
+            DB-->>Review: expected 水位与已提交消息
+            Review->>Memory: 读取授权来源原文、墓碑、类型与主题
+            Memory-->>Review: 事实原文、删除标记与主题目录
+            Review->>Runtime: Run(复盘策略, 临时上下文)
+            opt 有值得保存的新事实
+                Runtime->>Memory: 经 memory 工具 list / search / add
+                Note over Runtime,Memory: 新事实引用本次范围的消息 ID<br/>并选择或创建主题
+                Memory-->>Runtime: 原文与主题保存结果、index_status 与操作效果
+            end
+            Runtime-->>Review: RunResult 与 tool_results
+            alt 运行完成且工具成功、效果可确认
+                Review->>DB: AdvanceReview(expected, through_message_id)
+                DB-->>Review: 推进处理水位
+            else 运行或写入失败
+                Note over Review,DB: 保留原水位，已提交回复不受影响
+            end
+        else 未达到阈值
+            DB-->>Task: 等待后续成功轮次
+        end
+    end

@@ -15,6 +15,13 @@ export function createStore() {
     return () => subscriptions.delete(sub);
   }, server(key, value) {update(s => ({...s, server: {...s.server, [key]: value}}));},
   ui(key, value) {update(s => ({...s, ui: {...s.ui, [key]: value}}));},
+  resetMemory() {
+    update(s=>({...s,
+      server:{...s.server,memory:{},memoryInspection:{},catalog:{}},
+      ui:{...s.ui,memorySourceId:'',memoryKind:'all',memorySelection:null,memoryInspectionTab:'records',memoryReload:(s.ui.memoryReload||0)+1},
+      drafts:{...s.drafts,memoryByTarget:{}}}));
+    try{globalThis.localStorage?.setItem('funagent.webDrafts',JSON.stringify({chat:state.drafts.chatBySession,memory:{}}));}catch{}
+  },
   migrateMemoryDrafts(sourceId) {
     if(!sourceId)return;
     const memory={...state.drafts.memoryByTarget};let changed=false;

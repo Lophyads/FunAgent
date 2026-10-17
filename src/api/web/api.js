@@ -72,6 +72,8 @@ export class ApiClient {
   submitMemoryImport(sourceId,file){const body=new FormData();body.append('source_id',sourceId);body.append('file',file);return this.wire('/memory/imports',{method:'POST',body});}
   memoryImport(id){return this.wire(`/memory/imports/${encodeURIComponent(id)}`);}
   latestMemoryImport(sourceId){return this.wire(`/memory/imports?${new URLSearchParams({source_id:sourceId})}`);}
+  memoryConfig(){return this.wire('/memory/config');}
+  applyMemoryConfig(content){return this.wire('/memory/config',{method:'POST',body:memoryJSON({content})});}
   memorySources(){return this.wire('/memory/sources');}
   memoryTopics(source){return this.wire(`/memory/topics?${new URLSearchParams({source_id:source.source_id})}`);}
   createMemoryTopic(source,topic){return this.wire('/memory/topics',{method:'POST',body:memoryJSON({source_id:source.source_id,...topic})});}

@@ -108,7 +108,7 @@ export function mount(root, {store, api}) {
   function findRecord(id) {return Object.values(state.pages).flatMap(page => page.entries).find(record => (record.id || record.record_id) === id);}
   function recordDraft(record, readonly = false) {
     return {action:readonly || !record.version ? 'view' : 'replace', id:record.id || record.record_id,
-      expected_version:record.version, type:record.type, topic_id:record.topic_id, topic_path:record.topic_path,
+      expected_version:record.version, type:record.type, topic_id:record.topic_id, topic_path:record.topic_path, index_status:record.index_status,
       content:record.content, subject:record.subject || '', origin:record.origin || '',
       event_at:dateLabel(record.event_timestamp || record.event_at), event_timestamp:record.event_timestamp || record.event_at, dirty:false};
   }
@@ -291,7 +291,9 @@ export function mount(root, {store, api}) {
       if (!disposed && gen === scopeGeneration && accepted) {
         if (next) selection = {kind:'record', recordId:next.id, topicId:next.topic_id || null};
         else selection = current.topic_id ? {kind:'topic', topicId:current.topic_id} : {kind:'unclassified'};
-        saveSelection(); inspection.invalidate(); notify(action === 'remove' ? '记忆已删除' : '记忆已保存');
+        saveSelection(); inspection.invalidate(); notify(action === 'remove' ? '记忆已删除' :
+          result.index_status === 'pending' ? '事实与主题已保存，图谱索引待完成' :
+          result.index_status === 'unknown' ? '事实与主题已保存，图谱索引状态未知' : '记忆已保存');
         await refreshPage();
       }
     } catch (error) {
@@ -350,6 +352,9 @@ export function mount(root, {store, api}) {
       '操作结果未确认，草稿与请求标识已保留。请先刷新核对，再继续编辑或原样重试。' : current.failure ? current.failure + ' 草稿已保留。' :
       current.action === 'view' ? '搜索为有限召回，结果只读；请返回目录选择条目进行编辑。' :
       adding && !current.topic_id ? '请选择所属主题；没有合适主题时请先新建主题。正文草稿将保留。' : '正文修改和删除需要确认；更换主题只保存目录，保留正文草稿。';
+    if (!busy() && !current.dirty && current.index_status) status.textContent +=
+      current.index_status === 'ready' ? ' 图谱索引已确认。' : current.index_status === 'pending' ?
+      ' 事实已保存，图谱索引待完成；无需重复提交。' : ' 事实已保存，图谱索引状态未知；无需重复提交。';
   }
   function renderSearch() {
     resultsRoot.replaceChildren(); const results = state.results;

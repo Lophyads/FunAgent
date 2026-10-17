@@ -1,0 +1,50 @@
+@startuml background_review
+title 后台复盘：从已提交对话提取长期事实
+hide footbox
+autonumber
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName Microsoft YaHei
+skinparam sequenceArrowColor #4A6FA5
+
+participant "TaskProcess" as Task
+database "主数据库" as DB
+participant "ReviewScheduler" as Scheduler
+participant "ReviewProcess" as Review
+participant "MemoryManager" as Memory
+participant "ModelRuntime" as Runtime
+
+note over Task: 主任务已 completed，回复和终态已经提交
+opt 启用 review 且配置目标来源
+    Task -> DB: ObserveReviewTurn：累计去重后的成功轮次
+    alt 达到 every_turns 阈值
+        DB --> Task: through_message_id
+        Task ->> Scheduler: Schedule(session_id, through_message_id)
+        note over Task: 主任务无需等待复盘执行
+        Scheduler -> Review: 独立 worker 执行固定历史范围
+        Review -> DB: 读取上次水位、新历史与只读锚点
+        DB --> Review: expected 水位与已提交消息
+        Review -> Memory: 读取授权来源原文、墓碑、类型与主题
+        Memory --> Review: 事实原文、删除标记与主题目录
+        Review -> Runtime: Run(复盘策略, 临时上下文)
+        opt 有值得保存的新事实
+            Runtime -> Memory: 经 memory 工具 list / search / add
+            note over Memory: 新增引用本次范围的消息 ID，并指定或创建主题
+            Memory --> Runtime: 原文与主题保存结果、index_status 与操作效果
+        end
+        Runtime --> Review: RunResult 与 tool_results
+        alt 运行完成且工具均成功、效果可确认
+            Review -> DB: AdvanceReview(expected, through_message_id)
+            DB --> Review: 推进处理水位
+        else 运行或写入失败
+            Review -> Review: 返回失败状态，保留原水位
+        end
+        Review --> Scheduler: 本次复盘结果
+    else 尚未达到阈值
+        DB --> Task: 等待后续成功轮次
+    end
+end
+
+note over Memory: 后台工具仅允许 list / search / add；禁止改删既有事实
+note over Task, Scheduler: 复盘调度或执行失败不会改写已提交的主任务回复
+@enduml

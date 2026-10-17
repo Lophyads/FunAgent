@@ -1,585 +1,606 @@
 # FunAgent
 
-FunAgent 是面向本机运行的 Agent 应用，通过 CLI 和 Web 提供持久对话、异步任务、工具调用与长期记忆，支持人工澄清和单次操作批准。
+FunAgent 是面向本机运行的单进程 Python Agent，通过 CLI 和 Web 提供持久对话、异步任务、工具调用与长期记忆，支持人工澄清和单次操作批准。浏览器界面随 Python 包提供，无需单独构建前端。
 
-- [项目概述](#项目概述)
-- [系统架构与模块设计](#系统架构与模块设计)
-- [快速开始](#快速开始)
-- [配置与能力扩展](#配置与能力扩展)
-- [常用操作与接口](#常用操作与接口)
-- [开发与验证](#开发与验证)
-- [使用边界与常见问题](#使用边界与常见问题)
-- [文档导航](#文档导航)
+首次使用从[快速启动](#快速启动)开始；开发者可从[架构设计](#架构设计)、[数据流](#数据流)和[开发指南](#开发指南)了解执行过程与扩展入口。
 
-## 项目概述
+- [快速启动](#快速启动)
+- [架构设计](#架构设计)
+- [数据流](#数据流)
+- [配置与扩展](#配置与扩展)
+- [开发指南](#开发指南)
+- [常见问题](#常见问题)
 
-### 核心能力一览
+## 快速启动
 
-| 能力 | 说明 |
+准备 **Python 3.11–3.13** 和已加入 `PATH` 的 **uv**，在项目根目录的 **PowerShell** 中执行。首次安装依赖需要联网；Demo 运行无需 API Key、Docker 或外部记忆服务。
+
+```powershell
+New-Item -ItemType Directory -Force .funagent/quickstart | Out-Null
+Copy-Item -Path examples/quickstart/*.conf -Destination .funagent/quickstart
+uv run --locked funagent --conf-dir .funagent/quickstart --check-config
+uv run --locked funagent --conf-dir .funagent/quickstart
+```
+
+前两条命令仅用于首次复制[最小配置](examples/quickstart/)，后续启动只需最后一条。校验成功打印 `Configuration valid.`；服务启动后打开 [http://127.0.0.1:7777](http://127.0.0.1:7777)，新建会话并发送：
+
+| 输入 | 预期结果 |
 | --- | --- |
-| 对话与任务 | CLI / Web 共享会话，支持异步排队、流式展示、取消和历史恢复 |
-| 模型与工具 | 离线 Demo / OpenAI 兼容模型；文件、终端、联网、桌面操作及 MCP 工具 |
-| 记忆与复盘 | 用户画像、事实和知识按策略召回；后台从已完成对话提取长期事实 |
-| 人工交互与管理 | 澄清、单次批准，以及记忆管理、数据浏览和运行诊断 |
+| `hello` | 回复 `Demo: hello` |
+| `tool:hello` | 调用 `echo`，返回 `hello` |
+| `read:pyproject.toml` | 读取项目文件 |
+| `ask:Which language?` | 显示澄清问题，填写后继续执行 |
 
-### 技术亮点
+Demo 按固定规则响应，用于验证运行链路。会话、任务和日志保存在 `.funagent/quickstart/`，长期记忆需另行配置。按 `Ctrl+C` 停止服务；接入真实模型见[模型配置](#接入真实模型)。
 
-1. **共用 ReAct 内核：** 主任务、召回规划和复盘通过不同策略复用 `Runtime.Run`。
-2. **模块与驱动解耦：** 业务域依赖协议，工厂选择具体实现，应用层统一装配和关闭资源。
-3. **执行结果可追溯：** 回复与终态原子提交，工具请求与结果配对；权限、单次批准和记忆版本校验约束实际操作。
+示例的 `workspace = "."` 指启动时的工作目录，请始终从项目根目录运行。需要固定工作区时，将 `.funagent/quickstart/serv.conf` 的 `workspace` 改为本机已有目录的绝对路径。
 
-## 系统架构与模块设计
+<details>
+<summary>使用 CLI</summary>
+
+将 `.funagent/quickstart/serv.conf` 的 `mode` 改为 `"both"`，重启后同时使用 Web 和 CLI；设为 `"cli"` 则只启动 CLI。
+
+```text
+new 我的第一个会话
+submit <session_id> hello
+wait <task_id>
+history <session_id>
+help
+quit
+```
+
+`new` 返回会话 ID，`submit` 返回任务 ID；将尖括号占位符替换为实际 ID。`wait` 等待结果，并处理任务中的澄清或批准请求。
+
+</details>
+
+## 架构设计
+
+FunAgent 将用户输入作为可查询、可取消的任务处理。CLI 和 Web 共用业务服务；模型、工具和记忆通过协议与工厂装配。对话历史与任务状态由主数据库保存，长期记忆使用单独配置的来源。
 
 ### 整体架构图
 
-![FunAgent 总体架构](docs/架构图.png)
+下图按当前源码绘制。FunAgent 内部模块运行在同一个 Python 进程中；主任务由一个 worker 串行执行，复盘、记忆导入和检索评估使用各自的后台执行路径。外部服务按配置启用。
 
-架构图从上到下分为四层，右侧为共享服务，底部为数据与外部资源。图中的模块表示同一应用进程内的逻辑职责；Web 界面运行在浏览器中，MODULAR-RAG 作为独立知识服务接入。
+![FunAgent 系统架构：接入、应用编排、执行与领域、驱动与存储，以及跨层共享服务](docs/architecture.svg)
 
-| 层次 | 模块与职责 | 主要源码 |
+架构图使用本地 Excalidraw 绘制，提供[可编辑源文件](docs/architecture.excalidraw)。实线表示主要调用或资源访问，虚线表示跨层支撑；仅展示主要关系，具体执行顺序见下方时序图。`src/app/application.py` 负责构造各域实现、绑定服务，并交给 `Lifecycle` 管理启动与关闭。
+
+### 架构层次与源码入口
+
+| 层次 | 职责 | 主要源码 |
 | --- | --- | --- |
-| 接入层 | CLI 命令、HTTP 请求、SSE 订阅、Web 展示及管理接口 | `src/api/`、`src/api/web/` |
-| 应用服务层 | 会话初始化、任务准入与排队、一轮任务编排、后台复盘调度 | `src/frame/session_mgr.py`、`src/task/`、`src/frame/review_scheduler.py` |
-| Agent 核心层 | 共用 ReAct 内核、召回规划、记忆授权与管理、工具注册与分发 | `src/model/runtime.py`、`src/memory/`、`src/tool/tool_registry.py` |
-| 适配器层 | 模型请求转换与 IO、SQLite / Supabase 存储、MCP / HTTP 查询、终端与网络等后端 | 各域的 `factory.py`、驱动文件及 `src/tool/backends/` |
-| 共享服务 | 公共契约、配置、人工交互、事件、日志、诊断、主数据持久化和资源关闭 | `src/frame/`、`src/persistence/`、`src/app/` |
+| 接入层 | 解析 CLI / HTTP 请求，提供 Web 页面、SSE 和管理接口 | `src/api/cli_controller.py`、`src/api/http_server.py`、`src/api/*_routes.py`、`src/api/web/` |
+| 应用编排层 | 装配资源，管理会话、任务准入和排队，编排一轮执行及后台用例 | `src/app/application.py`、`src/task/`、`src/frame/session_mgr.py`、`src/frame/review_scheduler.py`、`src/memory/review_process.py`、`src/memory/memory_operations.py`、`src/memory/memory_import_service.py`、`src/eval/service.py` |
+| 执行与领域层 | 运行模型与工具循环，规划召回，执行记忆授权和工具策略 | `src/model/runtime.py`、`src/memory/memory_prepare.py`、`src/memory/memory_planner.py`、`src/memory/memory_manager.py`、`src/tool/tool_registry.py` |
+| 驱动与存储层 | 转换模型协议，连接记忆来源和工具后端，持久化会话与任务 | 各域的 `factory.py`、`src/model/openai_chat.py`、`src/memory/{sqlite,supabase,cognee,mcp_query,http_query}.py`、`src/tool/backends/`、`src/persistence/` |
+| 跨层共享服务 | 提供配置、公共契约、人工交互、事件、观测与资源生命周期 | `src/frame/`、`src/observability/` |
 
-主任务由一个工作线程消费；启用后台复盘时，复盘另有一个工作线程。主任务、召回规划与复盘的运行上下文独立，共用模型执行机制及已装配的服务。
+目录按业务域组织，因此同一目录可能包含多个层次的代码：例如 `memory_prepare.py` 负责召回编排，`memory_manager.py` 负责来源授权与分发，`memory/sqlite.py` 实现具体存储。
 
-### 目录结构
+开发时遵循以下约定：
 
-```text
-FunAgent/
-├── README.md
-├── pyproject.toml                 # 包定义、命令入口与可选依赖
-├── uv.lock                        # 依赖锁定
-├── start.cmd / start.sh            # 使用根目录配置启动
-├── model.conf                     # 模型 provider、adapter 与 profile
-├── tool.conf                      # 工具集、权限、批准策略与后端
-├── memory.conf                    # 记忆来源、召回与复盘策略
-├── log.conf                       # 日志输出与轮转
-├── serv.conf                      # 运行模式、监听地址、队列与任务预算
-├── src/
-│   ├── __main__.py                # python -m src 入口
-│   ├── app/                       # 应用装配、启动回滚与命令参数
-│   ├── api/                       # CLI、HTTP、记忆管理、数据与诊断接口
-│   │   └── web/                   # 浏览器页面，原生 ES Modules
-│   ├── frame/                     # 公共契约、配置、会话、事件与生命周期
-│   ├── task/                      # 主任务队列、执行编排与模型策略
-│   ├── model/                     # ReAct 内核、流式累积与模型驱动
-│   ├── memory/                    # 召回、复盘、管理、存储与查询驱动
-│   ├── persistence/               # 主数据库协议与 SQLite 实现
-│   └── tool/                      # 工具声明、选择、授权与分发
-│       ├── builtins/              # 内置工具及 handler
-│       └── backends/              # MCP、terminal、web、computer、treg 等
-├── mcp_server/MODULAR-RAG/         # 独立 RAG 项目，不进入主应用发行包
-├── docs/                          # 架构图、API、迁移说明与验收记录
-└── pyproject.toml                  # 项目依赖与构建配置
-```
+- `contracts.py` 定义数据结构，`protocols.py` 定义使用方接口，`factory.py` 按配置选择实现；可选依赖在选用时加载。
+- `ModelRuntime` 和 `MemoryMgr` 等提供已装配服务的访问入口，实际执行分别由 `Runtime`、`MemoryManager` 等实现承担。
+- 主任务、召回规划和后台复盘复用执行内核，分别使用自己的策略、上下文、工具范围和预算。召回规划不调用工具。
+- 主数据库保存持久结果；事件和 SSE 负责界面更新，轨迹保存执行过程。后台处理失败不会改写已提交的主任务回复。
 
-建议按 `src/__main__.py → src/app/main.py → src/app/application.py` 阅读应用入口，再沿 `TaskQueue → TaskProcess → Runtime.Run` 阅读主执行链路。详细文件职责与导入约定见 [源码导航](src/README.md)。
+## 数据流
 
-### 数据流说明
+以下 Mermaid `sequenceDiagram` 按源码中的调用与提交顺序绘制，源文件位于 [`docs/data-flows/`](docs/data-flows/)。实线箭头表示请求，虚线箭头表示返回或展示通知。
 
-下面按一条用户消息的生命周期展开。实线表示调用与数据传递，虚线表示展示事件或异步触发；各图中的主数据库、记忆服务和执行内核对应上方架构图中的同名职责。
+### 1. 一次对话如何完成
 
-#### 1. 主任务：提交、排队与准备
-
-```mermaid
-flowchart TD
-    User["用户：CLI / Web"] --> Submit["提交 session_id、text、可选 request_key"]
-    Submit --> Admission["TaskQueue：去重与容量检查"]
-    Admission --> Register["主数据库登记任务：queued"]
-    Register --> Queue["进入有界队列，返回 task_id"]
-    Queue --> Worker["单主工作线程取出任务"]
-    Worker --> Session["加载会话，首次初始化系统提示与画像"]
-    Session --> Begin["BeginTurn：状态改为 running，保存用户消息"]
-    Begin --> Recall["MemoryPrepare：按策略准备召回证据"]
-    Recall --> Run["Runtime.Run：模型与工具循环"]
-    Run --> Commit["FinishTurn：原子提交回复与任务终态"]
-    Commit --> Read["CLI / HTTP 读取持久化结果"]
-    Run -. "运行过程事件" .-> Events["EventMgr：有界展示缓冲"]
-    Commit -. "task_committed" .-> Events
-    Events -. "SSE 更新" .-> User
-    Commit -. "completed 且达到复盘频率" .-> Review["后台复盘队列"]
-```
-
-| 阶段 | 数据如何变化 | 关键规则 |
-| --- | --- | --- |
-| 提交与准入 | 用户输入转换为 `TurnRequest`；任务登记到主数据库，再发布到进程内队列 | 同会话内同键同内容返回原任务，不占新容量；同键异内容返回 `CONFLICT`；容量统计包含排队和运行中的任务 |
-| 工作线程取任务 | 为本轮建立 `run_id`、取消信号和总期限，随后从会话补齐工作区与配置授予的权限 | 主任务串行消费；任务执行预算从工作线程取出任务时开始计算 |
-| 会话提示初始化 | 已有会话沿用冻结的提示；首次初始化时，将配置的系统提示与授权画像组合并保存 | 同会话保持画像快照；显式记忆查询和新会话可以读取更新后的记录 |
-| 开始本轮 | `BeginTurn` 在事务中把任务从 `queued` 改为 `running`，保存当前用户消息并返回历史快照 | 当前用户消息只加入一次；后续召回增强使用请求副本 |
-| 进入执行内核 | 系统提示、历史、本轮输入、召回证据及工具选择共同构成模型请求 | 最终回复先由内核返回，再由任务编排层提交；过程展示与结果提交分别处理 |
-
-对应代码：`src/task/task_queue.py`、`src/task/task_process.py`、`src/frame/session_mgr.py`、`src/persistence/sqlite.py`。
-
-#### 2. 记忆召回：先规划，再按来源查询
-
-用户画像在会话初始化阶段进入系统提示；本轮事实与知识召回由 `MemoryPrepare` 单独处理。只有策略已启用、来源已配置且会话具有读取权限时，来源才会进入召回规划。
-
-```mermaid
-flowchart TD
-    Input["当前问题 + 有界历史"] --> Sources{"存在启用且授权的事实或知识来源？"}
-    Sources -->|否| Skip["返回 skipped，沿用原请求"]
-    Sources -->|是| Plan["MemoryPlanner：共用内核执行一次无工具规划"]
-    Plan --> Valid{"规划输出有效？"}
-    Valid -->|是| Needs["need_memory / need_knowledge 与查询文本"]
-    Valid -->|否| Fallback["对启用且授权的分支按原问题降级"]
-    Needs --> Facts{"需要事实召回？"}
-    Fallback --> Facts
-    Facts -->|是| FactsQuery["查询 facts 策略配置的 note / episode 来源"]
-    Facts -->|否| FactsSkip["事实分支标记 skipped"]
-    FactsQuery --> Knowledge{"需要知识召回？"}
-    FactsSkip --> Knowledge
-    Knowledge -->|是| KnowledgeQuery["查询 semantic 来源，去重并限制查询次数"]
-    Knowledge -->|否| KnowledgeSkip["知识分支标记 skipped"]
-    KnowledgeQuery --> Fit["分支预算裁剪，保留来源、引用和状态"]
-    KnowledgeSkip --> Fit
-    Fit --> Context["MemoryContext：证据、查询、状态与 warnings"]
-    Context --> Attach["AttachRecall：增强最后一条 user 的请求副本"]
-    Attach --> Main["进入主模型请求"]
-    Skip --> Main
-```
-
-规划输入包含当前真实问题、最多六组有界历史以及授权来源的说明。规划只决定是否需要事实 / 知识及使用什么查询文本，不能授予来源权限，也不直接产生可用证据。事实与知识分别判断，当前实现按图示顺序执行查询。
-
-| 分支 | 查询与预算 | 结果如何使用 |
-| --- | --- | --- |
-| 用户画像 `profile` | 独立的来源、条数、字符数与超时配置 | 首次初始化时进入冻结的系统提示 |
-| 长期事实 `facts` 策略 | 每轮至多一个去重后的查询，限定 `note/episode`，按来源授权检索 | 作为带引用的长期事实证据附加到本轮请求 |
-| 参考知识 `knowledge` | 查询文本、变体与原问题去重后，按 `max_queries` 限制为 1–3 次 | 作为参考资料附加到本轮请求 |
-
-各分支按完整渲染后的字符数和记录数裁剪，长正文保留 `truncated` 标记；来源状态和安全 `warnings` 随结果传递。来源失败或子预算耗尽可留下部分结果，父任务取消或总期限耗尽则终止本轮。注入后的消息仅供本次模型请求使用，持久历史仍保存原始用户输入。
-
-对应代码：`src/memory/memory_prepare.py`、`memory_planner.py`、`prompt.py`、`memory_manager.py`。
-
-#### 3. 模型、工具与人工交互闭环
-
-模型每次收到系统提示、当前消息序列和本轮可用工具定义。返回文本时结束本轮；返回工具请求时，内核先记录请求，再执行工具，将配对结果追加到消息序列中，继续请求模型。
+用户输入先持久化登记，再进入主任务队列；最终回复与任务终态一起提交。
 
 ```mermaid
 sequenceDiagram
-    participant Runtime as ReAct 内核
+    autonumber
+    actor User as 用户
+    participant API as CLI / HTTP
+    participant Queue as TaskQueue
+    participant Task as TaskProcess
+    participant DB as 主数据库
+    participant Memory as MemoryPrepare
+    participant Runtime as Runtime
+
+    User->>API: 提交会话 ID、输入<br/>可选 request_key
+    API->>Queue: Submit(TurnRequest)
+    Queue->>Queue: 检查幂等键与容量
+    Queue->>DB: RegisterTurn，登记 queued 任务
+    DB-->>Queue: task_id
+    Queue->>Queue: 发布到进程内队列
+    Queue-->>API: 返回 task_id
+    API-->>User: 接收成功
+
+    Note over Queue,Task: 单个主任务 worker 串行执行
+    Queue->>Task: Run(task_id, context)
+    Task->>DB: 加载会话与历史
+    Task->>Task: 补齐工作区与会话权限
+    Note over Task,DB: 首次准备会话时读取授权画像<br/>并冻结系统提示词
+    Task->>DB: BeginTurn，保存原始用户消息
+    DB-->>Task: 会话与历史快照
+    Task->>Memory: 准备本轮事实与知识证据
+    Memory-->>Task: MemoryContext、来源状态与警告
+    Task->>Task: AttachRecall，仅增强本次请求副本
+    Task->>Runtime: Run(主任务策略)
+    Runtime-->>Task: RunResult
+    Task->>DB: FinishTurn，原子提交回复与终态
+    DB-->>Task: 已提交结果
+    Task-->>API: 经 EventMgr 发布 task_committed
+    API-->>User: SSE 更新或查询持久结果
+    Note over Task,DB: 成功轮次达到复盘阈值时<br/>异步触发后台复盘
+```
+
+同一会话内，相同 `request_key` 和输入复用原任务，输入变化则冲突。重启会修复中断任务状态，保留已提交数据，不自动重放工具调用。
+
+### 2. 记忆如何进入模型上下文
+
+画像在会话首次准备提示词时单独加载并冻结；以下展示每轮事实与知识的召回。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Task as TaskProcess
+    participant Prepare as MemoryPrepare
+    participant Memory as MemoryManager
+    participant Planner as MemoryPlanner
+    participant Runtime as Runtime
+    participant Source as 记忆 / 知识来源
+
+    Task->>Prepare: 当前问题、会话权限与总期限
+    Prepare->>Prepare: 筛选已启用且授权的<br/>facts / knowledge 来源
+    alt 没有可用来源
+        Prepare-->>Task: 跳过召回（skipped）
+    else 存在可用来源
+        Prepare->>Memory: ReadTopics(授权来源)
+        Memory-->>Prepare: 主题目录与来源说明
+        Prepare->>Planner: Plan(当前问题, 授权目录)
+        Planner->>Runtime: Run(无工具召回规划策略)
+        Runtime-->>Planner: 规划 JSON
+        Planner->>Planner: 校验规划字段与类型
+        alt 规划失败或子期限耗尽
+            Planner-->>Prepare: PLAN_FAILED / PLAN_INVALID / DEADLINE
+            Prepare-->>Task: 跳过召回，附带警告
+        else 规划有效
+            Planner-->>Prepare: 是否检索、查询文本与变体
+            loop 需要检索的 facts / knowledge 分支
+                Prepare->>Memory: Search(查询与候选上限)
+                Memory->>Memory: 再次校验来源权限与能力
+                Memory->>Source: 查询授权来源
+                Source-->>Memory: 记录、引用与来源状态
+                Memory-->>Prepare: 候选与警告
+                Prepare->>Prepare: 去重并交错合并多个来源
+                opt 启用 rerank 且存在候选
+                    Prepare->>Runtime: Rank(原问题, 候选正文)
+                    Runtime-->>Prepare: 评分或重排失败状态
+                end
+                Prepare->>Prepare: 按记录数与字符预算裁剪
+            end
+            Prepare-->>Task: MemoryContext<br/>证据、引用、状态和警告
+        end
+    end
+    Task->>Task: AttachRecall，仅加入本次模型输入
+```
+
+来源或重排失败时尽量保留可用结果；父任务取消或总期限耗尽会终止本轮。持久历史中的用户输入保持原文。
+
+### 3. 工具调用与人工交互如何闭环
+
+模型提出调用后，由工具服务校验和执行；批准与澄清通过 CLI / Web 交回原调用。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Runtime as Runtime
     participant Model as 模型驱动
     participant DB as 主数据库
-    participant Tool as 工具服务与后端
-    participant Human as 人工交互服务
+    participant Tools as ToolRegistry
+    participant Human as InteractionMgr
     actor User as 用户 CLI / Web
+    participant Backend as handler / 后端
 
     loop 在迭代上限与任务期限内
-        Runtime->>Model: 系统提示 + 消息序列 + 工具定义
-        Model-->>Runtime: 文本回复或工具调用
+        Runtime->>Model: 系统提示、消息与可用工具定义
+        Model-->>Runtime: 最终文本或工具调用
         alt 返回最终文本
-            Note over Runtime: 结束循环，将结果交给 TaskProcess 提交
+            Note over Runtime: 返回 RunResult，由 TaskProcess 提交
         else 返回工具调用
-            Runtime->>DB: 保存工具请求，登记 call_id
-            Runtime->>Tool: 执行当前调用
-            Note over Tool: 校验工具选择、用途、权限、参数与能力
-            opt 需要单次批准，或调用 clarify
-                Tool->>Human: 建立绑定当前 task / run 的人工请求
-                Human-->>User: 展示批准内容或结构化澄清问题
-                User->>Human: 提交批准决定或问题答案
-                Human-->>Tool: 唤醒原调用，返回决定或答案
+            Runtime->>DB: AppendToolCalls，保存请求与 call_id
+            loop 顺序执行本批工具
+                Runtime->>Tools: Execute(call, selection, context)
+                Tools->>Tools: 校验选择、用途与权限<br/>校验参数与后端能力
+                alt 校验失败或策略拒绝
+                    Tools-->>Runtime: invalid / denied
+                else 进入操作处理
+                    opt 策略要求单次批准
+                        Tools->>Human: Wait(approval)<br/>绑定任务、运行、调用与参数摘要
+                        Human-->>User: 展示本次操作
+                        User->>Human: 批准或拒绝
+                        Human-->>Tools: 返回决定
+                        Tools->>Tools: 获批后复核参数、策略与可用性
+                    end
+                    alt 获得执行许可
+                        Tools->>Backend: Execute(args, context)
+                        opt 当前工具为 clarify
+                            Backend->>Human: Wait(clarify)<br/>提交结构化问题
+                            Human-->>User: 展示问题与选项
+                            User->>Human: 提交带问题 ID 的答案
+                            Human-->>Backend: 返回经校验的答案
+                        end
+                        Backend-->>Tools: status、content、effect
+                        Tools-->>Runtime: 配对的 ToolResult
+                    else 未获批准、等待中断或复核失败
+                        Tools-->>Runtime: 对应的拒绝、取消或错误结果
+                    end
+                end
+                Runtime->>DB: AppendToolResult，按 call_id 保存结果
+                Runtime->>Runtime: 追加 tool 消息，继续模型请求
             end
-            Note over Tool: 按策略执行；拒绝、非法参数等返回相应状态
-            Tool-->>Runtime: ToolResult：call_id、status、content、effect
-            Runtime->>DB: 保存与 call_id 配对的工具结果
-            Note over Runtime: 追加 tool 消息，进入下一次模型请求
         end
     end
 ```
 
-图中展示主任务的工具记录路径；召回规划无工具，复盘使用临时运行消息，不把复盘循环写入主会话历史。同一批工具调用按顺序执行，结果通过 `call_id` 与请求配对。参数无效、权限拒绝或已知工具失败会返回相应的工具结果，模型可据此修正下一次调用；模型请求的重试和降级由公共内核按配置处理。
+此图展示主任务的记录路径；召回规划无工具，复盘使用临时消息。工具结果记录 `effect`，无法确认的副作用保留为未知状态。
 
-| 人工请求 | 用户提交的数据 | 恢复原调用的条件 |
-| --- | --- | --- |
-| 澄清 `clarify` | 带问题 ID 的单选、多选或文本答案 | 服务校验问题、选项与答案类型；合法答案作为工具结果返回模型 |
-| 单次批准 `approval` | 批准 / 拒绝决定 | 批准绑定 task、run、call、操作及规范化参数摘要；批准后再次检查参数和可用性，再执行当前操作 |
+### 4. 对话如何沉淀为长期记忆
 
-批准等待发生在受约束操作执行之前，澄清等待发生在 `clarify` handler 内部。人工回答不会创建新的用户轮次；拒绝、过期、取消或批准内容变化会按对应状态结束当前调用。工具结果同时保留操作效果 `none/known/unknown`，无法确认的副作用不会标记为成功。
-
-对应代码：`src/model/runtime.py`、`src/tool/tool_registry.py`、`src/frame/interaction_mgr.py`。
-
-#### 4. 最终提交、流式展示与刷新恢复
-
-内核返回 `RunResult` 后，`TaskProcess` 调用 `FinishTurn` 保存任务结果。成功任务的最终 assistant 消息和 `completed` 状态在同一个事务内提交；失败、取消或迭代耗尽同样进入持久终态。提交完成后再发布 `task_committed`，浏览器据此校准显示。
-
-| 数据 | 保存位置 | 查询与恢复方式 |
-| --- | --- | --- |
-| 会话、原始用户消息、最终回复、任务状态与工具配对记录 | 主数据库 | CLI / HTTP 查询，刷新后重读；重启后保留已提交内容 |
-| 流式正文增量、工具阶段、人工等待展示和运行时间线 | 进程内有界事件缓冲与投影 | SSE 推送；断线、慢读或事件淘汰后通过快照校准 |
-| 待回答人工请求与单次批准 | 进程内人工交互服务 | 同进程可继续回答；取消、过期或应用关闭会结束等待 |
-
-流式重试 / 降级会重置被弃用尝试的展示内容。SSE 断线只释放订阅，任务仍继续执行；临时增量不能作为任务成功的依据。重启会修复遗留的排队 / 运行任务状态，不自动重放模型或工具操作，也不恢复上一个进程的历史事件缓冲。
-
-#### 5. 后台复盘：把已完成对话转为长期事实
-
-后台复盘在主任务结果提交之后触发，使用独立队列和工作线程，主任务无需等待复盘结束。复盘仍调用同一个 `Runtime.Run`，但使用复盘模型策略、独立运行上下文和受限记忆工具。
+后台复盘只处理已提交的历史范围，主任务回复无需等待。
 
 ```mermaid
-flowchart TD
-    Completed["主任务 completed，结果已提交"] --> Enabled{"复盘已启用且配置来源？"}
-    Enabled -->|否| Disabled["跳过自动复盘"]
-    Enabled -->|是| Count["持久化去重后的完成轮次计数"]
-    Count --> Trigger{"达到非零 every_turns 阈值？"}
-    Trigger -->|否| Wait["等待后续已完成轮次"]
-    Trigger -->|是| Queue["ReviewScheduler：按会话进入复盘队列"]
-    Queue --> Range["读取处理水位与本次固定历史范围"]
-    Range --> Prepare["准备新历史、现有事实及仅供指代的历史锚点"]
-    Prepare --> Run["Runtime.Run + 复盘策略"]
-    Run --> Write["memory list / search / add：查询或新增事实"]
-    Write --> Check{"运行完成且工具结果均成功？"}
-    Check -->|否| Failure["记录复盘状态，保留原处理水位"]
-    Check -->|是| Advance["按预期水位推进复盘进度"]
-    Advance -. "新增事实供后续查询" .-> Recall["后续轮次的事实召回 / 显式 memory 查询"]
+sequenceDiagram
+    autonumber
+    participant Task as TaskProcess
+    participant DB as 主数据库
+    participant Scheduler as ReviewScheduler
+    participant Review as ReviewProcess
+    participant Runtime as Runtime
+    participant Memory as MemoryManager
+
+    Note over Task,DB: 主任务已 completed<br/>回复与终态已提交
+    opt 启用 review 且配置目标来源
+        Task->>DB: ObserveReviewTurn，累计成功轮次
+        alt 达到 every_turns 阈值
+            DB-->>Task: through_message_id
+            Task->>Scheduler: 异步 Schedule<br/>(session_id, through_message_id)
+            Scheduler->>Review: 独立 worker 执行固定历史范围
+            Review->>DB: 读取上次水位、新历史与只读锚点
+            DB-->>Review: expected 水位与已提交消息
+            Review->>Memory: 读取授权来源的已有事实与主题
+            Memory-->>Review: 现有记录与主题目录
+            Review->>Runtime: Run(复盘策略, 临时上下文)
+            opt 有值得保存的新事实
+                Runtime->>Memory: 经 memory 工具 list / search / add
+                Note over Runtime,Memory: 新事实引用本次范围的消息 ID<br/>并选择或创建主题
+                Memory-->>Runtime: 工具结果与操作效果
+            end
+            Runtime-->>Review: RunResult 与 tool_results
+            alt 运行完成且工具成功、效果可确认
+                Review->>DB: AdvanceReview(expected, through_message_id)
+                DB-->>Review: 推进处理水位
+            else 运行或写入失败
+                Note over Review,DB: 保留原水位，已提交回复不受影响
+            end
+        else 未达到阈值
+            DB-->>Task: 等待后续成功轮次
+        end
+    end
 ```
 
-复盘范围从上次成功水位之后开始，到本次触发的完整用户轮结束；执行中的范围保持固定，同会话尚未执行的复盘请求可合并到更晚的完整轮次。复盘读取现有事实帮助去重，新增事实必须引用本次范围内的可信消息 ID；已复盘的历史锚点只帮助理解指代，不能再次作为写入证据。
+后台工具仅允许查询和新增事实，不能改删既有事实。正常完成且没有新事实时也会推进水位；只读历史锚点仅用于理解指代。
 
-后台工具只开放 `list/search/add`，禁止修改或删除既有事实。只有运行完成且工具结果无失败、效果可确认时，才推进处理水位；没有新事实可写的正常复盘也会推进水位。复盘调度或执行失败不会改写已经提交的主任务回复。
+### 5. 记忆如何管理与批量导入
 
-对应代码：`src/frame/review_scheduler.py`、`src/memory/review_process.py`、`src/persistence/sqlite.py`。
+管理用例使用 `session_access.management` 权限；批量导入由独立 worker 执行。
 
-## 快速开始
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 用户 CLI / Web
+    participant Import as MemoryImportService
+    participant Operations as MemoryOperations
+    participant Memory as MemoryManager<br/>主题目录
+    participant Source as 记忆来源
 
-### 环境准备
-
-- Python **3.11–3.13**。
-- `uv`，用于按 `uv.lock` 安装依赖和运行应用。
-- Web 页面随 Python 包提供，运行主应用无需 Node 构建。
-
-获取源码后，在项目根目录执行：
-
-```powershell
-uv sync --locked
+    alt 日常记忆管理
+        User->>Operations: 查询或提交记忆变更
+        Operations->>Operations: 检查 management 权限<br/>校验变更确认策略
+        Operations->>Memory: 执行获准的来源或主题操作
+        Memory->>Source: 读取或写入记忆
+        Source-->>Memory: 记录、版本与操作结果
+        Memory-->>Operations: 返回结果
+        Operations-->>User: 展示记录或变更结果
+    else Web 批量导入
+        User->>Import: Submit(source_id, 导入文件)
+        Import->>Import: 解析文件与检查来源<br/>检查单任务容量
+        Import-->>User: 返回 import_id
+        loop 后台处理主题与记忆
+            Import->>Operations: 查询已有数据<br/>创建主题或写入记忆
+            Operations->>Memory: 校验权限并分发
+            Memory->>Source: 查询或写入
+            Source-->>Memory: 已确认结果
+            Memory-->>Operations: 记录或主题映射
+            Operations-->>Import: 更新进度与映射
+        end
+        User->>Import: 查询导入状态
+        Import-->>User: 进度、结果或失败信息
+    end
 ```
 
-### 运行离线 Demo
+### 6. 检索结果如何评估与追踪
 
-首次体验可以使用离线模型，无需 API 密钥、Supabase 或外部 MCP 服务。在项目根目录创建 `demo-conf`，以 UTF-8 保存以下五份 TOML 配置。
+应用内检索评估独立排队，保存每个来源的候选、评分和状态。
 
-```powershell
-mkdir demo-conf
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 用户 Web
+    participant Eval as EvalService
+    participant Memory as MemoryManager
+    participant Source as 记忆来源
+    participant Judge as RetrievalJudge<br/>Runtime
+    participant Repo as EvalRepository
+
+    User->>Eval: 提交问题、来源与 top_k
+    Eval->>Eval: 检查管理权限<br/>检查任务容量
+    Eval->>Repo: 保存 queued 评估任务
+    Eval-->>User: 返回 run_id
+    Note over Eval: 独立评估 worker 取出任务
+    Eval->>Repo: 标记 running
+    par 来源 A 的独立检索
+        Eval->>Memory: Search(问题, 来源 A, top_k)
+        Memory->>Source: 查询来源 A
+        Source-->>Memory: 候选与来源状态
+        Memory-->>Eval: 返回检索结果
+        Eval->>Repo: 保存候选、状态与耗时
+    and 其他选定来源
+        Note over Eval,Source: 其他来源重复同样流程<br/>线程池整体最多 4 路并发
+    end
+    loop 顺序评分检索成功且非空的来源
+        Eval->>Judge: Grade(问题, 候选正文)
+        Judge-->>Eval: 相关性、回答支持度或失败状态
+        Eval->>Repo: 保存评分与模型用量
+    end
+    Eval->>Repo: 汇总 completed / partial / failed 状态
+    User->>Eval: 查询评估结果
+    Eval->>Repo: 读取 run_id
+    Repo-->>Eval: 候选、评分与状态
+    Eval-->>User: 展示来源对比与结果
 ```
+
+评估记录位于配置目录的 `.funagent/eval.sqlite3`。主任务阶段、模型请求和工具 IO 另由 `src/observability/` 采集为轨迹，可通过诊断接口、日志和轨迹页面排查。
 
 <details>
-<summary>展开离线配置：model.conf、tool.conf、memory.conf、log.conf、serv.conf</summary>
+<summary>常用 HTTP 入口</summary>
 
-**`demo-conf/model.conf`**
+HTTP 路径直接位于根路径下，浏览器使用同一套接口。
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `POST /sessions`、`GET /sessions` | 创建、列出会话 |
+| `POST /sessions/{id}/tasks` | 提交 `{"text":"hello","request_key":"first-turn-1"}`，返回任务 ID；`request_key` 可省略 |
+| `GET /tasks/{id}`、`POST /tasks/{id}/cancel` | 查询结果、请求取消 |
+| `GET /sessions/{id}/messages` | 读取会话历史 |
+| `GET /tasks/{id}/events` | 订阅任务 SSE 事件 |
+| `GET /tasks/{id}/interactions` | 查询待处理交互 |
+| `POST /interactions/{id}/answer` | 提交 `task_id`、`run_id` 和 `answer` |
+| `GET /diagnostics/status` | 运行状态；同类视图包括 tools、connections、models、config、memory |
+| `/memory/*`、`/data/*`、`/traces`、`/eval/*` | 记忆管理、只读数据、轨迹与检索评估，方法见相应路由模块 |
+
+</details>
+
+## 配置与扩展
+
+`--conf-dir` 指向包含以下五份文件的目录。扩展名为 `.conf`，内容格式为 **UTF-8 TOML**；最小示例见 [`examples/quickstart/`](examples/quickstart/)。
+
+| 文件 | 主要配置 |
+| --- | --- |
+| `serv.conf` | `[options]`：运行模式、监听地址、工作区、主数据库、队列容量、模型 profile、迭代与超时限制 |
+| `model.conf` | `adapters`、`providers`、`profiles`：模型协议、连接、超时、重试、流式输出和备用 profile |
+| `tool.conf` | `toolsets`、`purposes`、`session_access`、`tools`、`backends`：工具选择、权限和后端 |
+| `memory.conf` | `sources`、`policies`、`topics`：记忆来源、召回 / 复盘策略和主题目录 |
+| `log.conf` | `[options]`：日志输出、脱敏与轮转；`[observability]`：轨迹容量等限制 |
+
+主数据库、SQLite 记忆、日志和主题目录的相对路径以配置目录为基准。`workspace` 的相对路径以及 MCP 的 `command`、`cwd` 等需结合启动进程的工作目录配置。
+
+实际启动加载 `<配置目录>/.env`，已有的进程环境变量优先。`credential_env` 填环境变量名，凭据值放在该目录的 `.env` 或进程环境中；快速启动不会自动加载项目根目录的 `.env`。
+
+### 接入真实模型
+
+将 `.funagent/quickstart/model.conf` 替换为以下内容，填写服务地址和模型名：
 
 ```toml
-adapters = ["demo"]
+adapters = ["openai_chat"]
 
-[providers.offline]
-kind = "demo"
+[providers.chat]
+kind = "openai"
+base_url = "https://your-openai-compatible-host/v1"
+credential_env = "OPENAI_API_KEY"
 
-[profiles.main]
-provider_id = "offline"
-adapter_id = "demo"
-model = "offline"
-timeout = 10.0
+[profiles.primary]
+provider_id = "chat"
+adapter_id = "openai_chat"
+model = "your-chat-model"
+timeout = 60.0
+max_retries = 2
+streaming = true
+fallback_profiles = []
 ```
 
-**`demo-conf/tool.conf`**
+在同一 PowerShell 窗口设置凭据并启动：
+
+```powershell
+$env:OPENAI_API_KEY = "替换为你的密钥"
+uv run --locked --extra openai funagent --conf-dir .funagent/quickstart
+```
+
+也可将 `OPENAI_API_KEY=...` 写入 `.funagent/quickstart/.env`。服务需兼容 Chat Completions，所选模型需支持配置的工具和流式输出能力。`max_retries = 2` 表示最多重试两次；备用 profile 必须在同文件中声明。
+
+### 工具与权限
+
+工具须同时满足选择规则、用途、会话权限和后端能力。`purposes` 区分 `main`、`recall`、`review`；`session_access.default` 是普通会话默认权限，`management` 用于管理用例，也可以按会话 ID 配置权限。
 
 ```toml
-[purposes]
-main = ["echo", "clarify", "read_workspace"]
-recall = []
-review = []
-
-[tools.read_workspace]
-requires_approval = true
+[purposes.main]
+toolsets = ["default", "workspace", "interaction"]
+enable = ["echo"]
+disable = ["memory"]
 
 [session_access]
 default = ["workspace.read"]
+management = ["workspace.read"]
 ```
 
-**`demo-conf/memory.conf`**
+`default` 工具集包含计算和时间工具，`workspace` 提供工作区文件工具，`interaction` 提供澄清；也可像 Demo 一样直接列出工具名。`[tools.<工具名>]` 可绑定 `backend_id` 或要求批准，`[backends.<id>]` 声明连接。
+
+MCP 支持 `stdio`、`streamable_http` 和 `sse`。根目录配置中的 RAG 后端使用独立 Python 环境，启动时发现工具；其隐藏查询工具由固定召回流程调用。依赖与配置分别见 `mcp_server/MODULAR-RAG/requirements.txt`、`mcp_server/MODULAR-RAG/config/settings.yaml`。
+
+### 长期记忆
+
+对话历史自动保存在主数据库中；长期记忆须单独声明来源、授权并写入内容。
+
+| `store` | `kind` | 配置内容 |
+| --- | --- | --- |
+| `sqlite` | `episodic` | 本地记忆文件路径 |
+| `supabase` | `episodic` | RPC 地址、namespace、凭据、Embedding 和数据库部署资产 |
+| `cognee` | `episodic` | API 地址、datasets、令牌和超时 |
+| `callback` | `semantic` | `http_json` 查询地址，或 `mcp` 的 backend、collection 与 top_k |
+
+例如，将 `.funagent/quickstart/memory.conf` 替换为以下内容，可启用本地事实召回：
 
 ```toml
+[sources.local]
+kind = "episodic"
+store = "sqlite"
+path = "memory.sqlite3"
+capabilities = ["search", "list", "write", "update", "delete"]
+read_access = "memory.local.read"
+write_access = "memory.local.write"
+source_description = "本地项目记忆"
+
 [policies.recall]
-profile = "main"
+profile = "primary"
+timeout = 30.0
+
+[policies.facts]
+enabled = true
+sources = ["local"]
+max_records = 10
+max_chars = 4000
+timeout = 10.0
 
 [policies.review]
 enabled = false
 ```
 
-**`demo-conf/log.conf`**
+同时在 `tool.conf` 的 `session_access.default` 增加 `memory.local.read`，在 `management` 增加 `memory.local.read` 和 `memory.local.write`。重启后在 Memory 页面先创建主题，再添加记录；Demo 使用 `memory:关键词` 验证召回。
 
-```toml
-[options]
-level = "INFO"
-console = true
-```
+| 策略 | 作用 |
+| --- | --- |
+| `profile` | 首次准备会话提示词时加载画像，并随提示词冻结 |
+| `recall` | 调用指定模型生成召回计划，不调用工具 |
+| `facts` / `knowledge` | 分别检索事实 / 知识，控制来源、候选量、结果量、字符预算和超时 |
+| `rerank` | 可选的候选评分，引用 `task = "rerank"`、`adapter_id = "tei_rerank"` 的 profile |
+| `review` | 成功对话达到轮次阈值后后台复盘，目标须为已启用的 facts 来源并具备所需能力 |
 
-**`demo-conf/serv.conf`**
+启用复盘还需配置复盘模型 profile，并在 `purposes.review` 开放 `memory` 工具。主题目录默认为配置目录下的 `.funagent/memory-topics.json`。所有已声明的来源都会在启动时构造，停用召回策略不会移除对应来源及其依赖。
 
-```toml
-[options]
-mode = "both"
-host = "127.0.0.1"
-port = 8080
-workspace = "."
-database = "app.sqlite3"
-capacity = 16
-model_profile = "main"
-max_iterations = 8
-task_timeout = 60.0
-interaction_timeout = 120.0
-```
+### 可选依赖与现有启动脚本
 
-</details>
+extras 可以组合，例如 `uv run --locked --extra openai --extra mcp funagent --conf-dir <配置目录>`。
 
-校验后启动：
+| extra | 使用场景 |
+| --- | --- |
+| 无 | Demo、本地 SQLite、基础工具、CLI 和 Web |
+| `openai` | OpenAI 兼容模型 |
+| `mcp` | MCP 工具或知识召回 |
+| `embedding`、`supabase`、`cognee`、`rerank` | 对应 HTTP 驱动所需的 `httpx` |
+| `web` | 内置 Web 搜索与网页 / PDF 提取 |
+| `dev` | pytest |
+| `supabase-test` | Supabase 数据库契约验收 |
 
-```powershell
-uv run --locked funagent --conf-dir ./demo-conf --check-config
-uv run --locked funagent --conf-dir ./demo-conf
-```
+根目录的 `*.conf` 是依赖外部服务和本机路径的部署配置。使用前检查工作区、服务地址、凭据变量和 RAG 解释器路径。Supabase 部署说明见 [`sql/supabase/README.md`](sql/supabase/README.md)，迁移文件位于 `src/memory/assets/supabase/migrations/`。
 
-浏览器打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)，可创建会话并发送 `hello`。终端同时提供 CLI：
+| 入口 | 行为与前置条件 |
+| --- | --- |
+| `uv run --locked funagent --conf-dir <配置目录>` | 按指定配置运行，按所选驱动补充 `--extra` |
+| `bash start.sh` | 安装 `openai/mcp/supabase/embedding/cognee` extras 后启动；不负责启动 Cognee，WSL 下使用宿主机 `uv.exe` |
+| `.\start.cmd` | 先通过 `ensure-cognee.ps1` 检查、启动并登录 Cognee，再以相同 extras 启动；前置步骤失败则终止 |
+
+`start.cmd` 检查 `127.0.0.1:8000/health`，必要时通过 `evals/services/cognee.compose.yml` 启动 Docker 服务，并将令牌写入 `.funagent/cognee-session.env`。Compose 还依赖宿主机 `1234` 端口的模型与 Embedding 服务；即使传入 `--check-config`，此脚本仍会先执行 Cognee 前置步骤。
+
+## 开发指南
+
+### 目录与阅读顺序
 
 ```text
-new 我的会话
-submit <session_id> hello
-wait <task_id>
-history <session_id>
+FunAgent/
+├── examples/quickstart/       # 可复制的五份最小 Demo 配置
+├── src/
+│   ├── __main__.py            # python -m src 入口
+│   ├── app/                   # 参数解析、应用装配与启动关闭
+│   ├── api/                   # CLI、HTTP、SSE、管理接口与 Web 页面
+│   ├── frame/                 # 配置、契约、会话、交互、事件与生命周期
+│   ├── task/                  # 主任务队列、执行编排与策略
+│   ├── model/                 # 共用执行内核、模型与重排驱动
+│   ├── memory/                # 授权、主题、召回、复盘、管理、导入与来源驱动
+│   ├── tool/                  # 工具注册、校验、内置 handler 与后端
+│   ├── persistence/           # 主数据库协议与 SQLite 实现
+│   ├── observability/         # 轨迹采集、脱敏、存储与读取
+│   └── eval/                  # 应用内检索评估与结果存储
+├── mcp_server/MODULAR-RAG/    # 独立 RAG 项目、环境和配置
+├── evals/                    # 独立评估 CLI、配置、数据和测试
+├── scripts/                  # 发布、浏览器与迁移验收脚本
+├── docs/                     # Excalidraw 架构图、Mermaid 时序图与专题设计
+├── pyproject.toml / uv.lock   # 包定义、入口、依赖与锁定版本
+├── start.cmd / start.sh      # 按根目录部署配置启动
+└── .funagent/                # 本地配置与运行数据
 ```
 
-将占位符替换为命令返回的实际 ID。Demo 使用以下固定输入演示执行流程：
+建议按 `src/__main__.py` → `src/app/main.py` → `src/app/application.py` → `src/task/task_queue.py` → `src/task/task_process.py` → `src/model/runtime.py` 阅读主链路，随后按需阅读记忆或工具模块。
 
-| 输入 | 行为 |
+| 开发目标 | 从哪里开始 |
 | --- | --- |
-| `hello` | 返回 `Demo: hello` |
-| `tool: 你好` | 调用 echo 工具并返回内容 |
-| `ask: 你希望使用什么颜色？` | 发起文本澄清，回答后继续原任务 |
-| `read: README.md` | 按上述配置请求单次批准，再读取工作区文件 |
+| 新增接口或页面 | `src/api/`、`src/api/web/`，复用已有业务用例 |
+| 调整任务流程 | `src/task/task_process.py`、`src/task/main_strategy.py` |
+| 新增模型或记忆驱动 | 对应域的 `protocols.py`、`contracts.py`、`factory.py` |
+| 新增工具 | `src/tool/builtins/` 的 `register_tools(registrar)`；按需实现 `src/tool/backends/` 后端 |
+| 排查运行行为 | `src/observability/`、诊断接口及任务轨迹 |
 
-CLI 的 `wait` 会提示回答待处理的人工请求，浏览器提供相同闭环。`quit` 或 Ctrl+C 关闭应用；在 `both` 模式下，CLI 的 `quit` 也会关闭 HTTP 服务。关闭浏览器或断开 SSE 不会取消任务，取消需显式操作。
+发行包和命令名是 `funagent`，Python 包名为 `src`。主应用与 MODULAR-RAG 各有一个 `src` 包，须使用各自环境和工作目录。详细文件职责见[源码导航](src/README.md)，长篇分析见[架构分析](ARCHITECTURE.zh-CN.md)，路径与行为以当前源码为准。
 
-### 使用项目根目录配置
+### 运行数据与验证
 
-根目录五份配置用于真实模型与记忆接入。Windows PowerShell 使用：
+使用快速启动配置时，以下路径均相对于 `.funagent/quickstart/`：
+
+| 路径 | 内容 |
+| --- | --- |
+| `agentcore.db` | 会话、消息、任务状态与复盘进度 |
+| `logs/`、`trace_json/` | 应用日志与任务轨迹 |
+| `.funagent/eval.sqlite3` | 应用内检索评估记录 |
+| `memory.sqlite3`、`.funagent/memory-topics.json` | 启用上述本地记忆示例后生成的记忆与主题 |
+
+可运行当前检出已有的应用内评估回归测试：
 
 ```powershell
-.\start.cmd --check-config
-.\start.cmd
+uv run --locked --extra dev python -m pytest evals/tests/test_online_eval.py
 ```
 
-Linux / macOS / Git Bash 使用：
+独立评估入口为 `uv run --locked python -m evals --help`，提供数据集校验、run、score 和 compare。`scripts/` 中的验收脚本按各自 `--help` 准备依赖与输入。
 
-```bash
-bash start.sh --check-config
-bash start.sh
-```
+`pyproject.toml` 声明的 `tests/`、`tests_refactor/`、`tests_observability/` 及构建脚本引用的 `examples/refactor*` 当前未提供，完整发布验收需补齐对应资源。根目录部署配置、部分文档和运行数据受 `.gitignore` 排除，交付前需检查所引用文件是否包含在交付范围内。
 
-脚本在项目根目录执行 `uv run --locked`，启用 `openai`、`mcp`、`supabase`、`embedding` 可选依赖。当前根配置使用 `web` 模式，监听 [http://127.0.0.1:7777](http://127.0.0.1:7777)。Windows 下使用 `start.cmd` 可直接调用 Windows 的 `uv.exe`。
+## 常见问题
 
-启动前按实际环境准备以下依赖：
-
-| 当前接入 | 需要准备 |
+| 现象 | 检查与处理 |
 | --- | --- |
-| DeepSeek 模型 | `OPENAI_API_KEY`；检查 `model.conf` 中的端点与模型名称 |
-| Supabase 事实记忆 | `SUPABASE_SECRET_KEY`；在选定数据库部署项目 SQL / RPC，核对端点与 namespace |
-| Embedding 服务 | `EMBEDDING_API_KEY`；根配置指向 `http://127.0.0.1:1234/v1/embeddings`，模型输出为 4096 维 |
-| RAG MCP 服务 | `tool.conf` 指向 `mcp_server/MODULAR-RAG` 的独立 Python 环境；检查 `command`、`cwd` 和服务依赖，其他平台需调整解释器路径 |
-| treg 联网工具 | 设置 `TREG_TOKEN` 并重启；缺少令牌时不向模型暴露 `web_search`、`web_extract` |
+| `CONFIG_MISSING` | `--conf-dir` 中必须有 model、tool、memory、log、serv 五份 `.conf` 文件 |
+| `CONFIG_INVALID` / `CONFIG_REFERENCE` | 检查 UTF-8 TOML、字段类型及跨文件引用，先运行 `--check-config` |
+| 校验通过但实际启动失败 | `--check-config` 只验证格式与引用，不加载 `.env`、构造驱动或验证凭据、网络和工作区 |
+| `CONFIG_CREDENTIAL` / `DRIVER_UNAVAILABLE` | 在配置目录 `.env` 或进程环境中设置凭据；按实际驱动添加 `--extra` |
+| 新建会话提示工作区无效 | 检查 `serv.conf` 的 `workspace` 是否指向已有目录；相对路径需从正确目录启动 |
+| RAG 或外部服务连接失败 | 检查 `logs/errors.log`、服务地址、MCP 解释器与 cwd；先用 Demo 配置验证基础链路 |
+| 工具或记忆不可见 | 检查 purposes、toolsets、session_access、后端和记忆策略；CLI 可运行 `tools doctor`、`connections`、`memory check` |
+| 没有自动生成长期记忆 | 检查 review 开关、轮次阈值、目标 facts 来源、复盘模型及 memory 工具；普通历史持久化不会自动写入长期记忆 |
+| `7777` 端口占用 | 修改所用 `serv.conf` 的 `port` 后重启 |
 
-凭据放在所选配置目录的 `.env` 或进程环境中，配置文件保存环境变量名。当前根配置每 **3** 个已完成轮次触发复盘，自动知识召回关闭，主模型仍可直接调用 RAG 工具。
-
-`--check-config` 只校验配置结构和静态引用，不创建模型客户端或工具后端；它不能验证凭据、外部服务连通性或 MCP 动态工具。正式启动会装配所选驱动。使用 Supabase 事实记忆前，需在选定数据库自行部署相应的 SQL / RPC。
-
-## 配置与能力扩展
-
-### 五份配置与路径规则
-
-`--conf-dir` 指定的目录必须包含五份 `.conf` 文件，内容均为 TOML。
-
-| 文件 | 主要配置 |
-| --- | --- |
-| `model.conf` | provider、adapter、模型 profile、单次请求超时、重试次数、降级 profile 与流式开关 |
-| `tool.conf` | 按用途选择工具或工具集、会话权限、单次批准要求、后端与 MCP 发现规则 |
-| `memory.conf` | 来源类型、存储驱动、读写能力、画像 / 事实 / 知识预算、召回规划与复盘频率 |
-| `log.conf` | 日志级别、普通 / 错误文件、格式、控制台输出和轮转 |
-| `serv.conf` | `cli/web/both`、监听地址、主数据库、工作区、队列容量、主模型、迭代与时间上限 |
-
-数据库和日志的相对路径以配置目录为基准；workspace 以启动时的工作目录为基准，也可填写显式绝对路径。配置目录的 `.env` 在构造驱动前加载，进程环境变量优先。修改配置后重启应用。
-
-### 接入真实模型
-
-安装模型可选依赖：
-
-```powershell
-uv sync --locked --extra openai
-```
-
-将离线配置的 `model.conf` 替换为以下内容，并填写实际模型端点与名称。`serv.conf` 中保持 `model_profile = "main"`。
-
-```toml
-adapters = ["openai_chat"]
-
-[providers.remote]
-kind = "openai"
-base_url = "https://<模型服务地址>/v1"
-credential_env = "OPENAI_API_KEY"
-
-[profiles.main]
-provider_id = "remote"
-adapter_id = "openai_chat"
-model = "<支持工具调用的模型名称>"
-timeout = 60.0
-max_retries = 2
-fallback_profiles = []
-streaming = true
-```
-
-在配置目录 `.env` 中设置 `OPENAI_API_KEY`，然后运行：
-
-```powershell
-uv run --locked --extra openai funagent --conf-dir ./demo-conf
-```
-
-驱动使用 OpenAI 兼容 Chat Completions 协议。Provider 只执行单次 IO，SDK 自动重试关闭；有界重试与降级由公共内核处理。`streaming = true` 要求端点支持流式响应，降级模型必须显式配置到 `fallback_profiles`。
-
-### 记忆与知识接入
-
-| 策略 | 数据用途 | 运行方式 |
-| --- | --- | --- |
-| `profile` | 用户画像、稳定偏好 | 会话首次提示初始化时读取并冻结；新会话可读取更新后的画像 |
-| `facts` 策略分支 | `note` / `episode` 等长期事实 | 按本轮规划召回；具体后端由 `sources` 指定（根配置为 `supabase` 和 `cognee`） |
-| `knowledge` | 文档、参考知识 | 按本轮规划查询只读语义来源，支持去重与限次 |
-| `review` | 从已提交历史提取新事实 | 独立队列与工作线程，按 completed 轮次触发，保存处理水位 |
-
-来源由 `kind`、`store`、`capabilities` 及权限声明定义；策略控制是否启用、来源集合、条数、字符数和超时。存储与查询实现包括：
-
-- **SQLite：** 本地事实存储，支持关键词、FTS5 / BM25、中文匹配回退和时间筛选。
-- **Supabase：** 通过项目 RPC 存储事实，配合独立 Embedding HTTP 驱动进行向量化与精确余弦检索；写入和版本更新由 RPC 提交。
-- **Cognee：** 独立 HTTP 长期笔记驱动，仅存储和检索 `episodic/note` 记录；通过 `CHUNKS` / `CHUNKS_LEXICAL` 排序并归并完整笔记，与 SQLite、Supabase 共用检索输入输出协议。单个数据集名称在驱动内部映射 UUID；[配置与限制](docs/Cognee记忆驱动.md)。
-- **MCP / HTTP callback：** 只读知识来源；MCP 查询可借用启动时已连接的工具后端。
-
-开启事实来源后，需要在 `tool.conf` 配置相应的 `memory.<source_id>.read/write` 权限，并为相关用途选择 `memory` 工具。主模型的 `replace/remove` 需要单次批准和 `expected_version`；后台复盘只允许 `list/search/add`。CLI / Web 管理端的改删使用独立确认挑战，绑定记录、版本与修改内容。
-
-Web 的 Memory 页面可选择已配置来源，导入 UTF-8 Markdown、分页查看记录并编辑或删除。单篇文档保存为一条知识记录；[使用与验收说明](docs/Web记忆管理使用说明.md)。
-
-复盘启用且未指定频率时，默认每 10 个 completed 用户轮触发；`every_turns = 0` 关闭自动触发。离线快速开始关闭了记忆召回与复盘，真实接入可参考根目录 `memory.conf` 的策略结构和 [当前 API](docs/api-reference.md)。
-
-### 工具与可选后端
-
-| 类别 | 代表工具 / 实现 | 启用条件 |
-| --- | --- | --- |
-| 基础与人工交互 | `calculator`、`current_time`、`echo`、`clarify` | 在对应 purpose 中选择工具 |
-| 文件 | `list_directory`、`search_files`、`read_file`、`write_file`、`patch_file` | 读取需 `workspace.read`；写入和补丁需 `workspace.write` 及单次批准 |
-| 终端 | `terminal` | 显式绑定 terminal 后端、`process.execute` 权限与单次批准 |
-| 联网 | `web_search`、`web_extract` | 绑定 Web 后端并授予 `network.read`；当前根配置使用 treg |
-| 桌面操作 | `computer_use` | 可用的 HTTP AX 后端、`computer.use` 权限及操作策略 |
-| 记忆 | `memory` | 记忆来源、来源权限及用途选择 |
-| MCP 外部工具 | `mcp_<server_id>__<规范化原名>` | MCP 后端、动态发现、include/exclude 和调用策略 |
-
-通用读取工具接受绝对路径或相对会话 workspace 的路径（包括 `..`），可以读取 workspace 外的文件。`search_files.path` 可以是文件或目录；`query` 是不区分大小写的字面子串，通配符过滤使用 `glob`。读取结果中的 `path` 为绝对路径，搜索结果可直接传给 `read_file`；目录条目的 `name` 相对返回的目录 `path`。受保护路径、符号链接/reparse point 和文本大小限制仍有效。`write_file`、`patch_file` 及 terminal 的工作目录保持原 workspace 边界；旧工具 `read_workspace` 仍只读取 workspace 内的文件。
-
-MCP 支持 stdio、Streamable HTTP 和 SSE。可选依赖按需要安装：模型用 `openai`，MCP / treg 用 `mcp`，Supabase 记忆用 `supabase` + `embedding`，DDGS 搜索与 PDF 提取用 `web`。只安装依赖不会自动启用后端，还需要对应配置和权限。
-
-新增内置工具时，在 `src/tool/builtins/` 添加 `*_tool.py` 并实现 `register_tools(registrar)`，用 `ToolEntry` 声明名称、schema、handler 工厂、用途、权限与策略。启动按模块名扫描并校验全部声明；`tool.conf` 负责选择与加严策略。新增模型、记忆或持久化驱动，通过对应业务域的协议与 `factory.py` 接入。
-
-## 常用操作与接口
-
-### CLI
-
-```text
-help
-new 我的会话
-sessions
-submit <session_id> --request-key retry-001 hello
-wait <task_id>
-get <task_id>
-cancel <task_id>
-history <session_id>
-pending <task_id>
-answer <task_id> <interaction_id> <答案>
-tools doctor
-connections
-models
-config
-status
-quit
-```
-
-配置记忆来源后还可使用 `memory search/list/write/update/delete/confirm/export` 和 `review <session_id>`。配置日志文件后可使用 `logs tail/follow`；记忆导出生成 JSONL，并拒绝覆盖已有目标文件。
-
-主任务轨迹始终保存为日志目录同级 `trace_json/<trace_id>.json`。CLI 使用 `trace <task_id> [json|markdown|path]` 或 `traces [session_id]`；页面对话面板的“任务轨迹”和 Data 任务行可打开只读审查。操作树、IO、token、等待及完整性共用同一读取器，历史任务没有文件时显示“未采集”。离线读取、样例、六项资源配置与恢复诊断见 [观察层使用说明](docs/观察层使用说明.md)。
-
-### HTTP API
-
-| 接口 | 用途 |
-| --- | --- |
-| `POST /sessions`、`GET /sessions` | 创建与列出会话 |
-| `POST /sessions/{id}/tasks` | 提交任务，接收 `text` 与可选 `request_key` |
-| `GET /tasks/{id}`、`POST /tasks/{id}/cancel` | 查询状态与请求取消 |
-| `GET /sessions/{id}/messages`、`GET /sessions/{id}/tasks` | 分页读取历史和任务 |
-| `GET /tasks/{id}/events`、`GET /sessions/{id}/events` | 任务 / 会话 SSE |
-| `GET /tasks/{id}/interactions`、`POST /interactions/{id}/answer` | 查询与回答人工请求 |
-| `/memory/*` | 授权来源、搜索、分页记录、写入与改删确认 |
-| `GET /diagnostics/{kind}` | 工具、连接、模型、配置与状态诊断 |
-| `GET /data/schema`、`GET /data/tables/{table}` | 主数据库白名单表的只读浏览 |
-| `GET /traces` | 按会话 / 时间筛选保存的轨迹摘要，支持 `limit` 与 `offset` |
-| `GET /tasks/{id}/trace` | 读取已保存操作树、IO、汇总与主库校准状态 |
-| `GET /tasks/{id}/trace/json`、`GET /tasks/{id}/trace/markdown` | 导出已保存 JSON 或 Markdown 审查报告 |
-
-`request_key` 在会话内唯一：相同键和相同内容返回原任务，异内容返回 `409 CONFLICT`。刷新页面可从数据库读取会话历史与任务状态；运行过程通过有界 SSE 快照校准。详细参数、游标、错误码和人工答复格式见 [API 参考](docs/api-reference.md)。
-
-## 构建
-
-构建 wheel 与 sdist：
-
-```powershell
-uv build --out-dir dist
-```
-
-也可从构建后的 wheel 安装，通过 `funagent --conf-dir <配置目录>` 或 `python -m src --conf-dir <配置目录>` 启动。
-
-历史完整迁移与发布验收见 [迁移验收记录](docs/migration-acceptance.md)，运行其中命令前需检查它们要求的示例、测试资源和外部依赖。
-
-## 使用边界与常见问题
-
-可使用 [记忆 endpoint 检查脚本](check_memory_endpoint.py) 验证配置对应的 Supabase REST 服务与当前版本的 `list/search` RPC：
-
-```powershell
-uv run --no-sync python -X utf8 check_memory_endpoint.py --conf-dir .
-```
-
-脚本读取所选目录的 `memory.conf` 和 `.env`，进程环境变量优先；默认检查 `supabase`，可用 `--source` 指定其他来源，或用 `--timeout 10` 调整单次 HTTP 超时。仅执行读取，输出错误码与函数签名，不展示凭据或记忆正文。退出码 `0` 表示两个读取 RPC 均通过，`1` 表示远端检查失败，`2` 表示本地配置错误。检查不包含 embedding、向量检索或写入能力；依赖使用项目现有的 `python-dotenv` 和 `supabase` extra 中的 `httpx`。
-
-当前运行模型为单机、单应用进程，一个主任务工作线程、一个 Eval 工作线程及可选的一个复盘工作线程。主任务队列在进程内，持久化用于保存结果和修复中断状态；不提供分布式调度、跨进程接管或重启后自动重放任务。取消是合作式取消，关闭时需要等待实际 IO 和借用归还。
-
-旧项目 API、配置和数据库 schema 没有自动迁移入口，已有历史库的迁移需单独处理。架构图列出的外部能力是否可用，取决于配置、权限、可选依赖和服务准备情况。
-
-| 现象 / 错误码 | 排查方向 |
-| --- | --- |
-| `CONFIG_MISSING` / `CONFIG_INVALID` | 检查 `--conf-dir`、五份配置是否齐全及 TOML 结构 |
-| `CONFIG_REFERENCE` | 检查模型 profile、工具 backend、记忆 source 等引用 |
-| `CONFIG_CREDENTIAL` | 检查配置指定的环境变量；修改 `.env` 后重启 |
-| `DRIVER_UNAVAILABLE` | 检查所选驱动名称及对应 extra 是否安装 |
-| `UNSUPPORTED` | 检查驱动是否支持所选能力，例如流式响应或 Data 读取 |
-| `CAPACITY` | 当前准入容量已满，等待任务完成或取消任务 |
-| 根配置启动时 RAG 失败 | 检查独立解释器、`cwd`、服务依赖与 MCP 启动输出 |
-| 页面刷新后过程信息缺失 | 最终历史与任务状态可从主库读取；重启前的临时事件缓冲不持久化 |
-
-## 在线记忆 Eval
-
-Web 侧边栏的 **Eval** 页面支持单问题、多来源检索与 LLM 评分。选择有管理端读取权限的来源和每来源 Top-K（1–20，最多 8 个来源）后开始评测。各来源独立保留召回内容和引用，展示检索耗时、评分耗时、逐条相关性、整体回答支持度及判定理由。召回内容先显示，评分随后更新；空召回、超时和评分失败分别展示，评分失败仍保留证据。
-
-默认使用 `serv.conf` 的 `model_profile` 作为评测模型；也可以在 `[options]` 中设置：
-
-```toml
-eval_model_profile = "primary" # 必须是 model.conf 中已定义的 profile
-eval_source_timeout = 30       # 每个来源的检索超时，秒
-eval_judge_timeout = 60        # 每个来源的评测超时，秒
-```
-
-LLM 评分衡量召回内容对回答的支持程度，不代表有参考标注的事实准确率。单条相关性为 0–3 分，整体支持度为 0–4 分并转换为百分制；最多使用每来源 16000 字符的记忆正文，截断情况和实际评测输入可查看。评测禁用工具、使用临时模型上下文，独立于聊天任务和离线 Eval 的数据导入。离线 `demo` 模型不会产生真实评测分数，需要配置可用的 LLM。
-
-结果保存在配置目录的 `.funagent/eval.sqlite3`，最近 50 条可从页面重新打开。刷新或重启后完成结果保留；未完成任务标记为中断，不自动重跑。接口为 `GET /eval/options`、`POST /eval/runs`、`GET /eval/runs` 和 `GET /eval/runs/{run_id}`。提交请求可携带 32 位小写十六进制 `request_key`，相同输入的重试复用同一任务。
-
-离线回归用例位于 `evals/tests/test_online_eval.py`，浏览器验收可运行 `node evals/tests/web_acceptance.cjs`（需要 Playwright；Windows 默认使用已安装的 Chrome，可通过 `EVAL_BROWSER_CHANNEL` 指定其他浏览器）。验收仅使用临时 SQLite 来源和测试模型，不访问真实记忆服务。
+文档核对日期：2026-10-17。最小配置已在 Python 3.12 下验证 Web / CLI 启动、上述四类 Demo 输入与重启后的持久数据读取；本地记忆示例已验证配置校验和启动。外部模型和远程服务需在对应环境中验证。

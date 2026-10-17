@@ -9,7 +9,7 @@ import hashlib
 from ..frame.contracts import ControlError, DomainError
 from .cognee import Headers
 from .cognee_datasets import CogneeDataset
-from .cognee_documents import _unpack
+from .cognee_documents import _unpack, _deleted
 from .common import validate_content, validate_metadata
 from .transport import JSONHTTP
 
@@ -179,7 +179,7 @@ class CogneeInspection:
         mime = (row['mime_type'] or '').lower().split(';')[0]
         ext = (row['extension'] or '').lower().lstrip('.')
         textual = mime.startswith('text/') or mime in {'application/json', 'application/xml'} or (not mime and ext in {'txt', 'md', 'json', 'csv', 'xml'})
-        content, owned = None, False
+        content, owned, deleted = None, False, False
         if textual:
             try:
                 content = raw.decode('utf8')
@@ -191,13 +191,13 @@ class CogneeInspection:
                     if metadata.get('source_id') == self.source_id and metadata.get('type') == 'note' and isinstance(metadata.get('write_key'), str) and metadata['write_key'].strip():
                         validate_content(body, metadata.get('evidence'), 'note')
                         validate_metadata(metadata.get('subject'), metadata.get('event_at'), metadata.get('origin'))
-                        content, owned = body, True
+                        content, owned, deleted = body, True, _deleted(metadata)
                 except DomainError:
                     pass
         truncated = textual and len(content.encode('utf8')) > 65536
         preview = content.encode('utf8')[:65536].decode('utf8', errors='ignore') if textual else None
         return {'item': row, 'preview': preview, 'textual': textual, 'truncated': bool(truncated),
-                'funagent_note': owned, 'fetched_at': now()}
+                'funagent_note': owned, 'deleted': deleted, 'fetched_at': now()}
 
     def Graph(self, name, max_nodes, depth, seed, context):
         identifier = self.dataset_id(name)

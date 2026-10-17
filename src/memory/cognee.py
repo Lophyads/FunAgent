@@ -6,7 +6,8 @@ import re
 from uuid import UUID
 
 from ..frame.contracts import ControlError, DomainError
-from .common import text, validate_query, controlled_lock
+from .common import text, normalize, validate_query, controlled_lock
+from .search import Terms
 from .contracts import MemoryIssue, MemorySearchResult
 from .failure import ErrorIssue, IssueWarnings
 from .transport import JSONHTTP, ValidateConnection
@@ -20,10 +21,12 @@ SEARCH_TYPES = frozenset({"CHUNKS", "CHUNKS_LEXICAL"})
 def ValidateSettings(settings):
     """Shared by configuration loading and standalone construction; no IO."""
     allowed = {"store", "kind", "capabilities", "read_access", "write_access", "source_description",
-               "endpoint", "datasets", "search_type", "credential_env", "auth_header", "timeout"}
+               "endpoint", "datasets", "search_type", "credential_env", "auth_header", "timeout", "write_confirmation"}
     capabilities = settings.get("capabilities", ("search",)) if isinstance(settings, Mapping) else ()
     valid = (isinstance(settings, Mapping) and set(settings) <= allowed and
              settings.get("kind", "episodic") == "episodic" and
+             isinstance(settings.get("write_confirmation", "indexed"), str) and
+             settings.get("write_confirmation", "indexed") in {"stored", "indexed"} and
              isinstance(capabilities, (list, tuple)) and all(isinstance(value, str) for value in capabilities) and
              len(capabilities) == len(set(capabilities)) and
              "search" in capabilities and set(capabilities) <= {"search", "list", "write", "update", "delete"} and
@@ -62,7 +65,7 @@ def Headers(settings):
 
 class CogneeMemoryStore(CogneeDocuments):
     supported_types = frozenset({"note"})
-    supports_deleted_read = False
+    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, settings, source_id, *, transport=None, _dataset_id=None):
@@ -70,6 +73,7 @@ class CogneeMemoryStore(CogneeDocuments):
         if not text(source_id):
             raise DomainError("CONFIG_INVALID", "Invalid Cognee memory source")
         self.source_id, self.kind = source_id, "episodic"
+        self._write_confirmation = settings.get("write_confirmation", "indexed")
         self.capabilities = frozenset(settings.get("capabilities", ("search",)))
         self._dataset_names = tuple(settings["datasets"])
         registered = CogneeDataset.Find(self._dataset_names[0]) if len(self._dataset_names) == 1 else None
@@ -96,11 +100,11 @@ class CogneeMemoryStore(CogneeDocuments):
             return MemorySearchResult()
         if query.types and "note" not in query.types:
             return MemorySearchResult((), {self.source_id: "ok"})
-        if query.include_deleted:
-            raise DomainError("UNSUPPORTED", "Cognee physically deletes notes; deleted receipts are unavailable")
         child = self._document_context(context, "search")
         try:
             with controlled_lock(self._document_lock, child), self._http.Borrow(child):
+                if query.include_deleted:
+                    return self._facts(query, child)
                 candidates = None
                 if query.text.strip():
                     payload = self._http.Post("/recall", {"query": query.text, "search_type": self._search_type,
@@ -108,11 +112,20 @@ class CogneeMemoryStore(CogneeDocuments):
                         "dataset_ids": [self._document_dataset]}, child, stage="search")
                     candidates = self._candidates(payload)
                 rows = tuple(self._rows(child))
-                identifiers = tuple(dict.fromkeys((*(_uuid(row.get('id')) for _, row in rows), *(candidates or ()))))
+                # Resolve current raw before admitting old chunks or observing index state.
+                active = {}
+                for _, row in rows:
+                    record = self._record(row, child)
+                    if record is not None and not record.deleted:
+                        active[record.ref.record_id] = record
+                identifiers = tuple(active)
+                if not identifiers:
+                    child.CheckCancelled()
+                    return MemorySearchResult((), {self.source_id: "ok"})
                 issues = []
                 try:
                     states = self._completion(None, child)
-                    states = {**states, **{identifier: states.get(identifier) for identifier in identifiers}}
+                    states = {identifier: states.get(identifier) for identifier in identifiers}
                 except ControlError:
                     raise
                 except DomainError as error:
@@ -122,14 +135,11 @@ class CogneeMemoryStore(CogneeDocuments):
                 for code, observed in (('INDEX_NOT_READY', False), ('INDEX_STATE_UNKNOWN', None)):
                     if any(value is observed for value in states.values()):
                         issues.append(MemoryIssue(code=code, stage='verify', source_id=self.source_id))
-                if candidates is not None:
-                    by_id = {_uuid(row.get("id")): row for _, row in rows}
-                    rows = ((0, by_id[identifier]) for identifier in candidates if identifier in by_id)
                 records = []
-                for _, row in rows:
-                    if states.get(_uuid(row.get('id'))) is not True:
+                for identifier in identifiers if candidates is None else candidates:
+                    if states.get(identifier) is not True:
                         continue
-                    record = self._record(row, child)
+                    record = active.get(identifier)
                     if record is not None and self._matches(record, query):
                         records.append(record)
                         if len(records) == query.limit:
@@ -140,6 +150,22 @@ class CogneeMemoryStore(CogneeDocuments):
         except ControlError:
             context.CheckCancelled()
             raise DomainError("MEMORY_TIMEOUT", "Cognee memory search timed out") from None
+
+    def _facts(self, query, context):
+        terms, records = Terms(query.text), []
+        for _, row in self._rows(context):
+            record = self._record(row, context)
+            if record is None or not self._matches(record, query):
+                continue
+            searchable = normalize(" ".join(value for value in
+                (record.content, record.subject, record.origin) if value))
+            if terms and not any(term in searchable for term in terms):
+                continue
+            records.append(record)
+            if len(records) == query.limit:
+                break
+        context.CheckCancelled()
+        return MemorySearchResult(tuple(records), {self.source_id: "ok"})
 
     def _candidates(self, payload):
         if not isinstance(payload, list) or len(payload) > 100:

@@ -229,7 +229,8 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
                 raise DomainError('CONFLICT', '重复导入的记录身份发生变化。')
             matches = existing[identity] = [receipt]
             record = verify(memory, matches, topic_id)
-            result['memories'].append(dict(key=key, record_id=record['record_id'], topic_id=topic_id))
+            result['memories'].append(dict(key=key, record_id=record['record_id'], topic_id=topic_id,
+                **({'index_status': record['index_status']} if record.get('index_status') is not None else {})))
             result['progress']['memories_done'] += 1
             publish()
         stage, key = 'verification', None

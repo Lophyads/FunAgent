@@ -37,11 +37,13 @@ from ..task.task_process import TaskProcess
 from ..task.task_queue import TaskQueue
 from ..tool.tool_mgr import ToolMgr
 from ..tool.factory import Create as CreateTools
+from .memory_settings import MemoryServices, MemorySettings
 
 
 # The application owns one HTTP listener; controllers share the business managers.
 _http_server = None
 _lifecycle = None
+_memory_settings = None
 logger = logging.getLogger("funagent.startup")
 
 
@@ -51,8 +53,26 @@ def Initialize(conf_dir):
     return ConfMgr.GetInstance()
 
 
+def _BuildMemoryServices(conf, conf_dir, *, backends, tools, store, events):
+    from ..memory.factory import CreateTopics
+    resources = Lifecycle()
+    try:
+        models = resources.Own(CreateModel(conf, resources.Own, tool_dispatch=tools,
+                                          journal=store, events=events))
+        topics = CreateTopics(conf, conf_dir)
+        memory = resources.Own(CreateMemory(conf, conf_dir, resources.Own, backends=backends, topics=topics))
+        inspection = CreateInspection(conf, resources.Own)
+        operations = resources.Own(MemoryOperations(memory, conf, inspection=inspection, topics=topics))
+        options = conf.Serv().Options()
+        profile = conf.Model().Profile(options.get("eval_model_profile", options["model_profile"]))
+        return MemoryServices(resources, models, memory, operations, RetrievalJudge(models, profile))
+    except BaseException:
+        resources.Stop()
+        raise
+
+
 def Start(conf_dir):
-    global _http_server, _lifecycle
+    global _http_server, _lifecycle, _memory_settings
     try:
         ConfMgr.GetInstance()
     except DomainError as error:
@@ -80,35 +100,36 @@ def Start(conf_dir):
         owner.Bind(EventMgr, TaskEvents())
         backends = {}
         required = RequiredBackends(conf)
-        tools = (CreateTools(conf, owner.Own, required_backends=required,
-                 bind_backend=lambda key, value: backends.__setitem__(key, value)) if required else CreateTools(conf, owner.Own))
+        tools = CreateTools(conf, owner.Own, required_backends=required,
+                            bind_backend=lambda key, value: backends.__setitem__(key, value))
         owner.Bind(ToolMgr, tools)
-        owner.Bind(ModelRuntime, CreateModel(conf, owner.Own, tool_dispatch=ToolMgr.GetInstance(), journal=store,
-                                            events=EventMgr.GetInstance()))
         owner.Own(InteractionMgr, InteractionMgr.Close)
         InteractionMgr.Initialize(options.get("interaction_timeout", 120))
-        from ..memory.factory import CreateTopics
-        topics = CreateTopics(conf, conf_dir)
-        memory = CreateMemory(conf, conf_dir, owner.Own, backends=backends, topics=topics)
-        owner.Bind(MemoryMgr, memory)
-        inspection = CreateInspection(conf, owner.Own)
-        owner.Bind(MemoryOperationsMgr, MemoryOperations(memory, conf, inspection=inspection, topics=topics))
-        owner.Bind(MemoryImportMgr, MemoryImportService(MemoryOperationsMgr.GetInstance()), worker=True)
+        def build(candidate):
+            return _BuildMemoryServices(candidate, conf_dir, backends=backends, tools=tools,
+                                        store=store, events=EventMgr.GetInstance())
+        services = owner.Own(build(conf))
+        # The resource group owns clients; bindings only release their references.
+        for manager, instance in ((ModelRuntime, services.models), (MemoryMgr, services.memory),
+                                  (MemoryOperationsMgr, services.operations)):
+            manager.Initialize(instance)
+            owner.Own(manager, lambda manager=manager: manager.Replace(None))
+        imports = MemoryImportService(services.operations)
+        owner.Bind(MemoryImportMgr, imports, worker=True)
         eval_profile = conf.Model().Profile(options.get("eval_model_profile", options["model_profile"]))
-        evaluations = EvalService(memory, MemoryOperationsMgr.GetInstance(), conf.Tool().Access("management"),
+        evaluations = EvalService(services.memory, services.operations, conf.Tool().Access("management"),
             owner.Own(EvalRepository(conf_dir / ".funagent" / "eval.sqlite3")),
-            RetrievalJudge(ModelRuntime.GetInstance(), eval_profile),
+            services.judge,
             source_timeout=options.get("eval_source_timeout", 30),
             judge_timeout=options.get("eval_judge_timeout", eval_profile.timeout), start_worker=False)
         owner.Bind(EvalMgr, evaluations, worker=True)
         evaluations.Start()
-        if review.get("enabled", False) and review.get("sources"):
-            owner.Own(ReviewScheduler, ReviewScheduler.Close)
-            ReviewScheduler.Initialize(review.get("capacity", 16), executor=ReviewProcess, start_worker=False)
-            worker = ReviewScheduler.GetInstance()
-            owner.Forget(ReviewScheduler)
-            owner.TrackBinding(ReviewScheduler, worker, worker=True)
-            worker.Start()
+        owner.Own(ReviewScheduler, ReviewScheduler.Close)
+        ReviewScheduler.Initialize(review.get("capacity", 16), executor=ReviewProcess, start_worker=False)
+        worker = ReviewScheduler.GetInstance()
+        owner.Forget(ReviewScheduler)
+        owner.TrackBinding(ReviewScheduler, worker, worker=True)
+        worker.Start()
         queue = TaskQueue(options["capacity"], executor=TaskProcess,
                           timeout=options.get("task_timeout", 60), start_worker=False)
         # The queue constructor has repaired main database interrupted tasks.
@@ -116,12 +137,29 @@ def Start(conf_dir):
         observation.Recover(store.GetTask)
         owner.Bind(TaskMgr, queue, worker=True)
         queue.Start()
-        owner.Bind(DiagnosticsMgr, DiagnosticService(conf, tools, ModelRuntime.GetInstance(), queue,
-                                                     logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact,
-                                                     traces=observation.Reader(store.GetTask), observation=observation,
-                                                     memory=MemoryOperationsMgr.GetInstance()))
+        diagnostics = DiagnosticService(conf, tools, services.models, queue,
+            logs=LogReader(logs.Files(), logs.Redact), redact=logs.Redact,
+            traces=observation.Reader(store.GetTask), observation=observation, memory=services.operations)
+        owner.Bind(DiagnosticsMgr, diagnostics)
+
+        def bind(candidate, current):
+            conf.ReplaceMemory(candidate)
+            ModelRuntime.Replace(current.models)
+            MemoryMgr.Replace(current.memory)
+            MemoryOperationsMgr.Replace(current.operations)
+            imports.RebindMemory(current.operations)
+            evaluations.RebindMemory(current.memory, current.operations, current.judge)
+            diagnostics.RebindMemory(current.operations, current.models)
+            worker.Reconfigure(candidate.Memory().Policy("review"))
+
+        def busy():
+            return (queue.Status()["accepted"] > 0 or worker.IsBusy()
+                    or imports.IsBusy() or evaluations.IsBusy())
+
+        _memory_settings = owner.Own(MemorySettings(conf_dir, conf, services, build=build, bind=bind, busy=busy))
+        owner.Forget(services)  # MemorySettings now owns the active resource group.
         if options["mode"] in {"web", "both"}:
-            _http_server = owner.HTTP(HttpServer(options["host"], options["port"]))
+            _http_server = owner.HTTP(HttpServer(options["host"], options["port"], memory_settings=_memory_settings))
             _http_server.Start()
         logger.info("Application started")
         return TaskMgr.GetInstance()
@@ -141,8 +179,14 @@ def GetHttpServer() -> HttpServer | None:
     return _http_server
 
 
+def GetMemorySettings():
+    return _memory_settings
+
+
 def Stop():
-    global _http_server, _lifecycle
+    global _http_server, _lifecycle, _memory_settings
+    if _memory_settings is not None:
+        _memory_settings.RequestStop()
     if _lifecycle is None:
         # Public test/embedding assembly uses the same drain path. Its bound
         # managers retain their existing ownership of stores and providers.
@@ -163,4 +207,4 @@ def Stop():
         _lifecycle.Stop()
     finally:
         if _lifecycle.Empty():
-            _lifecycle = _http_server = None
+            _lifecycle = _http_server = _memory_settings = None

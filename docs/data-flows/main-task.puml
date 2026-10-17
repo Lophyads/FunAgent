@@ -1,0 +1,50 @@
+@startuml main_task
+title 主任务：提交、执行与结果提交
+hide footbox
+autonumber
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName Microsoft YaHei
+skinparam sequenceArrowColor #4A6FA5
+
+actor "用户" as User
+participant "CLI / HTTP" as API
+participant "TaskQueue" as Queue
+participant "TaskProcess" as Task
+database "主数据库" as DB
+participant "MemoryPrepare" as Recall
+participant "ModelRuntime" as Runtime
+participant "ReviewScheduler" as Review
+
+User -> API: 提交 session_id、text、可选 request_key
+API -> Queue: Submit(TurnRequest)
+note over Queue: 检查幂等键与容量；同键同内容复用原任务
+Queue -> DB: RegisterTurn：登记 queued 任务
+Queue -> Queue: 发布到进程内队列
+Queue --> API: task_id
+API --> User: 接收成功，返回任务 ID
+
+group 单个主任务 worker
+    Queue -> Task: Run(task_id, context)
+    Task -> DB: 加载会话、历史与冻结提示词
+    note over Task: 首次准备会话时读取授权画像并冻结系统提示
+    Task -> DB: BeginTurn：保存本轮用户消息
+    DB --> Task: 会话与历史快照
+    Task -> Recall: 当前问题、权限和任务期限
+    Recall --> Task: 召回证据、状态与 warnings
+    Task -> Task: AttachRecall：增强本次请求副本
+    Task -> Runtime: Run(主任务策略)
+    Runtime --> Task: RunResult
+    Task -> DB: FinishTurn：原子提交结果与终态
+    Task --> API: 经 TaskEvents / SSE 发布 task_committed
+    API --> User: 展示已提交结果
+end
+
+opt completed、启用复盘且达到轮次阈值
+    Task -> DB: ObserveReviewTurn
+    DB --> Task: 固定的历史结束位置
+    Task ->> Review: Schedule(session_id, through_message_id)
+end
+
+note over DB: 重启修复中断任务状态，保留已提交数据；不自动重放工具
+@enduml

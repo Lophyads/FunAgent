@@ -12,6 +12,7 @@ export const payload = (trace,ref) => ref ? trace?.payloads?.[ref]?.data : undef
 const labels = {'conversation.prepare':'会话准备','profile.retrieve':'加载用户画像','memory.prepare':'记忆规划','memory.attach':'检索结果附加','memory.plan':'检索规划','memory.branch':'检索分支','memory.search':'记忆来源检索','memory.source.search':'来源查询','memory.query':'查询','memory.deduplicate':'候选去重','memory.filter':'分数筛选','memory.fit':'预算裁剪','memory.authorization':'访问校验','model.rank':'模型重排','model.encode':'请求编码','model.attempt':'模型交互','model.retry_wait':'重试等待','journal.tool_calls':'调用记录','tool.call':'工具调用','tool.policy_and_validation':'调用校验','tool.handler':'工具执行','journal.tool_result':'结果记录','agent.run':'执行器','agent.iteration':'模型循环','interaction.wait':'人工等待','turn.finalize':'最终保存','task.queue_wait':'排队等待'};
 export function traceName(trace,node) {
   const name=labels[node.name]||node.name||'未命名步骤';
+  if(node.name==='memory.rerank')return `记忆重排 · ${{facts:'事实',knowledge:'知识'}[node.branch]||node.branch||'记忆'}`;
   if(node.name==='memory.search'&&descendants(trace?.root).find(parent=>parent.span_id===node.parent_span_id)?.name==='profile.retrieve')return labels['profile.retrieve'];
   if(node.name==='tool.call'||node.kind==='tool')return `${name} · ${readable(payload(trace,node.input_ref)?.name)||'未命名工具'}`;
   if(node.name==='model.attempt')return `${node.kind==='rerank'?'重排评分':name} · ${node.model||payload(trace,node.input_ref)?.model||'未记录模型'}`;
@@ -45,7 +46,10 @@ export function buildTrace(review) {
     }else add(n.name==='conversation.prepare'?'Prepare':n.name.startsWith('memory.')?'Retrieval':n.name==='turn.finalize'?'Finalize':'步骤',n);
   }
   for(const n of trace.orphan_nodes||[])add('未关联',n,`原父节点 ${n.parent_span_id||'未知'}`);
-  for(const n of nodes.values())if(n.name==='memory.search')add('Retrieval',n);
+  for(const n of nodes.values()){
+    if(n.name==='memory.search')add('Retrieval',n);
+    if(n.name==='memory.rerank')add('重排',n);
+  }
   if(!rows.length&&root)add('任务',root);
   rows.sort((a,b)=>(a.node.started_at??Infinity)-(b.node.started_at??Infinity)||(startSeq.get(a.node.span_id)??Infinity)-(startSeq.get(b.node.span_id)??Infinity));
   const userInput=payload(trace,root?.input_ref);
@@ -73,6 +77,13 @@ export function toolContent(value) {
   return parts.length?parts.join('\n\n'):formatValue(parsed);
 }
 export function interactionText(node,side,value) {
+  if(node.name==='memory.rerank'){
+    const records=items=>Array.isArray(items)?(items.length?items.map((r,i)=>`${i+1}. 输入 #${r.index??'未记录'} · ${r.source_id||'来源未知'} / ${r.record_id||'记录未知'}\n版本  ${r.version??'未记录'}${Number.isFinite(r.score)?` · 重排分数 ${r.score}`:''}\n${formatValue(r.content)}`).join('\n\n'):'（无记录）'):'未完整采集';
+    if(side==='input')return `评分问题\n${value?.question??'未记录'}\n\n去重后候选（输入索引从 0 开始）\n${records(value?.records)}`;
+    if(value?.mode==='fallback')return `重排失败，沿用原候选顺序\n错误  ${value.error_code||node.error_code||'未记录'}\n\n${records(value.records)}`;
+    if(value?.mode!=='reranked')return formatValue(value);
+    return `模型  ${node.model||'未记录'}\n分数阈值  ${node.min_score??'未设置（仅排序）'}\n\n评分（按输入索引）\n${formatValue(value.scores)}\n\n选中记录（实际顺序，仍需后续预算裁剪）\n${records(value.selected)}\n\n排除记录\n${records(value.rejected)}`;
+  }
   if(side==='input'&&['memory.search','memory.source.search','memory.query'].includes(node.name)&&value&&typeof value==='object')return `查询  ${readable(value.text)||'未提供文本查询'}\n\n${formatValue(value)}`;
   if(node.name==='memory.deduplicate'&&side==='output')return `代表记录\n${formatValue(value?.representatives)}\n\n副本分组\n${formatValue(value?.duplicate_groups)}\n\n身份冲突\n${formatValue(value?.identity_conflicts)}`;
   if(node.name==='memory.filter')return side==='input'?`分数阈值  ${node.min_score??'未设置（仅排序）'}\n\n候选评分\n${formatValue(value?.items)}`:`选中记录\n${formatValue(value?.selected)}\n\n排除记录\n${formatValue(value?.rejected)}`;

@@ -39,6 +39,14 @@ class EvalService:
     def Start(self):
         self._worker.start()
 
+    def IsBusy(self):
+        with self._condition:
+            return bool(self._admitted)
+
+    def RebindMemory(self, memory, operations, judge):
+        with self._condition:
+            self._memory, self._operations, self._judge = memory, operations, judge
+
     def Sources(self):
         return [source for source in self._operations.Sources() if "search" in source["capabilities"]]
 

@@ -45,7 +45,18 @@ def _parent(value):
     return None if value is None else Text(value, 128)
 
 
-def Handle(method, route, query, body):
+def Handle(method, route, query, body, *, settings=None):
+    if route == "/memory/config":
+        if query:
+            raise DomainError("INVALID_REQUEST", "Unexpected query")
+        if settings is None:
+            raise DomainError("NOT_READY", "Memory settings are not initialized")
+        if method == "GET":
+            return 200, settings.Read()
+        if method == "POST":
+            Fields(body, {"content"}, {"content"})
+            return 200, settings.Apply(Text(body["content"], 65536))
+        raise DomainError("METHOD_NOT_ALLOWED", "Invalid memory config method")
     if route == '/memory/imports' or route.startswith('/memory/imports/'):
         from ..memory.memory_import_mgr import MemoryImportMgr
         service = MemoryImportMgr.GetInstance()

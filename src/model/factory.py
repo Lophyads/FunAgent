@@ -7,7 +7,8 @@ from ..frame.contracts import DomainError
 PROVIDERS = {"demo": (".demo", "DemoProvider"), "openai": (".openai_chat", "OpenAIProvider"),
              "http_json": (".http_json", "HTTPJSONProvider")}
 ADAPTERS = {"demo": (".demo", "DemoAdapter"), "openai_chat": (".openai_chat", "OpenAIChatAdapter"),
-            "tei_rerank": (".tei_rerank", "TEIRerankAdapter")}
+            "tei_rerank": (".tei_rerank", "TEIRerankAdapter"),
+            "qwen3_rerank": (".qwen3_rerank", "Qwen3RerankAdapter")}
 
 
 def _selected(table, kind):
@@ -48,7 +49,7 @@ def Create(conf, own, *, tool_dispatch, journal, events=None):
     # Check bindings before creating any resources, including custom Conf views.
     for profile in profiles.values():
         if (profile.task not in {"chat", "rerank"} or
-                (profile.task == "rerank") != (profile.adapter_id == "tei_rerank") or
+                (profile.task == "rerank") != (profile.adapter_id in {"tei_rerank", "qwen3_rerank"}) or
                 (profile.profile_id in generation and profile.task != "chat") or
                 any(profiles[name].task != profile.task for name in profile.fallback_profiles)):
             raise DomainError("CONFIG_INVALID", "Model task and adapter do not match")

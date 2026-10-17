@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    participant Task as TaskProcess
+    participant Prepare as MemoryPrepare
+    participant Memory as MemoryManager
+    participant Planner as MemoryPlanner
+    participant Runtime as Runtime
+    participant Source as 记忆 / 知识来源
+
+    Task->>Prepare: 当前问题、会话权限与总期限
+    Prepare->>Prepare: 筛选已启用且授权的<br/>facts / knowledge 来源
+    alt 没有可用来源
+        Prepare-->>Task: 跳过召回（skipped）
+    else 存在可用来源
+        Prepare->>Memory: ReadTopics(授权来源)
+        Memory-->>Prepare: 主题目录与来源说明
+        Prepare->>Planner: Plan(当前问题, 授权目录)
+        Planner->>Runtime: Run(无工具召回规划策略)
+        Runtime-->>Planner: 规划 JSON
+        Planner->>Planner: 校验规划字段与类型
+        alt 规划失败或子期限耗尽
+            Planner-->>Prepare: PLAN_FAILED / PLAN_INVALID / DEADLINE
+            Prepare-->>Task: 跳过召回，附带警告
+        else 规划有效
+            Planner-->>Prepare: 是否检索、查询文本与变体
+            loop 需要检索的 facts / knowledge 分支
+                Prepare->>Memory: Search(查询与候选上限)
+                Memory->>Memory: 再次校验来源权限与能力
+                Memory->>Source: 查询授权来源
+                Source-->>Memory: 记录、引用与来源状态
+                Memory-->>Prepare: 候选与警告
+                Prepare->>Prepare: 去重并交错合并多个来源
+                opt 启用 rerank 且存在候选
+                    Prepare->>Runtime: Rank(原问题, 候选正文)
+                    Runtime-->>Prepare: 评分或重排失败状态
+                end
+                Prepare->>Prepare: 按记录数与字符预算裁剪
+            end
+            Prepare-->>Task: MemoryContext<br/>证据、引用、状态和警告
+        end
+    end
+    Task->>Task: AttachRecall，仅加入本次模型输入

@@ -29,6 +29,11 @@ export function mountMemoryImportDialog(root, {api, refresh}) {
     reconcile.disabled = pending;
     const p = task?.progress;
     progress.textContent = task ? `${task.dataset_id} · ${task.status} · 主题 ${p.topics_done}/${p.topics_total} · 记忆 ${p.memories_done}/${p.memories_total}` : '';
+    if (task?.status === 'completed') {
+      const records = task.memories || [], pending = records.filter(r => r.index_status === 'pending').length,
+        unknown = records.filter(r => r.index_status === 'unknown').length;
+      progress.textContent += ` · 事实与主题已保存${pending || unknown ? ` · 索引待完成 ${pending} / 未知 ${unknown}` : ''}`;
+    }
     if (task?.error) error.textContent = `${task.error.stage} ${task.error.key || ''} · ${task.error.code} · ${task.error.message}`;
   }
   function current(gen) {return !disposed && gen === generation && dialog.open;}

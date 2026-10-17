@@ -96,6 +96,7 @@ class MemoryRecord:
     updated_at: str | None = None
     origin: str | None = None
     truncated: bool = False
+    index_status: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "evidence", tuple(self.evidence))

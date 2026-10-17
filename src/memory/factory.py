@@ -84,6 +84,12 @@ def ValidatePolicies(sources, policies):
             if (required_type is not None and types is not None and required_type not in types or
                     purpose == "review" and not deleted):
                 raise DomainError("CONFIG_REFERENCE", f"Memory source {name} cannot serve {purpose}")
+            if purpose == "review":
+                source = sources[name]
+                if source["kind"] != "episodic" or not {"search", "list", "write"} <= set(source.get("capabilities", ("search",))):
+                    raise DomainError("CONFIG_REFERENCE", f"Review source {name} requires episodic search/list/write")
+                if source["store"] == "cognee" and source.get("write_confirmation", "indexed") != "stored":
+                    raise DomainError("CONFIG_REFERENCE", f"Cognee review source {name} requires write_confirmation=stored")
     review, facts = policies.get("review", {}), policies.get("facts", {})
     if review.get("enabled", False) and (not facts.get("enabled", False) or
             not set(review.get("sources", ())) <= set(facts.get("sources", ()))):
@@ -127,4 +133,5 @@ def Create(conf, conf_dir, own, *, backends=None, topics=None):
         if factory is None:
             raise DomainError("DRIVER_UNAVAILABLE", "Selected memory store is unavailable")
         stores[name] = own(factory(name, settings, conf_dir))
-    return MemoryManager(stores, topics=topics if topics is not None else CreateTopics(conf, conf_dir), owns_stores=False)
+    return MemoryManager(stores, topics=topics if topics is not None else CreateTopics(conf, conf_dir),
+                         owns_stores=False, conf=conf.Memory())

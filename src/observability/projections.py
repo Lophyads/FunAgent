@@ -31,7 +31,7 @@ def Reply(reply):
 
 
 def Wire(value):
-    if isinstance(value, Mapping):
+    if isinstance(value, (Mapping, list, tuple)):
         # Payload size and credential handling are bounded by the hub.
         return value
     if hasattr(value, 'messages'):

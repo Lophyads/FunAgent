@@ -12,6 +12,7 @@ def RecordData(record):
             "subject": record.subject, "event_at": record.event_at, "created_at": record.created_at,
             "updated_at": record.updated_at, "origin": record.origin,
             **({"truncated": True} if record.truncated else {}),
+            **({"index_status": record.index_status} if record.index_status is not None else {}),
             **({"deleted": True, "evidence": record.evidence} if record.deleted else {})}
 
 

@@ -45,6 +45,9 @@ class DiagnosticService:
         self._closed = False
         self._memory = memory
 
+    def RebindMemory(self, memory, models):
+        self._memory, self._models = memory, models
+
     def Read(self, kind):
         def safe(value):
             if isinstance(value, str):
@@ -93,7 +96,8 @@ class DiagnosticService:
                                   'backends': thaw(conf.Tool().Backends()), 'session_access': thaw(conf.Tool().AccessMap()),
                                   'purposes': {k: asdict(conf.Tool().Selection(k)) for k in ('main','recall','review')}},
                     'memory.conf': {'sources': thaw(conf.Memory().Sources()),
-                                    'policies': {k: thaw(conf.Memory().Policy(k)) for k in ('profile', 'facts', 'knowledge', 'recall', 'review')}},
+                                    'topics': thaw(conf.Memory().Topics()),
+                                    'policies': {k: thaw(conf.Memory().Policy(k)) for k in ('profile', 'facts', 'knowledge', 'recall', 'rerank', 'review')}},
                     'log.conf': thaw(log), 'serv.conf': thaw(options)}),
                 "serv": {key: options[key] for key in ("mode", "host", "port", "capacity", "model_profile")},
                 "runtime": {"max_iterations": options.get("max_iterations", 6),
@@ -108,8 +112,8 @@ class DiagnosticService:
                             for name, source in conf.Memory().Sources().items()],
                            "policies": {name: ({"every_turns": conf.Memory().Policy(name).get("every_turns", 10)} if name == "review" else {}) |
                               {key: thaw(value) for key, value in conf.Memory().Policy(name).items()
-                              if key in {"enabled", "sources", "max_records", "max_chars", "max_queries", "every_turns"}}
-                              for name in ("profile", "facts", "knowledge", "review")}},
+                              if key in {"enabled", "sources", "profile", "timeout", "candidate_limit", "min_score", "max_records", "max_chars", "max_queries", "every_turns"}}
+                              for name in ("profile", "facts", "knowledge", "recall", "rerank", "review")}},
                 "tools": {"purposes": {purpose: {"enable": list(conf.Tool().Selection(purpose).enable),
                           "disable": list(conf.Tool().Selection(purpose).disable),
                           "toolsets": list(conf.Tool().Selection(purpose).toolsets)}

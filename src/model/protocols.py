@@ -20,6 +20,8 @@ class Runner(Protocol):
 @dataclass(frozen=True)
 class ProviderRequest:
     payload: Any = field(repr=False)
+    # HTTP JSON may execute an explicit finite sequence under the same deadline.
+    batch: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,9 @@ ResultT = TypeVar('ResultT')
 
 
 class Adapter(Generic[RequestT, ResultT], ABC):
+    # Rank uses the wire protocol's batch capacity under one shared deadline.
+    batch_size = 32
+
     @staticmethod
     @abstractmethod
     def Encode(request: RequestT, profile: ModelProfile) -> ProviderRequest: ...

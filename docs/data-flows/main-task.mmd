@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant API as CLI / HTTP
+    participant Queue as TaskQueue
+    participant Task as TaskProcess
+    participant DB as 主数据库
+    participant Memory as MemoryPrepare
+    participant Runtime as Runtime
+
+    User->>API: 提交会话 ID、输入<br/>可选 request_key
+    API->>Queue: Submit(TurnRequest)
+    Queue->>Queue: 检查幂等键与容量
+    Queue->>DB: RegisterTurn，登记 queued 任务
+    DB-->>Queue: task_id
+    Queue->>Queue: 发布到进程内队列
+    Queue-->>API: 返回 task_id
+    API-->>User: 接收成功
+
+    Note over Queue,Task: 单个主任务 worker 串行执行
+    Queue->>Task: Run(task_id, context)
+    Task->>DB: 加载会话与历史
+    Task->>Task: 补齐工作区与会话权限
+    Note over Task,DB: 首次准备会话时读取授权画像<br/>并冻结系统提示词
+    Task->>DB: BeginTurn，保存原始用户消息
+    DB-->>Task: 会话与历史快照
+    Task->>Memory: 准备本轮事实与知识证据
+    Memory-->>Task: MemoryContext、来源状态与警告
+    Task->>Task: AttachRecall，仅增强本次请求副本
+    Task->>Runtime: Run(主任务策略)
+    Runtime-->>Task: RunResult
+    Task->>DB: FinishTurn，原子提交回复与终态
+    DB-->>Task: 已提交结果
+    Task-->>API: 经 EventMgr 发布 task_committed
+    API-->>User: SSE 更新或查询持久结果
+    Note over Task,DB: 成功轮次达到复盘阈值时<br/>异步触发后台复盘

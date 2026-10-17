@@ -20,6 +20,11 @@ class ModelRuntime:
         return cls._instance
 
     @classmethod
+    def Replace(cls, runner: Runner | None):
+        previous, cls._instance = cls._instance, runner
+        return previous
+
+    @classmethod
     def Close(cls) -> None:
         instance, cls._instance = cls._instance, None
         if instance is not None:

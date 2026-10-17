@@ -56,6 +56,9 @@ ERRORS = {
     "PLAN_FAILED": (503, "记忆检索规划失败。"),
     "RERANK_FAILED": (503, "记忆重排失败。"),
     "CONFIG_CREDENTIAL": (502, "远端记忆服务认证失败，请检查服务端凭据配置。"),
+    "CONFIG_INVALID": (400, "配置无效，请检查 TOML 内容及字段。"),
+    "CONFIG_REFERENCE": (400, "配置引用的来源、模型或后端不可用。"),
+    "DRIVER_UNAVAILABLE": (503, "配置所需驱动或可选依赖不可用。"),
     "CONFLICT": (409, "Operation conflicts with current state."),
     "INTERACTION_STALE": (409, "This request is no longer pending for this task."),
     "INTERACTION_EXPIRED": (409, "This request has expired."),
@@ -101,7 +104,20 @@ def _page(query, kind):
 
 class HTTPController:
     @staticmethod
-    def Handle(method, target, body=None):
+    def Handle(method, target, body=None, *, memory_settings=None):
+        try:
+            route = urlsplit(target).path
+        except ValueError:
+            raise DomainError("INVALID_REQUEST", "Invalid request target") from None
+        uses_memory = (route.startswith(("/memory/", "/eval/", "/diagnostics/")) or
+                       method == "POST" and re.fullmatch(r"/sessions/[^/]+/tasks", route))
+        if memory_settings is not None and uses_memory:
+            with memory_settings.Scope():
+                return HTTPController._Handle(method, target, body, memory_settings=memory_settings)
+        return HTTPController._Handle(method, target, body, memory_settings=memory_settings)
+
+    @staticmethod
+    def _Handle(method, target, body=None, *, memory_settings=None):
         if method not in {"GET", "POST", "PATCH", "DELETE"}:
             raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         try:
@@ -123,7 +139,7 @@ class HTTPController:
                 raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
             return 200, diagnostic_service.Read(route.removeprefix("/diagnostics/"))
         if route.startswith("/memory/"):
-            return memory_routes.Handle(method, route, query, body)
+            return memory_routes.Handle(method, route, query, body, settings=memory_settings)
         if method in {"PATCH", "DELETE"}:
             raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
         if route.startswith("/eval/"):
@@ -287,7 +303,8 @@ class _Handler(BaseHTTPRequestHandler):
                                        parse_constant=lambda value: (_ for _ in ()).throw(ValueError())))
                 except (ValueError, UnicodeError):
                     raise DomainError("INVALID_REQUEST", "Invalid JSON") from None
-            status, payload = HTTPController.Handle(self.command, self.path, body)
+            status, payload = HTTPController.Handle(self.command, self.path, body,
+                                                    memory_settings=self.server.memory_settings)
             if isinstance(payload, trace_routes.TraceDownload):
                 self._send(status, payload.data, payload.content_type)
             else:
@@ -297,6 +314,9 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as error:
             code = error.code if isinstance(error, DomainError) and error.code in ERRORS else "INTERNAL_ERROR"
             status, message = ERRORS[code]
+            if urlsplit(self.path).path == "/memory/config" and code in {
+                    "CONFLICT", "CONFIG_INVALID", "CONFIG_REFERENCE", "DRIVER_UNAVAILABLE"}:
+                message = str(error)
             if isinstance(error, TopicConflict) and urlsplit(self.path).path.startswith("/memory/"):
                 message = str(error)
             detail = {}
@@ -421,8 +441,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 class HttpServer:
     """One listening resource, owned exclusively by the startup entry."""
-    def __init__(self, host, port):
+    def __init__(self, host, port, *, memory_settings=None):
         self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._server.memory_settings = memory_settings
         self._server.daemon_threads = False  # server_close must drain real request borrowers.
         self._server.sse_stopped = Event()
         address, bound_port = self._server.server_address

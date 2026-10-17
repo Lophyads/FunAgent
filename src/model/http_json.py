@@ -7,6 +7,7 @@ from threading import Condition
 from ..frame.contracts import ControlError, DomainError
 from .protocols import ModelError, ProviderResponse
 from .retry import RetryAfter
+from ..observability.observation_mgr import ObservationMgr
 
 
 class HTTPJSONProvider:
@@ -57,34 +58,47 @@ class HTTPJSONProvider:
 
     def Send(self, request, context):
         with self._borrow(context):
-            try:
-                context.CheckCancelled()
-                response = self._client.post(self._endpoint, json=request.payload, headers=self._headers,
-                    timeout=min(30, context.Remaining()), follow_redirects=False)
-                context.CheckCancelled()
-                if not 200 <= response.status_code < 300:
-                    status = response.status_code
-                    code = ('AUTH' if status in {401, 403} else 'RATE_LIMIT' if status == 429
-                            else 'TIMEOUT' if status == 408 else 'TRANSPORT' if status >= 500 or status == 409
-                            else 'INVALID_REQUEST')
-                    raise ModelError(code, retry_after=RetryAfter(response.headers.get('retry-after')))
-                payload = response.json()
-                context.CheckCancelled()
-                return ProviderResponse(payload)
-            except (ControlError, ModelError):
-                raise
-            except (json.JSONDecodeError, UnicodeError):
-                context.CheckCancelled()
-                raise ModelError('PROTOCOL') from None
-            except self._httpx.TimeoutException:
-                context.CheckCancelled()
-                raise ModelError('TIMEOUT') from None
-            except self._httpx.TransportError:
-                context.CheckCancelled()
-                raise ModelError('TRANSPORT') from None
-            except Exception:
-                context.CheckCancelled()
-                raise ModelError('PROVIDER_FATAL') from None
+            if request.batch:
+                results = []
+                mgr = ObservationMgr.GetInstance()
+                for payload in request.payload:
+                    context.CheckCancelled()
+                    with mgr.Scope('model.http', input=lambda: payload):
+                        result = self._send(payload, context)
+                        mgr.Complete(status='completed', output=lambda: result.payload, response_received=True)
+                        results.append(result.payload)
+                return ProviderResponse(tuple(results))
+            return self._send(request.payload, context)
+
+    def _send(self, payload, context):
+        try:
+            context.CheckCancelled()
+            response = self._client.post(self._endpoint, json=payload, headers=self._headers,
+                timeout=min(30, context.Remaining()), follow_redirects=False)
+            context.CheckCancelled()
+            if not 200 <= response.status_code < 300:
+                status = response.status_code
+                code = ('AUTH' if status in {401, 403} else 'RATE_LIMIT' if status == 429
+                        else 'TIMEOUT' if status == 408 else 'TRANSPORT' if status >= 500 or status == 409
+                        else 'INVALID_REQUEST')
+                raise ModelError(code, retry_after=RetryAfter(response.headers.get('retry-after')))
+            payload = response.json()
+            context.CheckCancelled()
+            return ProviderResponse(payload)
+        except (ControlError, ModelError):
+            raise
+        except (json.JSONDecodeError, UnicodeError):
+            context.CheckCancelled()
+            raise ModelError('PROTOCOL') from None
+        except self._httpx.TimeoutException:
+            context.CheckCancelled()
+            raise ModelError('TIMEOUT') from None
+        except self._httpx.TransportError:
+            context.CheckCancelled()
+            raise ModelError('TRANSPORT') from None
+        except Exception:
+            context.CheckCancelled()
+            raise ModelError('PROVIDER_FATAL') from None
 
     def Close(self):
         with self._condition:
