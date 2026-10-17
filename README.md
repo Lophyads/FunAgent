@@ -265,13 +265,13 @@ sequenceDiagram
             Scheduler->>Review: 独立 worker 执行固定历史范围
             Review->>DB: 读取上次水位、新历史与只读锚点
             DB-->>Review: expected 水位与已提交消息
-            Review->>Memory: 读取授权来源的已有事实与主题
-            Memory-->>Review: 现有记录与主题目录
+            Review->>Memory: 读取授权来源原文、墓碑、类型与主题
+            Memory-->>Review: 事实原文、删除标记与主题目录
             Review->>Runtime: Run(复盘策略, 临时上下文)
             opt 有值得保存的新事实
                 Runtime->>Memory: 经 memory 工具 list / search / add
                 Note over Runtime,Memory: 新事实引用本次范围的消息 ID<br/>并选择或创建主题
-                Memory-->>Runtime: 工具结果与操作效果
+                Memory-->>Runtime: 原文与主题保存结果、index_status 与操作效果
             end
             Runtime-->>Review: RunResult 与 tool_results
             alt 运行完成且工具成功、效果可确认
@@ -503,6 +503,12 @@ enabled = false
 | `review` | 成功对话达到轮次阈值后后台复盘，目标须为已启用的 facts 来源并具备所需能力 |
 
 启用复盘还需配置复盘模型 profile，并在 `purposes.review` 开放 `memory` 工具。主题目录默认为配置目录下的 `.funagent/memory-topics.json`。所有已声明的来源都会在启动时构造，停用召回策略不会移除对应来源及其依赖。
+
+Cognee 可以独立提供事实库与后台复盘，完整配置见 [Cognee quickstart](examples/quickstart/memory.cognee.conf)。将该文件替换为配置目录中的 `memory.conf`，提供 `COGNEE_MEMORY_TOKEN`，并在 `tool.conf` 配置 `purposes.review = ["memory"]`。主任务召回需要 `memory.cognee.read`；管理页需要对应 read/write 权限。复盘权限由可信上下文生成。只使用 Cognee 时应移除 Supabase 来源声明，关闭 profile 策略或另配支持画像的来源；Cognee 只接受 `note`。
+
+Cognee 的 `write_confirmation` 默认为 `indexed`，要求当前原文与本次同步索引联合确认；作为 review 来源必须显式设置 `"stored"`。stored 成功表示原文已逐字回读确认且主题归属完成，回执另外提供 `index_status`：`ready`（本次同步索引已确认）、`pending`（索引待完成）、`unknown`（当前版本索引证据不足）。管理新增、修改、导入和 memory 工具遵守同一来源配置；导入 completed 表示事实与分类保存完成。pending/unknown 无需再次新增事实，语义召回仍保留索引诊断。
+
+复盘预读与搜索直接查询 Cognee 原文及删除墓碑，不依赖图谱就绪；主任务继续按 CHUNKS/CHUNKS_LEXICAL 语义召回。删除保留事实原文、原证据和删除证据，普通列表与召回隐藏墓碑，复盘可识别已删除事实；同一 write_key 不会复活它。此接口不承诺物理擦除 Cognee 数据或历史图谱。切换事实来源只影响后续复盘，不自动迁移事实、重跑历史或重置会话水位。
 
 ### 可选依赖与现有启动脚本
 
