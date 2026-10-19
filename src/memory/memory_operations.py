@@ -1,11 +1,8 @@
-"""Management uses frozen permissions and one-use challenges, never tool grants."""
+"""Direct memory management using frozen permissions, never tool grants."""
 from dataclasses import replace
 from functools import wraps
-from threading import RLock
 from uuid import uuid4
 import hashlib
-import hmac
-import json
 import time
 import re
 
@@ -34,7 +31,7 @@ def ManagementRecord(record):
 
 
 class MemoryOperations:
-    def __init__(self, memory, conf, *, clock=time.monotonic, inspection=None, topics: TopicCatalog | None = None):
+    def __init__(self, memory, conf, *, inspection=None, topics: TopicCatalog | None = None):
         self._memory = memory
         self._inspection = inspection
         self._topics = topics
@@ -42,9 +39,6 @@ class MemoryOperations:
         self._facts = tuple(conf.Memory().Policy('facts').get('sources', ()))
         self._access = conf.Tool().Access("management")
         self._timeout = conf.Serv().Options().get("interaction_timeout", 120)
-        self._clock = clock
-        self._lock = RLock()
-        self._pending = {}
         self._closed = False
 
     def _context(self, identity=None):
@@ -131,7 +125,7 @@ class MemoryOperations:
         while True:
             context.CheckCancelled()
             page = self._memory.List(MemoryListQuery(ref.source_id, limit=100, cursor=cursor), context)
-            record = next((r for r in page.items if r.ref == ref and not r.deleted), None)
+            record = next((r for r in page.items if r.ref == ref), None)
             if record is not None:
                 return record
             cursor = page.next_cursor
@@ -203,7 +197,7 @@ class MemoryOperations:
         return ManagementRecord(record) | RecordTopic(snapshot, record.ref.record_id) | {"revision": snapshot.revision}
 
     @_management
-    def Request(self, action, ref, expected_version, patch=None):
+    def Change(self, action, ref, expected_version, patch=None):
         context = self._context()
         if not isinstance(action, str) or action not in {"replace", "remove"} or not text(expected_version) or len(expected_version) > 128:
             raise DomainError("INVALID_REQUEST", "Invalid management change")
@@ -213,7 +207,7 @@ class MemoryOperations:
         if source is None:
             raise DomainError("NOT_FOUND", "Memory source not found")
         operation = "update" if action == "replace" else "delete"
-        if Outcome(action, context.purpose) != "approval" or self._token(ref.source_id, True) not in context.access:
+        if Outcome(action, context.purpose) != "allow" or self._token(ref.source_id, True) not in context.access:
             raise DomainError("DENIED", "Memory management access denied")
         if operation not in source.get("capabilities", ()):
             raise DomainError("UNSUPPORTED", "Memory source does not support this operation")
@@ -227,64 +221,21 @@ class MemoryOperations:
             patch = replace(patch, evidence=context.memory_evidence)
         elif patch is not None:
             raise DomainError("INVALID_REQUEST", "Delete does not accept a patch")
-        # Require a visible current record as well as write authority; the writer
-        # repeats source/purpose checks and CAS at confirmation time.
-        record = self._visible_record(ref, context)
-        if record.version != expected_version:
-            raise DomainError("CONFLICT", "Memory version is stale")
-        identifier = uuid4().hex
-        parameters = {"action": action, "source_id": ref.source_id, "record_id": ref.record_id,
-                      "expected_version": expected_version}
-        if patch is not None:
-            parameters["patch"] = {name: getattr(patch, name) for name in
-                ("content", "type", "subject", "event_at", "origin") if getattr(patch, name) != UNSET}
-        digest = hashlib.sha256(json.dumps(parameters, ensure_ascii=False, sort_keys=True,
-                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-        challenge = parameters | {"challenge_id": identifier, "arguments_digest": digest,
-                                   "expires_at": time.time() + self._timeout}
-        with self._lock:
-            self._context()
-            now = self._clock()
-            self._pending = {key: value for key, value in self._pending.items() if value[0] > now}
-            if len(self._pending) >= 128:
-                raise DomainError("CAPACITY", "Too many pending management changes")
-            self._pending[identifier] = (now + self._timeout, digest, action, ref, expected_version, patch)
-        return challenge
-
-    @_management
-    def Confirm(self, challenge_id, arguments_digest, approve):
-        if not isinstance(challenge_id, str) or not isinstance(arguments_digest, str) or type(approve) is not bool:
-            raise DomainError("INVALID_REQUEST", "Invalid management confirmation")
-        with self._lock:
-            context = self._context(challenge_id)
-            pending = self._pending.get(challenge_id)
-            if pending is None:
-                raise DomainError("MANAGEMENT_STALE", "Management challenge is no longer pending")
-            expires, digest, action, ref, version, patch = pending
-            if expires <= self._clock():
-                del self._pending[challenge_id]
-                raise DomainError("MANAGEMENT_EXPIRED", "Management challenge expired")
-            if (len(arguments_digest) != 64 or any(char not in "0123456789abcdef" for char in arguments_digest)
-                    or not hmac.compare_digest(digest, arguments_digest)):
-                raise DomainError("CONFLICT", "Management parameters changed")
-            del self._pending[challenge_id]
-            if not approve:
-                return {"declined": True}
-            if Outcome(action, context.purpose) != "approval":
-                raise DomainError("DENIED", "Memory action no longer allowed")
+        snapshot = self._catalog(ref.source_id, context, write=True).Snapshot(ref.source_id)
+        # Delete is idempotent for an absent record. The authorized store handles
+        # absence so retries can still repair a failed topic unassignment.
+        if action == "replace":
+            record = self._visible_record(ref, context)
+            if record.version != expected_version:
+                raise DomainError("CONFLICT", "Memory version is stale")
+        try:
             if action == "replace":
-                snapshot = self._catalog(ref.source_id, context, write=True).Snapshot(ref.source_id)
-                record = self._memory.Update(ref, replace(patch, evidence=context.memory_evidence), version, context)
-                self._invalidate(ref.source_id)
+                record = self._memory.Update(ref, patch, expected_version, context)
                 return ManagementRecord(record) | RecordTopic(snapshot, ref.record_id) | {"revision": snapshot.revision}
-            self._catalog(ref.source_id, context, write=True)
-            try:
-                self._memory.Delete(ref, version, context)
-            finally:
-                self._invalidate(ref.source_id)
+            self._memory.Delete(ref, expected_version, context)
             return {"deleted": True}
+        finally:
+            self._invalidate(ref.source_id)
 
     def Close(self):
-        with self._lock:
-            self._closed = True
-            self._pending.clear()
+        self._closed = True

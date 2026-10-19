@@ -65,7 +65,6 @@ def Headers(settings):
 
 class CogneeMemoryStore(CogneeDocuments):
     supported_types = frozenset({"note"})
-    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, settings, source_id, *, transport=None, _dataset_id=None):
@@ -103,7 +102,7 @@ class CogneeMemoryStore(CogneeDocuments):
         child = self._document_context(context, "search")
         try:
             with controlled_lock(self._document_lock, child), self._http.Borrow(child):
-                if query.include_deleted:
+                if context.purpose == 'review':
                     return self._facts(query, child)
                 candidates = None
                 if query.text.strip():
@@ -116,7 +115,7 @@ class CogneeMemoryStore(CogneeDocuments):
                 active = {}
                 for _, row in rows:
                     record = self._record(row, child)
-                    if record is not None and not record.deleted:
+                    if record is not None:
                         active[record.ref.record_id] = record
                 identifiers = tuple(active)
                 if not identifiers:

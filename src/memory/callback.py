@@ -10,7 +10,6 @@ from .common import controlled_lock, text, validate_query, validate_metadata, ti
 
 class CallbackMemoryStore:
     supported_types = frozenset({"knowledge"})
-    supports_deleted_read = False
     capabilities = frozenset({"search"})
 
     def __init__(self, source_id, query_callback, kind="semantic"):

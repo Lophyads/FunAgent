@@ -38,8 +38,6 @@ ERRORS = {
     "NOT_READY": (503, "Application is not ready."),
     "DENIED": (403, "Memory access denied."),
     "UNSUPPORTED": (400, "Operation is unsupported."),
-    "MANAGEMENT_STALE": (409, "This management change is no longer pending."),
-    "MANAGEMENT_EXPIRED": (409, "This management change has expired."),
     "MEMORY_STORAGE": (500, "Memory operation failed."),
     "TOPIC_SYNC_FAILED": (503, TOPIC_SYNC_MESSAGE),
     "EMBEDDING_SOURCE": (503, "向量化服务请求失败，请检查 embedding 服务、模型与超时配置。"),

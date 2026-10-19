@@ -174,7 +174,7 @@ def Run(document: ImportDocument, source_id: str, operations: MemoryOperationsAc
             record.get('type') != memory['type'] or
             (record.get('topic_id') != topic_id and not (preflight and record.get('topic_id') is None)) or
             record.get('origin') != Identity(document.dataset_id, memory['key']) or
-            not record.get('record_id') or record.get('truncated') or record.get('deleted')):
+            not record.get('record_id') or record.get('truncated')):
             raise DomainError('CONFLICT', '记忆正文、类型或所属主题冲突。')
         return record
     try:

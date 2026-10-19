@@ -89,7 +89,6 @@ class MemoryRecord:
     citation: str
     version: str | None = None
     evidence: tuple[str, ...] = ()
-    deleted: bool = False
     subject: str | None = None
     event_at: str | None = None
     created_at: str | None = None
@@ -109,7 +108,6 @@ class MemoryQuery:
     kind: str | None = None
     types: tuple[str, ...] = ()
     limit: int = 10
-    include_deleted: bool = False
     subject: str | None = None
     event_from: str | None = None
     event_to: str | None = None
@@ -188,9 +186,11 @@ class RetrievalPlan:
     variant: str | None = None
     degraded: bool = False
     warnings: tuple[str, ...] = ()
+    memory_topics: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "memory_topics", tuple(self.memory_topics))
 
 
 @dataclass(frozen=True)

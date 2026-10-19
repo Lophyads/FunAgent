@@ -108,13 +108,18 @@ class MemoryPrepare:
                     candidates = ordered
                     scoring_context = replace(child, deadline=branch_deadline)
                     threshold = policies[branch].get("min_score")
+                    rank_question = request.text
+                    if branch == "facts" and plan.memory_topics:
+                        enriched = f"原问题：{request.text}\n相关记忆主题：{'；'.join(plan.memory_topics)}"
+                        if len(enriched) <= 8000:
+                            rank_question = enriched
                     with mgr.Scope('memory.rerank', branch=branch, profile_id=rerank["profile"],
                                    min_score=threshold, candidate_count=len(candidates),
-                                   input=lambda: dict(question=request.text, records=Candidates(candidates))):
+                                   input=lambda: dict(question=rank_question, records=Candidates(candidates))):
                         try:
                             scoring_context.CheckCancelled()
                             ranked = ModelRuntime.GetInstance().Rank(
-                                RerankRequest(request.text, tuple(r.content for r in candidates)),
+                                RerankRequest(rank_question, tuple(r.content for r in candidates)),
                                 rerank["profile"], scoring_context)
                             scoring_context.CheckCancelled()
                         except (ControlError, ModelError) as error:

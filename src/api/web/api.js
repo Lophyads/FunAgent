@@ -1,5 +1,5 @@
 import {applyEvent, terminal} from './store.js';
-import {notify, confirmAction} from './components/ui.js';
+import {notify} from './components/ui.js';
 
 const types={user:'profile',note:'note',episode:'episode',knowledge:'knowledge'};
 function memoryRecordReceipt(value){
@@ -112,10 +112,7 @@ export class ApiClient {
       if(!body.topic_id){const error=new Error('请选择所属主题；没有合适主题时请先新建主题。');error.status=400;error.code='INVALID_REQUEST';throw error;}
       return memoryRecordReceipt(await this.wire('/memory/records',{method:'POST',body:memoryJSON({source_id:source.source_id,...metadata,topic_id:body.topic_id,request_key:body.request_key})}));
     }
-    const proposal=await this.wire('/memory/changes',{method:'POST',body:memoryJSON({action:body.action,source_id:source.source_id,record_id:body.id,expected_version:body.expected_version,...(body.action==='replace'?{patch:metadata}:{})})});
-    const approve=await confirmAction(body.action==='remove'?'删除记忆':'确认修改记忆',`来源：${proposal.source_id}\n记录：${proposal.record_id}\n版本：${proposal.expected_version}\n\n${proposal.patch?.content||'确认后删除这条记录。'}`);
-    const result=await this.wire(`/memory/challenges/${proposal.challenge_id}/confirm`,{method:'POST',body:JSON.stringify({arguments_digest:proposal.arguments_digest,approve})});
-    if(!approve||result.declined)return {...result,declined:true};
+    const result=await this.wire('/memory/changes',{method:'POST',body:memoryJSON({action:body.action,source_id:source.source_id,record_id:body.id,expected_version:body.expected_version,...(body.action==='replace'?{patch:metadata}:{})})});
     if(body.action==='remove'){if(result.deleted!==true)throw new Error('删除操作未返回完整回执，结果未确认，请刷新核对。');return result;}
     return memoryRecordReceipt(result);}
   close(){this.closed=true;this.source?.close();clearInterval(this.expiryTimer);for(const timer of this.historyTimers.values())clearTimeout(timer);if(this.frame)cancelAnimationFrame(this.frame);}

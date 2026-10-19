@@ -10,6 +10,8 @@ def Outcome(action, purpose):
         return "allow"
     if action == "add" and purpose != "recall":
         return "allow"
-    if action in {"replace", "remove"} and purpose in {"main", "management"}:
+    if action in {"replace", "remove"} and purpose == "management":
+        return "allow"
+    if action in {"replace", "remove"} and purpose == "main":
         return "approval"
     return "deny"

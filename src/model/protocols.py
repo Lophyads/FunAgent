@@ -52,7 +52,7 @@ class ModelError(DomainError):
 
 
 class Provider(Protocol):
-    """One synchronous IO attempt, respecting context deadline/cancel.
+    """Synchronous IO respecting context deadline/cancel, including explicit batches.
 
     Implementations disable SDK retries and borrow under a short state lock.
     Concurrent Send calls perform IO independently, sharing no attempt state.

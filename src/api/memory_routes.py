@@ -131,12 +131,8 @@ def Handle(method, route, query, body, *, settings=None):
         if "patch" in body:
             Fields(body["patch"], {"content", "type", "subject", "origin", "event_at"}, {"content"})
             patch = MemoryPatch(evidence=(), **body["patch"])
-        return 202, operations.Request(Text(body["action"], 16), MemoryRef(Text(body["source_id"], 128), Text(body["record_id"], 128)),
+        return 200, operations.Change(Text(body["action"], 16), MemoryRef(Text(body["source_id"], 128), Text(body["record_id"], 128)),
                                        Text(body["expected_version"], 128), patch)
-    match = re.fullmatch(r"/memory/challenges/([A-Za-z0-9_-]{1,128})/confirm", route)
-    if match and method == "POST":
-        Fields(body, {"arguments_digest", "approve"}, {"arguments_digest", "approve"})
-        return 200, operations.Confirm(match[1], body["arguments_digest"], body["approve"])
-    if route in {"/memory/search", "/memory/records", "/memory/sources", "/memory/changes", "/memory/topics"} or match or topic_match or assignment_match:
+    if route in {"/memory/search", "/memory/records", "/memory/sources", "/memory/changes", "/memory/topics"} or topic_match or assignment_match:
         raise DomainError("METHOD_NOT_ALLOWED", "Invalid method")
     raise DomainError("NOT_FOUND", "Route not found")

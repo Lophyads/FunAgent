@@ -70,7 +70,7 @@ def SourceSemantics(settings):
     from .callback import CallbackMemoryStore
     driver = {"sqlite": SQLiteMemoryStore, "supabase": SupabaseMemoryStore,
               "cognee": CogneeMemoryStore, "callback": CallbackMemoryStore}.get(settings["store"])
-    return (driver.supported_types, driver.supports_deleted_read) if driver else (None, False)
+    return driver.supported_types if driver else None
 
 
 def ValidatePolicies(sources, policies):
@@ -80,13 +80,12 @@ def ValidatePolicies(sources, policies):
         if not policy.get("enabled", False):
             continue
         for name in policy.get("sources", ()):
-            types, deleted = SourceSemantics(sources[name])
-            if (required_type is not None and types is not None and required_type not in types or
-                    purpose == "review" and not deleted):
+            types = SourceSemantics(sources[name])
+            if required_type is not None and types is not None and required_type not in types:
                 raise DomainError("CONFIG_REFERENCE", f"Memory source {name} cannot serve {purpose}")
             if purpose == "review":
                 source = sources[name]
-                if source["kind"] != "episodic" or not {"search", "list", "write"} <= set(source.get("capabilities", ("search",))):
+                if source.get("kind", "episodic") != "episodic" or not {"search", "list", "write"} <= set(source.get("capabilities", ("search",))):
                     raise DomainError("CONFIG_REFERENCE", f"Review source {name} requires episodic search/list/write")
                 if source["store"] == "cognee" and source.get("write_confirmation", "indexed") != "stored":
                     raise DomainError("CONFIG_REFERENCE", f"Cognee review source {name} requires write_confirmation=stored")

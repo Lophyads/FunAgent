@@ -1,4 +1,4 @@
-"""One JSON HTTP attempt per Send, sharing a drained client."""
+"""JSON HTTP requests sharing a drained client and one context deadline."""
 import json
 import os
 from contextlib import contextmanager
@@ -65,6 +65,9 @@ class HTTPJSONProvider:
                     context.CheckCancelled()
                     with mgr.Scope('model.http', input=lambda: payload):
                         result = self._send(payload, context)
+                        mgr.Update(output=lambda: result.payload, response_received=True)
+                        if isinstance(result.payload, dict) and 'error' in result.payload:
+                            raise ModelError('PROTOCOL')
                         mgr.Complete(status='completed', output=lambda: result.payload, response_received=True)
                         results.append(result.payload)
                 return ProviderResponse(tuple(results))

@@ -65,7 +65,7 @@ def RunOutput(result):
 
 def Query(query):
     return {key: getattr(query, key) for key in ('text', 'source_ids', 'kind', 'types', 'limit',
-            'include_deleted', 'subject', 'event_from', 'event_to', 'origin')}
+            'subject', 'event_from', 'event_to', 'origin')}
 
 
 def Memory(result):
@@ -104,7 +104,7 @@ def ScoredCandidates(records, scores, selected):
 
 def Plan(plan):
     return {key: getattr(plan, key) for key in ('need_memory', 'need_knowledge', 'memory_query',
-                                             'knowledge_query', 'variant', 'degraded', 'warnings')}
+                                             'knowledge_query', 'variant', 'degraded', 'warnings', 'memory_topics')}
 
 
 def TaskOutput(task):

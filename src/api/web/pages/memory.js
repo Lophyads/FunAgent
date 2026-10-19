@@ -283,7 +283,6 @@ export function mount(root, {store, api}) {
     saving = true; render();
     try {
       const result = await api.writeMemory(ownSource, ownKind, body);
-      if (result.declined) {if (!disposed) notify('已放弃操作，草稿已保留'); return;}
       const next = action === 'remove' ? null : recordDraft({...result,
         topic_id:result.topic_id === undefined ? current.topic_id : result.topic_id,
         topic_path:result.topic_path || current.topic_path});

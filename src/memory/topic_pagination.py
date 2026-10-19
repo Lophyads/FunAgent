@@ -44,7 +44,7 @@ def ReadDirectory(reader, snapshot, query, context, *, topic_id=None, unclassifi
             record = page.items[index]
             scanned += 1
             assigned = snapshot.assignments.get(record.ref.record_id)
-            if (not record.deleted and (topic_id is None or assigned == topic_id)
+            if ((topic_id is None or assigned == topic_id)
                     and (not unclassified or assigned is None)):
                 records.append(record)
             offset = index + 1

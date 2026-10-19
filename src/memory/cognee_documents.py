@@ -61,17 +61,6 @@ def _unpack(raw):
         raise DomainError("MEMORY_PROTOCOL", "Invalid FunAgent Cognee document") from None
 
 
-def _deleted(metadata):
-    deleted = metadata.get('deleted', False)
-    if type(deleted) is not bool or deleted and (
-            not isinstance(metadata.get('deleted_from_version'), str) or
-            re.fullmatch(r'[0-9a-f]{64}', metadata['deleted_from_version']) is None or
-            not isinstance(metadata.get('deletion_evidence'), list) or
-            not metadata['deletion_evidence'] or any(not text(e) for e in metadata['deletion_evidence'])):
-        raise DomainError('MEMORY_PROTOCOL', 'Invalid Cognee tombstone')
-    return deleted
-
-
 class CogneeDocuments:
     """Mixin: management resolves one public dataset name to a private UUID."""
 
@@ -110,6 +99,8 @@ class CogneeDocuments:
         content, data = _unpack(raw)
         if data.get("source_id") != self.source_id or data.get("type") != "note" or not text(data.get("write_key")):
             return None
+        if data.get("deleted", False) is not False:
+            raise DomainError("MEMORY_PROTOCOL", "Legacy deleted documents require cleanup before use")
         try:
             validate_content(content, data.get("evidence"), data.get("type"))
             subject, event_at, origin = validate_metadata(data.get("subject"), data.get("event_at"), data.get("origin"))
@@ -120,17 +111,18 @@ class CogneeDocuments:
         citation = (f"cognee://{quote(self.source_id, safe='')}/data/{identifier}"
                     f"?dataset={quote(self._document_dataset_name, safe='')}")
         return MemoryRecord(MemoryRef(self.source_id, identifier), self.kind, data["type"], content,
-                            citation, sha256(raw).hexdigest(), tuple(data["evidence"]), _deleted(data),
+                            citation, sha256(raw).hexdigest(), tuple(data["evidence"]),
                             subject, event_at, created, updated, origin)
 
-    def _find(self, identifier, context):
+    def _find(self, identifier, context, *, missing_ok=False):
         identifier = _uuid(identifier)
         for _, row in self._rows(context):
             if _uuid(row.get("id")) == identifier:
                 record = self._record(row, context)
                 if record is not None:
                     return record
-        raise DomainError("NOT_FOUND", "Cognee memory document not found")
+        if not missing_ok:
+            raise DomainError("NOT_FOUND", "Cognee memory document not found")
 
     def List(self, query, context):
         if (query.source_id != self.source_id or type(query.limit) is not int or not 1 <= query.limit <= 100 or
@@ -155,7 +147,7 @@ class CogneeDocuments:
                     if offset < after:
                         continue
                     record = self._record(row, child)
-                    if record is None or record.deleted or not self._matches(record, query):
+                    if record is None or not self._matches(record, query):
                         continue
                     if len(records) == query.limit:
                         cursor = base64.urlsafe_b64encode(json.dumps([identity, last]).encode()).decode()
@@ -326,8 +318,6 @@ class CogneeDocuments:
         if ref.source_id != self.source_id or not text(expected_version):
             raise DomainError("INVALID_REQUEST", "Invalid memory reference or version")
         record = self._find(ref.record_id, context)
-        if record.deleted:
-            raise DomainError("NOT_FOUND", "Cognee memory document is deleted")
         if record.version != expected_version:
             raise DomainError("CONFLICT", "Memory version changed")
         return record
@@ -391,37 +381,30 @@ class CogneeDocuments:
             raise DomainError('INVALID_REQUEST', 'Invalid memory reference or version')
         try:
             with controlled_lock(self._document_lock, child), self._http.Borrow(child):
-                old = self._find(ref.record_id, child)
-                evidence = list(context.memory_evidence)
-                validate_content(old.content, evidence, old.type)
-                raw = self._raw(ref.record_id, child)
-                if sha256(raw).hexdigest() != old.version:
-                    raise DomainError('CONFLICT', 'Memory version changed')
-                content, metadata = _unpack(raw)
-                if old.deleted:
-                    if metadata['deleted_from_version'] != expected_version or metadata['deletion_evidence'] != evidence:
-                        raise DomainError('CONFLICT', 'Memory deletion identity changed')
+                old = self._find(ref.record_id, child, missing_ok=True)
+                if old is None:
                     return
                 if old.version != expected_version:
                     raise DomainError('CONFLICT', 'Memory version changed')
-                metadata.update(deleted=True, deleted_from_version=expected_version, deletion_evidence=evidence)
-                revised = _pack(content, metadata)
-                name = 'funagent-' + sha256((self.source_id + ':' + metadata['write_key']).encode()).hexdigest() + '.txt'
+                raw = self._raw(ref.record_id, child)
+                if sha256(raw).hexdigest() != expected_version:
+                    raise DomainError('CONFLICT', 'Memory version changed')
                 failure = None
                 try:
-                    self._http.Request('PATCH', '/update', child, mutation=True,
-                        params={'dataset_id': self._document_dataset, 'data_id': old.ref.record_id},
-                        files=[('data', (name, revised, 'text/plain'))], status_codes={404: 'NOT_FOUND'})
+                    self._http.Request('DELETE',
+                        f'/datasets/{self._document_dataset}/data/{old.ref.record_id}', child,
+                        mutation=True, response_mode='bytes', status_codes={404: 'NOT_FOUND'})
                 except ControlError:
                     raise
                 except MemoryFailure as error:
                     if error.issue.effect != 'unknown':
                         raise
                     failure = error
-                # A saved tombstone is effective regardless of graph processing.
+                # A lost response may still have committed the deletion. Resolve
+                # absence through the scoped dataset listing, not a generic 404.
                 try:
-                    current = self._find(ref.record_id, child)
-                    if current.version != sha256(revised).hexdigest():
+                    current = self._find(ref.record_id, child, missing_ok=True)
+                    if current is not None:
                         raise MemoryFailure(MemoryIssue(code='MEMORY_PROTOCOL', stage='verify', effect='unknown'))
                 except ControlError:
                     raise

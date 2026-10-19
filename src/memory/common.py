@@ -38,7 +38,7 @@ def BranchStatus(records, statuses, warnings):
 def RecordIdentity(record: MemoryRecord) -> tuple:
     """Identify a candidate by its reference, version and unmodified semantic values."""
     return (record.ref, record.version, record.content, record.kind, record.type,
-            record.subject, record.event_at, record.deleted, record.truncated)
+            record.subject, record.event_at, record.truncated)
 
 
 def text(value):
@@ -54,7 +54,7 @@ def NormalizeTopicName(value):
 
 
 def validate_query(query):
-    if (type(query.include_deleted) is not bool or not isinstance(query.text, str) or len(query.text) > 8000 or
+    if (not isinstance(query.text, str) or len(query.text) > 8000 or
             type(query.limit) is not int or not 1 <= query.limit <= 100 or
             query.kind not in {None, "semantic", "episodic"} or
             any(not text(v) for v in (*query.source_ids, *query.types))):

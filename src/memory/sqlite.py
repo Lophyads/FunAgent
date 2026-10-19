@@ -17,7 +17,6 @@ from .search import Terms, Rank
 
 class SQLiteMemoryStore:
     supported_types = None
-    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, path, source_id="facts", kind="episodic"):
@@ -39,21 +38,29 @@ class SQLiteMemoryStore:
                     type TEXT NOT NULL, content TEXT NOT NULL, search_text TEXT NOT NULL,
                     version TEXT NOT NULL, evidence TEXT NOT NULL,
                     write_key TEXT NOT NULL, original_hash TEXT NOT NULL,
-                    deleted INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_id, record_id), UNIQUE(source_id, write_key)
                 );
-                CREATE INDEX IF NOT EXISTS memory_type ON memory_records(source_id, deleted, type, seq);
             """)
             # Upgrade only this application's memory table; no legacy schema import.
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(memory_records)")}
             with self._db:
                 self._db.execute("BEGIN IMMEDIATE")
+                # Retire the old soft-delete schema before removing its filters.
+                # Never expose historical deleted content as a live record.
+                if "deleted" in columns:
+                    for name in ("memory_fts_insert", "memory_fts_delete", "memory_fts_update"):
+                        self._db.execute("DROP TRIGGER IF EXISTS " + name)
+                    self._db.execute("DROP INDEX IF EXISTS memory_type")
+                    self._db.execute("DROP INDEX IF EXISTS memory_event")
+                    self._db.execute("DELETE FROM memory_records WHERE deleted=1")
+                    self._db.execute("ALTER TABLE memory_records DROP COLUMN deleted")
                 for name in ("subject", "event_at", "created_at", "updated_at", "origin"):
                     if name not in columns:
                         self._db.execute("ALTER TABLE memory_records ADD COLUMN " + name + " TEXT")
                 now = datetime.now(timezone.utc).isoformat()
                 self._db.execute("UPDATE memory_records SET created_at=COALESCE(created_at,?),updated_at=COALESCE(updated_at,?)", (now, now))
-                self._db.execute("CREATE INDEX IF NOT EXISTS memory_event ON memory_records(source_id,deleted,type,event_at)")
+                self._db.execute("CREATE INDEX IF NOT EXISTS memory_type ON memory_records(source_id,type,seq)")
+                self._db.execute("CREATE INDEX IF NOT EXISTS memory_event ON memory_records(source_id,type,event_at)")
             self._fts = self._initialize_fts()
         except (OSError, sqlite3.Error):
             if self._db is not None:
@@ -72,18 +79,18 @@ class SQLiteMemoryStore:
             DROP TRIGGER IF EXISTS memory_fts_insert;
             DROP TRIGGER IF EXISTS memory_fts_delete;
             DROP TRIGGER IF EXISTS memory_fts_update;
-            CREATE TRIGGER memory_fts_insert AFTER INSERT ON memory_records WHEN new.deleted=0 BEGIN
+            CREATE TRIGGER memory_fts_insert AFTER INSERT ON memory_records BEGIN
                 INSERT INTO memory_fts(rowid,search_text) VALUES(new.seq,new.search_text);
             END;
-            CREATE TRIGGER memory_fts_delete AFTER DELETE ON memory_records WHEN old.deleted=0 BEGIN
+            CREATE TRIGGER memory_fts_delete AFTER DELETE ON memory_records BEGIN
                 INSERT INTO memory_fts(memory_fts,rowid,search_text) VALUES('delete',old.seq,old.search_text);
             END;
-            CREATE TRIGGER memory_fts_update AFTER UPDATE OF search_text,deleted ON memory_records BEGIN
-                INSERT INTO memory_fts(memory_fts,rowid,search_text) SELECT 'delete',old.seq,old.search_text WHERE old.deleted=0;
-                INSERT INTO memory_fts(rowid,search_text) SELECT new.seq,new.search_text WHERE new.deleted=0;
+            CREATE TRIGGER memory_fts_update AFTER UPDATE OF search_text ON memory_records BEGIN
+                INSERT INTO memory_fts(memory_fts,rowid,search_text) VALUES('delete',old.seq,old.search_text);
+                INSERT INTO memory_fts(rowid,search_text) VALUES(new.seq,new.search_text);
             END;
             INSERT INTO memory_fts(memory_fts) VALUES('delete-all');
-            INSERT INTO memory_fts(rowid,search_text) SELECT seq,search_text FROM memory_records WHERE deleted=0;
+            INSERT INTO memory_fts(rowid,search_text) SELECT seq,search_text FROM memory_records;
             COMMIT;
         """)
         return True
@@ -108,7 +115,7 @@ class SQLiteMemoryStore:
     def _record(self, row):
         return MemoryRecord(MemoryRef(self.source_id, row["record_id"]), self.kind,
                             row["type"], row["content"], f"memory://{self.source_id}/{row['record_id']}",
-                            row["version"].removeprefix("deleted:"), tuple(json.loads(row["evidence"])), bool(row["deleted"]),
+                            row["version"], tuple(json.loads(row["evidence"])),
                             row["subject"], row["event_at"], row["created_at"], row["updated_at"], row["origin"])
 
     def Search(self, query, context):
@@ -121,8 +128,6 @@ class SQLiteMemoryStore:
         if terms:
             clauses.append("(" + " OR ".join("instr(search_text,?)>0" for _ in terms) + ")")
             parameters.extend(terms)
-        if not query.include_deleted:
-            clauses.append("deleted=0")
         if query.types:
             clauses.append("type IN (" + ",".join("?" for _ in query.types) + ")")
             parameters.extend(query.types)
@@ -158,7 +163,7 @@ class SQLiteMemoryStore:
                     raise ValueError
             except (ValueError, TypeError, UnicodeError):
                 raise DomainError("INVALID_REQUEST", "Invalid memory cursor") from None
-        clauses, parameters = ["source_id=?", "deleted=0", "seq>?"], [self.source_id, after]
+        clauses, parameters = ["source_id=?", "seq>?"], [self.source_id, after]
         if query.type is not None:
             clauses.append("type=?")
             parameters.append(query.type)
@@ -187,7 +192,7 @@ class SQLiteMemoryStore:
         with self._connection(context, write=True) as db:
             existing = db.execute("SELECT * FROM memory_records WHERE source_id=? AND write_key=?", (self.source_id, draft.write_key)).fetchone()
             if existing:
-                if existing["original_hash"] != original or existing["deleted"]:
+                if existing["original_hash"] != original:
                     raise DomainError("CONFLICT", "Memory write identity already used")
                 return self._record(existing)
             identifier = uuid4().hex
@@ -202,7 +207,7 @@ class SQLiteMemoryStore:
     def _existing(self, db, ref, expected_version):
         if ref.source_id != self.source_id or not text(expected_version):
             raise DomainError("INVALID_REQUEST", "Invalid memory reference or version")
-        row = db.execute("SELECT * FROM memory_records WHERE source_id=? AND record_id=? AND deleted=0", (self.source_id, ref.record_id)).fetchone()
+        row = db.execute("SELECT * FROM memory_records WHERE source_id=? AND record_id=?", (self.source_id, ref.record_id)).fetchone()
         if row is None:
             raise DomainError("NOT_FOUND", "Memory record not found")
         if row["version"] != expected_version:
@@ -229,19 +234,11 @@ class SQLiteMemoryStore:
         if ref.source_id != self.source_id or not text(expected_version):
             raise DomainError("INVALID_REQUEST", "Invalid memory reference or version")
         with self._connection(context, write=True) as db:
-            receipt = context.purpose == "review" and bool(context.review_evidence)
             row = db.execute("SELECT * FROM memory_records WHERE source_id=? AND record_id=?", (ref.source_id, ref.record_id)).fetchone()
-            if (receipt and row is not None and row["deleted"] and row["version"] == "deleted:" + expected_version
-                    and tuple(json.loads(row["evidence"])) == context.review_evidence):
+            if row is None:
                 return
-            old = self._existing(db, ref, expected_version)
-            # Existing tombstone fields retain a review deletion receipt. This
-            # confirms only the same version and trusted evidence on a retry.
-            db.execute("UPDATE memory_records SET deleted=1,version=?,evidence=?,updated_at=? WHERE source_id=? AND record_id=?",
-                       ("deleted:" + expected_version if receipt else uuid4().hex,
-                        json.dumps(context.review_evidence) if receipt else
-                        json.dumps(context.memory_evidence) if context.purpose == "main" and context.memory_evidence else old["evidence"],
-                        datetime.now(timezone.utc).isoformat(), self.source_id, ref.record_id))
+            self._existing(db, ref, expected_version)
+            db.execute("DELETE FROM memory_records WHERE source_id=? AND record_id=?", (self.source_id, ref.record_id))
             context.CheckCancelled()
 
     def Close(self):

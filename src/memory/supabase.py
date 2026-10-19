@@ -15,7 +15,6 @@ from .transport import JSONHTTP, ValidateConnection
 
 class SupabaseMemoryStore:
     supported_types = None
-    supports_deleted_read = True
     capabilities = frozenset({"search", "list", "write", "update", "delete"})
 
     def __init__(self, settings, source_id, embedder, *, transport=None, owns_embedder=False):
@@ -43,7 +42,7 @@ class SupabaseMemoryStore:
     def _rpc(self, name, values, context):
         return self._http.Post("/rpc/funagent_memory_" + name,
                                {"p_namespace": self._namespace, "p_source_id": self.source_id} | values, context,
-                               mutation=name in {"add", "replace", "remove"},
+                               mutation=name in {"add", "replace", "remove_v2"},
                                stage="search" if name.startswith("search") else "request")
 
     def _record(self, row):
@@ -51,14 +50,14 @@ class SupabaseMemoryStore:
             if (row["namespace"] != self._namespace or row["source_id"] != self.source_id or
                     row["kind"] != self.kind or type(row["seq"]) is not int or row["seq"] <= 0 or
                     any(not text(row[k]) for k in ("record_id", "content", "type", "version")) or
-                    type(row["deleted"]) is not bool or not isinstance(row["evidence"], list) or
+                    not isinstance(row["evidence"], list) or
                     not row["evidence"] or any(not text(e) for e in row["evidence"])):
                 raise ValueError
             for field in ("event_at", "created_at", "updated_at"):
                 timestamp(row.get(field))
             return MemoryRecord(MemoryRef(self.source_id, row["record_id"]), self.kind, row["type"], row["content"],
                                 f"memory://{self.source_id}/{row['record_id']}", row["version"], tuple(row["evidence"]),
-                                row["deleted"], row.get("subject"), row.get("event_at"), row.get("created_at"),
+                                row.get("subject"), row.get("event_at"), row.get("created_at"),
                                 row.get("updated_at"), row.get("origin"))
         except (KeyError, TypeError, ValueError, DomainError):
             raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase memory record") from None
@@ -95,7 +94,7 @@ class SupabaseMemoryStore:
             payload = self._rpc("list", {"p_type": query.type, "p_limit": query.limit + 1, "p_after": after} | filters, context)
             records = self._rows(payload, query.limit + 1)
             sequences = [row["seq"] for row in payload]
-            if any(r.deleted for r in records) or sequences != sorted(set(sequences)) or any(seq <= after for seq in sequences):
+            if sequences != sorted(set(sequences)) or any(seq <= after for seq in sequences):
                 raise DomainError("MEMORY_PROTOCOL", "Invalid memory page order")
             cursor = None
             if len(records) > query.limit:
@@ -109,8 +108,8 @@ class SupabaseMemoryStore:
                 return MemorySearchResult()
             vector = self._vector(query.text, "query", context) if query.text.strip() else None
             try:
-                payload = self._rpc("search_v2", {"p_types": list(query.types), "p_limit": query.limit,
-                    "p_include_deleted": query.include_deleted, "p_profile": asdict(self._profile),
+                payload = self._rpc("search_v3", {"p_types": list(query.types), "p_limit": query.limit,
+                    "p_profile": asdict(self._profile),
                     "p_vector": vector, "p_threshold": self._threshold} | self._filters(query), context)
             except MemoryFailure as error:
                 if error.issue.http_status == 404:
@@ -118,7 +117,7 @@ class SupabaseMemoryStore:
                         source_id=self.source_id, http_status=404)) from None
                 raise
             if not isinstance(payload, dict) or set(payload) != {"records", "profile_coverage"}:
-                raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase search v2 response")
+                raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase search v3 response")
             coverage = payload["profile_coverage"]
             if (not isinstance(coverage, dict) or set(coverage) != {"matching", "incompatible"} or
                     any(type(v) is not int or v < 0 for v in coverage.values())):
@@ -126,8 +125,6 @@ class SupabaseMemoryStore:
             records = self._rows(payload["records"], query.limit)
             if len(records) > coverage["matching"]:
                 raise DomainError("MEMORY_PROTOCOL", "Invalid Supabase coverage count")
-            if not query.include_deleted and any(r.deleted for r in records):
-                raise DomainError("MEMORY_PROTOCOL", "Unexpected deleted memory record")
             issues = ()
             if vector is not None and coverage["incompatible"]:
                 issue = MemoryIssue(code="EMBEDDING_PROFILE_MISMATCH", stage="search", source_id=self.source_id)
@@ -183,7 +180,7 @@ class SupabaseMemoryStore:
     def Delete(self, ref, expected_version, context):
         with self._http.Borrow(context):
             self._reference(ref, expected_version)
-            payload = self._rpc("remove", {"p_record_id": ref.record_id, "p_expected_version": expected_version}, context)
+            payload = self._rpc("remove_v2", {"p_record_id": ref.record_id, "p_expected_version": expected_version}, context)
             if not isinstance(payload, dict) or payload.get("removed") is not True:
                 raise DomainError("MEMORY_PROTOCOL", "Invalid memory removal receipt")
 

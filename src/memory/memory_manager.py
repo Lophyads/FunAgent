@@ -212,8 +212,6 @@ class MemoryManager:
         context.CheckCancelled()
         validate_query(query)
         names = query.source_ids or tuple(name for name in self._sources if self._token(name) in context.access)
-        if query.include_deleted and (context.purpose != "review" or any(self._sources.get(name, {}).get("kind") != "episodic" for name in names)):
-            raise DomainError("DENIED", "Deleted receipts are available only to episodic review")
         selected = []
         for name in names:
             if name not in self._sources:

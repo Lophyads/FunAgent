@@ -204,6 +204,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cognee = [
+    { name = "httpx" },
+]
 dev = [
     { name = "pytest" },
 ]
@@ -215,6 +218,9 @@ mcp = [
 ]
 openai = [
     { name = "openai" },
+]
+rerank = [
+    { name = "httpx" },
 ]
 supabase = [
     { name = "httpx" },
@@ -231,7 +237,9 @@ web = [
 [package.metadata]
 requires-dist = [
     { name = "ddgs", marker = "extra == 'web'", specifier = "==9.16.0" },
+    { name = "httpx", marker = "extra == 'cognee'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'embedding'", specifier = "==0.28.1" },
+    { name = "httpx", marker = "extra == 'rerank'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'supabase'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'web'", specifier = "==0.28.1" },
     { name = "jsonschema", specifier = ">=4.18,<5" },
@@ -243,7 +251,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "tzdata", specifier = ">=2025.2" },
 ]
-provides-extras = ["openai", "embedding", "supabase", "supabase-test", "dev", "mcp", "web"]
+provides-extras = ["openai", "embedding", "rerank", "supabase", "cognee", "supabase-test", "dev", "mcp", "web"]
 
 [[package]]
 name = "h11"

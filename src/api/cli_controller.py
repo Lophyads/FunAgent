@@ -75,7 +75,7 @@ class CLIController:
             print(json.dumps(value, ensure_ascii=False), file=output)
             return
         if len(parts) < 3:
-            raise DomainError("INVALID_REQUEST", "Use memory check/search/list/write/update/delete/confirm/export")
+            raise DomainError("INVALID_REQUEST", "Use memory check/search/list/write/update/delete/export")
         _, operation, rest = parts
         manager = MemoryOperationsMgr.GetInstance()
         if operation == "export":
@@ -121,17 +121,12 @@ class CLIController:
             fields = rest.split(maxsplit=3)
             if len(fields) != 4:
                 raise DomainError("INVALID_REQUEST", "Use memory update <source> <record_id> <version> <content>")
-            value = manager.Request("replace", MemoryRef(fields[0], fields[1]), fields[2], MemoryPatch(fields[3], ()))
+            value = manager.Change("replace", MemoryRef(fields[0], fields[1]), fields[2], MemoryPatch(fields[3], ()))
         elif operation == "delete":
             fields = rest.split()
             if len(fields) != 3:
                 raise DomainError("INVALID_REQUEST", "Use memory delete <source> <record_id> <version>")
-            value = manager.Request("remove", MemoryRef(fields[0], fields[1]), fields[2])
-        elif operation == "confirm":
-            fields = rest.split()
-            if len(fields) != 3 or fields[2].lower() not in {"yes", "no"}:
-                raise DomainError("INVALID_REQUEST", "Use memory confirm <challenge_id> <digest> <yes|no>")
-            value = manager.Confirm(fields[0], fields[1], fields[2].lower() == "yes")
+            value = manager.Change("remove", MemoryRef(fields[0], fields[1]), fields[2])
         else:
             raise DomainError("INVALID_REQUEST", "Unknown memory command")
         print(json.dumps(value, ensure_ascii=False), file=output)

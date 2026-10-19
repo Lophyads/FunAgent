@@ -98,7 +98,7 @@ class MemoryHandler:
                 page = reader.List(MemoryListQuery(source, args.get("type"), args.get("limit", 50), args.get("cursor"), **filters), context)
                 value = {"records": [RecordData(r) for r in page.items], "next_cursor": page.next_cursor}
             elif action == "search":
-                result = reader.Search(MemoryQuery(args["text"], (source,), types=args.get("types", ()), limit=args.get("limit", 10), include_deleted=context.purpose == "review", **filters), context)
+                result = reader.Search(MemoryQuery(args["text"], (source,), types=args.get("types", ()), limit=args.get("limit", 10), **filters), context)
                 if context.purpose == "review" and (result.warnings or result.issues or result.source_status.get(source) != "ok"):
                     raise MemoryFailure(result.issues[0] if result.issues else
                                         ErrorIssue(DomainError('MEMORY_SOURCE', ''), source_id=source, stage='search'))
