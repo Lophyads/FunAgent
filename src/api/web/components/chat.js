@@ -89,14 +89,32 @@ export function mount(root, {store, api, commands}) {
         const fields=[];
         for(const q of request.payload.questions) {
           const group=el('fieldset',{},el('legend',{text:q.question})), choices=[];
-          if(q.multi_select) for(const choice of q.choices) {const input=el('input',{type:'checkbox',value:choice}); choices.push(input);group.append(el('label',{},input,el('span',{text:choice})));}
-          const input=q.kind==='single'?el('select',{'aria-label':`人工答复：${q.question}`},el('option',{value:'',text:'请选择'}),...q.choices.map(c=>el('option',{value:c,text:c}))):el('input',{type:'text','aria-label':`人工答复：${q.question}`,placeholder:q.multi_select?'选择答案':'输入答案',maxlength:4000});
-          if(q.multi_select)input.hidden=true;
+          for(const choice of q.choices) {const input=el('input',{type:'checkbox',value:choice}); choices.push(input);group.append(el('label',{},input,el('span',{text:choice})));}
+          const input=el('textarea',{'aria-label':`人工答复：${q.question}`,placeholder:'可多选，也可直接填写补充说明',rows:2,maxlength:4000});
+          const error=el('small',{class:'error',role:'alert',hidden:true});
+          const clearError=()=>{error.hidden=true;input.removeAttribute('aria-invalid');};
+          input.addEventListener('input',clearError);for(const choice of choices)choice.addEventListener('change',clearError);
           group.dataset.questionId=q.qid;
-          group.append(input);form.append(group);fields.push({q,input,choices});
+          group.append(input,error);form.append(group);fields.push({q,input,choices,error});
         }
-        form.append(el('button',{type:'submit',class:'primary',text:'提交答复'}));
-        form.addEventListener('submit',e=>{e.preventDefault();const answers={};for(const {q,input,choices} of fields) answers[q.qid]=q.multi_select?[...choices.filter(c=>c.checked).map(c=>c.value),...(input.value.trim()?[input.value.trim()]:[])]:input.value.trim();commands.resolve(request,{answers});});
+        const submit=el('button',{type:'submit',class:'primary',text:'提交答复'}), serverError=el('small',{class:'error',role:'alert',hidden:true});
+        form.append(submit,serverError);
+        form.addEventListener('submit',async e=>{
+          e.preventDefault();if(submit.disabled)return;
+          const answers=Object.create(null);let firstInvalid;
+          for(const {q,input,choices,error} of fields) {
+            const selected=choices.filter(c=>c.checked).map(c=>c.value),text=input.value.trim();
+            const message=[...input.value].length>4000?'补充说明不能超过 4000 字。':!selected.length&&!text?'请选择至少一项，或填写补充说明。':'';
+            error.textContent=message;error.hidden=!message;
+            if(message){input.setAttribute('aria-invalid','true');firstInvalid||=input;}else input.removeAttribute('aria-invalid');
+            answers[q.qid]={selected,text};
+          }
+          serverError.hidden=true;if(firstInvalid){firstInvalid.focus();return;}
+          submit.disabled=true;
+          try {const result=await commands.resolve(request,{answers});if(result?.error){serverError.textContent=result.error;serverError.hidden=false;}}
+          catch(error){serverError.textContent=error.message;serverError.hidden=false;}
+          finally {submit.disabled=false;}
+        });
       }
       form.append(el('small',{text:`有效期至 ${new Date(request.expires_at*1000).toLocaleTimeString()}`}));
       interactions.append(form);interactionNodes.set(request.request_id,form);

@@ -5,6 +5,47 @@ from .common import RecordIdentity
 from .contracts import MemoryRecord
 
 
+def SelectByTopic(records, snapshots, allowed):
+    """Use stored classification only; missing or stale assignments never pass."""
+    selected, outside, unclassified = [], [], []
+    for record in records:
+        source = record.ref.source_id
+        snapshot = snapshots.get(source)
+        topic = snapshot.assignments.get(record.ref.record_id) if snapshot is not None else None
+        if snapshot is None or topic not in snapshot.topics:
+            unclassified.append(record)
+        elif topic in allowed.get(source, ()):
+            selected.append(record)
+        else:
+            outside.append(record)
+    return tuple(selected), tuple(outside), tuple(unclassified)
+
+
+def AutoCutCount(scores, cut_off):
+    """Cut a descending score curve at its Nth normalized local maximum.
+
+    Adapted from Weaviate entities/autocut (BSD-3-Clause; see autocut.LICENSE.txt).
+    https://github.com/weaviate/weaviate/blob/main/entities/autocut/autocut.go
+    Scores are already sorted and validated by the caller. A tiny comparison
+    tolerance prevents roundoff on a straight line from fabricating an elbow.
+    """
+    count = len(scores)
+    if cut_off <= 0 or count <= 2 or scores[0] == scores[-1]:
+        return count
+    span = scores[-1] - scores[0]
+    differences = [(score - scores[0]) / span - index / (count - 1)
+                   for index, score in enumerate(scores)]
+    extrema = 0
+    for index in range(1, count):
+        following = differences[index + 1] if index + 1 < count else differences[index - 2]
+        if (differences[index] - differences[index - 1] > 1e-12 and
+                differences[index] - following > 1e-12):
+            extrema += 1
+            if extrema >= cut_off:
+                return index
+    return count
+
+
 def _ImportIdentity(record: MemoryRecord) -> tuple | None:
     if (record.truncated or record.origin is None or
             re.fullmatch(r"import:[0-9a-fA-F]{64}", record.origin) is None):

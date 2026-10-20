@@ -6,14 +6,14 @@ from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError, ControlError
 from .contracts import MemoryContext, MemoryBranch, MemoryQuery, MemoryIssue
 from .common import normalize, RecordIdentity, MergeSourceStatus
-from .candidate_selection import DeduplicateRecords, SelectByScore
+from .candidate_selection import AutoCutCount, DeduplicateRecords, SelectByScore, SelectByTopic
 from .memory_mgr import MemoryMgr
 from .memory_planner import MemoryPlanner
 from .prompt import FitBranch
 from .protocols import MemoryReader
 from ..observability.observation_mgr import ObservationMgr
 from ..observability.projections import Memory, Query, Candidates, Deduplication, ScoredCandidates
-from .topic_projection import PlanningTopics
+from .topic_projection import PlanningTopics, ResolveMemoryTopics
 from ..model.contracts import RerankRequest
 from ..model.model_runtime import ModelRuntime
 from ..model.protocols import ModelError
@@ -61,6 +61,8 @@ class MemoryPrepare:
             mgr.Event('memory.plan_skipped', error_code=code, warning=warning)
             return MemoryContext(warnings=(warning,), status="skipped")
         context.CheckCancelled()
+        topic_snapshots = {snapshot.source_id: snapshot for snapshot in snapshots}
+        allowed_topics = ResolveMemoryTopics(snapshots, sources, plan.memory_topics)
         branches = {}
         for branch, needed in (("facts", plan.need_memory), ("knowledge", plan.need_knowledge)):
             with mgr.Scope('memory.branch', run_id=child.run_id, purpose='recall', branch=branch,
@@ -69,6 +71,10 @@ class MemoryPrepare:
                 if not selected or not needed:
                     branches[branch] = MemoryBranch(source_status={name: "skipped" for name in selected}, status="skipped")
                     mgr.Complete(status='skipped', output=lambda: Memory(branches[branch]), reason='not_needed' if not needed else 'no_source')
+                    continue
+                if branch == "facts" and not any(allowed_topics.get(name) for name in selected):
+                    branches[branch] = MemoryBranch(source_status={name: "skipped" for name in selected}, status="skipped")
+                    mgr.Complete(status='skipped', output=lambda: Memory(branches[branch]), reason='no_topic_scope')
                     continue
                 texts = ((plan.memory_query or request.text,) if branch == "facts" else
                          (plan.knowledge_query, plan.variant, request.text))
@@ -99,6 +105,16 @@ class MemoryPrepare:
                 groups = [tuple(group) for group in groups.values()]
                 ordered = tuple(group[index] for index in range(max((len(g) for g in groups), default=0))
                                 for group in groups if index < len(group))
+                if branch == "facts":
+                    candidates = ordered
+                    with mgr.Scope('memory.topic_filter', topics=plan.memory_topics,
+                                   allowed_topic_ids={name: sorted(allowed_topics.get(name, ())) for name in selected},
+                                   topic_revisions={name: snapshot.revision for name, snapshot in topic_snapshots.items()
+                                                    if name in selected},
+                                   input=lambda: dict(records=Candidates(candidates))):
+                        ordered, outside, unclassified = SelectByTopic(candidates, topic_snapshots, allowed_topics)
+                        mgr.Complete(output=lambda: dict(selected=Candidates(ordered), rejected={
+                            'topic_mismatch': Candidates(outside), 'unclassified': Candidates(unclassified)}))
                 candidates = ordered
                 with mgr.Scope('memory.deduplicate', input=lambda: dict(records=Candidates(candidates))):
                     ordered, duplicates = DeduplicateRecords(candidates)
@@ -141,6 +157,19 @@ class MemoryPrepare:
                                 ordered, rejected = SelectByScore(candidates, scores, threshold)
                                 mgr.Complete(output=lambda: dict(selected=ScoredCandidates(candidates, scores, ordered),
                                                                  rejected=ScoredCandidates(candidates, scores, rejected)))
+                            autocut = policies[branch].get("autocut", 0)
+                            if autocut:
+                                before = ordered
+                                score_by_record = {id(record): score for record, score in zip(candidates, scores)}
+                                selected_scores = tuple(score_by_record[id(record)] for record in before)
+                                with mgr.Scope('memory.autocut', autocut=autocut,
+                                               input=lambda: dict(items=ScoredCandidates(candidates, scores, before))):
+                                    cut = AutoCutCount(selected_scores, autocut)
+                                    ordered, cut_rejected = before[:cut], before[cut:]
+                                    mgr.Complete(cut_index=cut, reason='score_jump' if cut_rejected else 'no_cut',
+                                                 output=lambda: dict(selected=ScoredCandidates(candidates, scores, ordered),
+                                                                     rejected=ScoredCandidates(candidates, scores, cut_rejected)))
+                                rejected = (*cut_rejected, *rejected)
                             mgr.Complete(profile_id=ranked.profile_id, model=ranked.model,
                                          output=lambda: dict(mode='reranked', scores=scores,
                                              selected=ScoredCandidates(candidates, scores, ordered),

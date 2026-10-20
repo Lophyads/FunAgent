@@ -244,10 +244,11 @@ class ApprovalBinding:
 class ClarificationQuestion:
     question_id: str
     prompt: str
-    kind: str = "text"
     options: tuple[str, ...] = ()
 
     def __post_init__(self):
+        if not isinstance(self.options, (list, tuple)):
+            raise DomainError("INVALID_REQUEST", "Question options must be an array")
         object.__setattr__(self, "options", tuple(self.options))
 
 

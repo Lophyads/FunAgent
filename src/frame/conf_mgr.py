@@ -390,7 +390,7 @@ def _validate(docs):
         if purpose in {"profile", "facts", "knowledge"}:
             allowed = {"enabled", "sources", "max_records", "max_chars", "timeout", "max_queries"}
             if purpose in {"facts", "knowledge"}:
-                allowed |= {"candidate_limit", "min_score"}
+                allowed |= {"candidate_limit", "min_score", "autocut"}
             _require(set(policy) <= allowed, "memory.policies")
         if "profile" in policy:
             _refs([policy["profile"]], profiles, "memory.policies.profile")
@@ -435,6 +435,9 @@ def _validate(docs):
         if "min_score" in policy:
             _number(policy["min_score"], "memory.policies.min_score")
             _require(policy["min_score"] <= 1, "memory.policies.min_score")
+        if "autocut" in policy:
+            _number(policy["autocut"], "memory.policies.autocut", integer=True)
+            _require(policy["autocut"] <= 100, "memory.policies.autocut")
         if "history_max_chars" in policy:
             _number(policy["history_max_chars"], "memory.policies.history_max_chars", integer=True, minimum=256)
         if "input_max_chars" in policy:

@@ -58,7 +58,7 @@ export class ApiClient {
   async interactions(){const sid=this.store.get().ui.activeSessionId;if(!sid||this.closed)return;const turns=Object.values(this.store.get().server.turns).filter(t=>t.session_id===sid&&!terminal(t.status));
     const pages=await Promise.all(turns.map(t=>this.wire(`/tasks/${encodeURIComponent(t.turn_id)}/interactions`)));if(this.store.get().ui.activeSessionId!==sid||this.closed)return;
     const items=pages.flatMap(p=>p.items).map(r=>({...r,request_id:r.interaction_id,session_id:sid,payload:r.kind==='approval'?{tool_name:r.approval?.tool_name,scope:r.prompt,arguments:r.approval,choices:['批准','拒绝']}:
-      {questions:r.questions.map(q=>({qid:q.id,question:q.prompt,kind:q.kind,choices:q.options||[],multi_select:q.kind==='multiple'}))}}));this.store.server('interactions',items);}
+      {questions:r.questions.map(q=>({qid:q.id,question:q.prompt,choices:q.options}))}}));this.store.server('interactions',items);}
   selectSession(sid){if(this.frame){cancelAnimationFrame(this.frame);this.frame=null;}this.source?.close();this.pending=[];this.seq=-1;this.epoch=null;
     this.store.ui('activeSessionId',sid);sessionStorage.setItem('funagent.session',sid);this.store.server('interactions',[]);this.store.ui('connectionStatus','connecting');
     this.history(sid).catch(e=>notify(e.message,true));this.tasks(sid).then(()=>this.interactions()).catch(e=>notify(e.message,true));
@@ -125,5 +125,5 @@ export function createCommands(store,api){return {
     catch(e){const current=store.get().drafts.chatBySession[sid],uncertain=!e.status||e.status>=500;store.draft('chatBySession',sid,{...current,submitting:false,uncertain,requestId:uncertain?requestId:null});notify(uncertain?'提交结果不确定。重试将使用同一请求 ID；也可先检查历史。':e.message,true);}},
   async stop(tid){const sid=store.get().ui.activeSessionId,turns=Object.values(store.get().server.turns).filter(t=>t.session_id===sid&&!terminal(t.status)).sort((a,b)=>a.created_at-b.created_at);const t=tid?turns.find(t=>t.turn_id===tid):turns.find(t=>t.status!=='queued')||turns[0];if(t)await api.wire(`/tasks/${t.turn_id}/cancel`,{method:'POST',body:'{}'});},
   async resolve(request,response){try{const answer=request.kind==='approval'?response.decision==='批准':{answers:request.payload.questions.map(q=>({question_id:q.qid,value:response.answers[q.qid]}))};
-    await api.wire(`/interactions/${request.request_id}/answer`,{method:'POST',body:JSON.stringify({task_id:request.task_id,run_id:request.run_id,answer})});await api.interactions();}catch(e){notify(e.message,true);await api.interactions();}},
+    await api.wire(`/interactions/${request.request_id}/answer`,{method:'POST',body:JSON.stringify({task_id:request.task_id,run_id:request.run_id,answer})});await api.interactions();return {answered:true};}catch(e){notify(e.message,true);await api.interactions().catch(()=>{});return {error:e.message};}},
 };}

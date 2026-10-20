@@ -11,7 +11,7 @@ from ..frame.session_mgr import SessionMgr
 from ..task.task_mgr import TaskMgr
 from ..frame.review_scheduler import ReviewScheduler
 from ..frame.interaction_mgr import InteractionMgr
-from ..frame.clarification import QuestionData
+from ..frame.clarification import QuestionData, ValidateAnswers
 from ..memory.memory_operations_mgr import MemoryOperationsMgr
 from ..memory.contracts import MemoryQuery, MemoryListQuery, MemoryDraft, MemoryPatch, MemoryRef
 from . import diagnostic_service
@@ -51,20 +51,38 @@ class CLIController:
                                             task_id=request.task_id, run_id=request.run_id)
 
     @staticmethod
-    def _read_clarification(request, read_answer):
+    def _read_clarification(request, read_answer, output=None):
+        output = output or sys.stdout
         answers = []
         for question in request.questions:
-            text = read_answer(f"{question.question_id} ({question.kind})> ")
-            if text.strip() == "/cancel":
-                return text
-            if question.kind == "multiple":
+            print(question.prompt, file=output, flush=True)
+            for index, option in enumerate(question.options, 1):
+                print(f"{index}. {option}", file=output, flush=True)
+            while True:
+                selected = []
+                if question.options:
+                    choice = read_answer(f"{question.question_id} 选择编号（可多选，逗号分隔；回车跳过）> ").strip()
+                    if choice == "/cancel":
+                        return choice
+                    try:
+                        indices = [int(part.strip()) for part in choice.replace("，", ",").split(",")] if choice else []
+                        if any(index < 1 or index > len(question.options) for index in indices):
+                            raise ValueError
+                        selected = [question.options[index - 1] for index in indices]
+                    except ValueError:
+                        print("INVALID_REQUEST: 请输入有效的选项编号。", file=output, flush=True)
+                        continue
+                text = read_answer(f"{question.question_id} 补充说明（回车跳过；/cancel 取消）> ")
+                if text.strip() == "/cancel":
+                    return text
+                row = {"question_id": question.question_id, "value": {"selected": selected, "text": text}}
                 try:
-                    value = json.loads(text)
-                except ValueError:
-                    raise DomainError("INVALID_REQUEST", "Multiple choice answer must be a JSON array") from None
-            else:
-                value = text
-            answers.append({"question_id": question.question_id, "value": value})
+                    ValidateAnswers((question,), {"answers": [row]})
+                except DomainError as error:
+                    print(f"{error.code}: {error}", file=output, flush=True)
+                    continue
+                answers.append(row)
+                break
         return json.dumps({"answers": answers}, ensure_ascii=False)
 
     @staticmethod
@@ -264,7 +282,7 @@ class CLIController:
                     for request in InteractionMgr.GetInstance().Pending(identifier):
                         CLIController._show_interaction(request, output)
                         try:
-                            answer = (CLIController._read_clarification(request, read_answer) if request.kind == "clarify"
+                            answer = (CLIController._read_clarification(request, read_answer, output) if request.kind == "clarify"
                                       else read_answer("answer (yes/no for approval; /cancel to cancel)> "))
                             if answer.strip() == "/cancel":
                                 TaskMgr.GetInstance().Cancel(identifier)

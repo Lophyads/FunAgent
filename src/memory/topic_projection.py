@@ -34,5 +34,41 @@ def PlanningTopics(snapshots, sources):
         for key, node in nodes.items():
             parent = snapshot.topics[key].parent_id
             (roots if parent is None else nodes[parent]["children"]).append(node)
-        result.append({"source_id": snapshot.source_id, "kind": sources[snapshot.source_id]["kind"], "nodes": roots})
+        result.append({"source_id": snapshot.source_id, "kind": sources[snapshot.source_id]["kind"],
+                       "source_description": sources[snapshot.source_id].get("source_description", ""),
+                       "nodes": roots})
     return result
+
+
+def MemoryTopicPaths(topics):
+    """Full paths visible to the planner, restricted to fact-memory sources."""
+    paths = set()
+    pending = [(node, ()) for source in topics if source["kind"] == "episodic" for node in source["nodes"]]
+    while pending:
+        node, parents = pending.pop()
+        names = (*parents, node["name"])
+        paths.add(" / ".join(names))
+        pending.extend((child, names) for child in node["children"])
+    return paths
+
+
+def ResolveMemoryTopics(snapshots, sources, selected):
+    """Resolve selected paths and their descendants within each source snapshot."""
+    selected = set(selected)
+    allowed = {}
+    for snapshot in snapshots:
+        if sources[snapshot.source_id]["kind"] != "episodic":
+            continue
+        roots = {key for key in snapshot.topics
+                 if " / ".join(topic["name"] for topic in TopicPath(snapshot, key)) in selected}
+        children = {}
+        for key, topic in snapshot.topics.items():
+            children.setdefault(topic.parent_id, []).append(key)
+        pending, included = list(roots), set()
+        while pending:
+            key = pending.pop()
+            if key not in included:
+                included.add(key)
+                pending.extend(children.get(key, ()))
+        allowed[snapshot.source_id] = frozenset(included)
+    return allowed
