@@ -79,7 +79,7 @@ class _TomlModelConf(ModelConf):
             key: ModelProfile(key, value["provider_id"], value["adapter_id"],
                               value["model"], value["timeout"], value.get("max_retries", 0),
                               tuple(value.get("fallback_profiles", ())), value.get("streaming", False),
-                              value.get("task", "chat"))
+                              value.get("task", "chat"), reasoning_effort=value.get("reasoning_effort"))
             for key, value in data["profiles"].items()
         })
 
@@ -212,6 +212,23 @@ def _validate(docs):
     for provider in providers.values():
         _require(isinstance(provider, dict), "model.providers")
         _text(provider["kind"], "model.providers.kind")
+        if "auth" in provider:
+            _require(provider["kind"] == "openai", "model.providers.auth")
+        if provider["kind"] == "openai":
+            _require(set(provider) <= {"kind", "base_url", "credential_env", "connect_timeout", "read_timeout", "auth"},
+                     "model.providers.openai")
+            if "base_url" in provider:
+                _text(provider["base_url"], "model.providers.base_url")
+            for field in ("connect_timeout", "read_timeout"):
+                if field in provider:
+                    _number(provider[field], "model.providers." + field, strict=True)
+            if "auth" in provider:
+                auth = provider["auth"]
+                _require(isinstance(auth, dict) and set(auth) == {"kind", "state_dir"} and auth["kind"] == "siwc",
+                         "model.providers.auth")
+                _text(auth["state_dir"], "model.providers.auth.state_dir")
+                _require("credential_env" not in provider and provider.get("base_url", "https://api.openai.com/v1").rstrip("/") ==
+                         "https://api.openai.com/v1", "model.providers.siwc")
         if provider["kind"] == "http_json":
             _require(set(provider) <= {"kind", "endpoint", "credential_env"}, "model.providers.http_json")
             _text(provider["endpoint"], "model.providers.endpoint")
@@ -223,12 +240,24 @@ def _validate(docs):
                 _text(provider["credential_env"], "model.providers.credential_env")
     for profile in profiles.values():
         _require(isinstance(profile, dict), "model.profiles")
+        _require("replay_scope" not in profile, "model.profiles.replay_scope")
+        if "reasoning_effort" in profile:
+            _require(profile.get("adapter_id") == "openai_responses" and
+                     isinstance(profile["reasoning_effort"], str) and
+                     profile["reasoning_effort"] in {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
+                     "model.profiles.reasoning_effort")
         _refs([profile["provider_id"]], providers, "model.profiles.provider_id")
         _refs([profile["adapter_id"]], adapters, "model.profiles.adapter_id")
         _text(profile["model"], "model.profiles.model")
         _number(profile["timeout"], "model.profiles.timeout", strict=True)
         _number(profile.get("max_retries", 0), "model.profiles.max_retries", integer=True)
         _require(type(profile.get("streaming", False)) is bool, "model.profiles.streaming")
+        provider = providers[profile["provider_id"]]
+        if provider.get("auth", {}).get("kind") == "siwc":
+            _require(profile["adapter_id"] == "openai_responses" and profile.get("streaming", False) and
+                     profile.get("max_retries", 0) == 0 and not profile.get("fallback_profiles", []), "model.profiles.siwc")
+        if profile["adapter_id"] == "openai_responses":
+            _require(provider["kind"] == "openai" and profile.get("streaming", False), "model.profiles.responses")
         _refs(_names(profile.get("fallback_profiles", []), "model.profiles.fallback_profiles"),
               profiles, "model.profiles.fallback_profiles")
         task = profile.get("task", "chat")

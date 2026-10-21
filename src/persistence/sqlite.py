@@ -11,7 +11,7 @@ import hashlib
 import re
 import unicodedata
 
-from ..frame.contracts import (DomainError, Message, Session, SessionSnapshot,
+from ..frame.contracts import (DomainError, Message, ModelReplay, Session, SessionSnapshot,
                          Task, TurnRequest, ToolCall, ToolResult, RunResult, RecordScope, Page, thaw)
 
 
@@ -22,12 +22,17 @@ def _message_json(message):
                        "calls": [{"call_id": c.call_id, "name": c.name, "args": thaw(c.args),
                                   "argument_error": c.argument_error}
                                  for c in message.calls], "call_id": message.call_id,
-                       "status": message.status, "effect": message.effect}, ensure_ascii=False)
+                       "status": message.status, "effect": message.effect,
+                       **({"replay": {"version": message.replay.version, "format": message.replay.format,
+                                      "scope": message.replay.scope, "items": thaw(message.replay.items)}}
+                          if message.replay is not None else {})}, ensure_ascii=False, allow_nan=False)
 
 
 def _message(data):
     data = json.loads(data)
     data["calls"] = tuple(ToolCall(**c) for c in data["calls"])
+    if data.get("replay") is not None:
+        data["replay"] = ModelReplay(**data["replay"])
     return Message(**data)
 
 
@@ -286,7 +291,7 @@ class SQLiteStore:
             self._append_result(db, task_id, actual)
         if status == "completed":
             db.execute("INSERT INTO messages(task_id,payload) VALUES(?,?)",
-                       (task_id, _message_json(Message("assistant", result.final))))
+                       (task_id, _message_json(Message("assistant", result.final, replay=result.replay))))
         db.execute("UPDATE tasks SET status=?,result=?,finished_at=? WHERE task_id=?",
                    (status, _result_json(result), time.time(), task_id))
         return self._task(self._task_row(db, task_id))

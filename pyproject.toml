@@ -16,8 +16,11 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = ["openai>=2.0,<3"]
+siwc = ["openai>=2.54.0,<3", "httpx==0.28.1", "PyJWT[crypto]>=2.10,<3"]
 embedding = ["httpx==0.28.1"]
+rerank = ["httpx==0.28.1"]
 supabase = ["httpx==0.28.1"]
+cognee = ["httpx==0.28.1"]
 supabase-test = ["psycopg[binary]==3.3.6"]
 dev = ["pytest>=8.4,<10"]
 mcp = [
@@ -43,10 +46,10 @@ packages = ["src"]
 
 [tool.hatch.build.targets.sdist]
 ignore-vcs = true
-include = ["/src", "/tests_refactor", "/tests_observability", "/examples/refactor*", "/README.md", "/docs/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py"]
+include = ["/src", "/tests_refactor", "/tests_observability", "/tests/test_openai_provider.py", "/tests/test_openai_responses.py", "/tests/test_siwc_credentials.py", "/tests/test_responses_history.py", "/tests/test_siwc_lifecycle.py", "/scripts/verify_siwc_core.py", "/examples/siwc/model.conf", "/examples/refactor*", "/README.md", "/docs/*.md", "/pyproject.toml", "/uv.lock", "/hatch_build.py", "/workflows/memory-cognee/graph-engine/package.json", "/workflows/memory-cognee/graph-engine/package-lock.json", "/workflows/memory-cognee/graph-engine/build.mjs", "/workflows/memory-cognee/graph-engine/README.md"]
 
 [tool.pytest.ini_options]
 addopts = "-q -m 'not supabase_integration'"
 markers = ["supabase_integration: requires an explicitly configured isolated Supabase database and RPC endpoint; missing environment is an error"]
-testpaths = ["tests", "tests_refactor", "tests_observability"]
+testpaths = ["tests", "tests_refactor", "tests_observability", "evals/tests"]
 pythonpath = ["."]

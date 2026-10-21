@@ -45,7 +45,7 @@ def Generate(directory):
                     if event.kind == 'interaction_pending':
                         request, = InteractionMgr.GetInstance().Pending(task_id)
                         InteractionMgr.GetInstance().Resolve(request.interaction_id,
-                            {'answers': [{'question_id': 'answer', 'value': '蓝色'}]},
+                            {'answers': [{'question_id': 'answer', 'value': {'selected': [], 'text': '蓝色'}}]},
                             task_id=task_id, run_id=request.run_id)
                     if queue.Get(task_id).status not in {'queued', 'running'}:
                         break

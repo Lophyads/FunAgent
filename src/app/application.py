@@ -53,12 +53,12 @@ def Initialize(conf_dir):
     return ConfMgr.GetInstance()
 
 
-def _BuildMemoryServices(conf, conf_dir, *, backends, tools, store, events):
+def _BuildMemoryServices(conf, conf_dir, *, backends, tools, store, events, resolve_siwc=None):
     from ..memory.factory import CreateTopics
     resources = Lifecycle()
     try:
         models = resources.Own(CreateModel(conf, resources.Own, tool_dispatch=tools,
-                                          journal=store, events=events))
+                                          journal=store, events=events, resolve_siwc=resolve_siwc))
         topics = CreateTopics(conf, conf_dir)
         memory = resources.Own(CreateMemory(conf, conf_dir, resources.Own, backends=backends, topics=topics))
         inspection = CreateInspection(conf, resources.Own)
@@ -88,6 +88,21 @@ def Start(conf_dir):
         owner.Own(Environment(conf_dir))
         owner.Own(ConfMgr, ConfMgr.Close)
         conf = Initialize(conf_dir)
+        # Register this owner before replaceable groups, including when SIWC is
+        # first enabled by a later settings change. Shutdown is reverse ordered.
+        auth_resources = Lifecycle()
+        owner.Own(auth_resources, auth_resources.Stop)
+        auth_sessions = {}
+        def resolve_siwc(state_dir):
+            try:
+                from ..model.siwc import SiwcSession
+            except ImportError:
+                raise DomainError('DRIVER_UNAVAILABLE', 'Install funagent[siwc] to use SIWC') from None
+            path = (conf_dir / state_dir).resolve()
+            key = str(path).casefold()
+            if key not in auth_sessions:
+                auth_sessions[key] = auth_resources.Own(SiwcSession(path))
+            return auth_sessions[key]
         logs = owner.Own(LogSession(conf, conf_dir))
         observation = CreateObservation(conf, logs, conf_dir)
         owner.Own(observation, observation.CloseResource)
@@ -107,7 +122,7 @@ def Start(conf_dir):
         InteractionMgr.Initialize(options.get("interaction_timeout", 120))
         def build(candidate):
             return _BuildMemoryServices(candidate, conf_dir, backends=backends, tools=tools,
-                                        store=store, events=EventMgr.GetInstance())
+                                        store=store, events=EventMgr.GetInstance(), resolve_siwc=resolve_siwc)
         services = owner.Own(build(conf))
         # The resource group owns clients; bindings only release their references.
         for manager, instance in ((ModelRuntime, services.models), (MemoryMgr, services.memory),

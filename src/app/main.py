@@ -5,10 +5,25 @@ import sys
 
 from ..frame.conf_mgr import ConfMgr
 from ..frame.contracts import DomainError
-from . import application
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'auth':
+        parser = argparse.ArgumentParser(prog='funagent auth')
+        parser.add_argument('command', choices=('login', 'status', 'models', 'logout'))
+        parser.add_argument('--state-dir', default='.funagent/siwc')
+        parser.add_argument('--no-open', action='store_true')
+        parser.add_argument('--login-timeout', type=int, default=600)
+        args = parser.parse_args(argv[1:])
+        if not 1 <= args.login_timeout <= 1800:
+            parser.error('--login-timeout must be between 1 and 1800 seconds')
+        try:
+            from ..api.siwc_controller import Run
+            return Run(args)
+        except KeyboardInterrupt:
+            return 130
+    from . import application
     parser = argparse.ArgumentParser(prog="funagent")
     parser.add_argument("--conf-dir", required=True)
     parser.add_argument("--check-config", action="store_true")

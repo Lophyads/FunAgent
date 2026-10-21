@@ -2,11 +2,31 @@
 from collections.abc import Mapping
 from dataclasses import replace
 from math import isfinite
+import json
 
 from ..frame.contracts import ModelReply, ToolCall, thaw
 from ..frame.tool_validator import ToolValidator
 from .protocols import ModelError
 from .contracts import RerankRequest, RerankResult
+
+
+def ParseArguments(raw, call_id, name):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+    def reject(value):
+        raise ValueError
+    try:
+        args = json.loads(raw, object_pairs_hook=unique, parse_constant=reject)
+        if not isinstance(args, dict):
+            raise ValueError
+        return ToolCall(call_id, name, args)
+    except (TypeError, ValueError, RecursionError):
+        return ToolCall(call_id, name, {}, "invalid_arguments")
 
 
 def ValidateRerankRequest(request):

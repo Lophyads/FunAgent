@@ -11,6 +11,10 @@ from urllib.parse import urlsplit, urlunsplit
 KINDS = frozenset({"tools", "connections", "models", "config", "status", "memory"})
 
 
+def ProfileView(profile):
+    return {k: v for k, v in asdict(profile).items() if k != 'replay_scope'}
+
+
 def Sanitized(value, key=''):
     name = key.lower()
     if name in {'args', 'env', 'headers', 'system_prompt', 'credential_env', 'credential_ref'} or any(
@@ -81,7 +85,7 @@ class DiagnosticService:
         if kind == "models":
             bound = {item['profile_id']: item for item in self._models.Inspect()}
             configured = conf.Model().Profiles()
-            return {"profiles": [asdict(profile) | bound.get(name, {}) | {'selected': name in bound,
+            return {"profiles": [ProfileView(profile) | bound.get(name, {}) | {'selected': name in bound,
                        'base_url': Sanitized(thaw(conf.Model().Providers()[profile.provider_id])).get('base_url')}
                        for name, profile in configured.items()] if configured else list(bound.values())}
         if kind == "status":
@@ -91,7 +95,7 @@ class DiagnosticService:
         log = conf.Log().Options()
         return {"effective": Sanitized({'model.conf': {'providers': thaw(conf.Model().Providers()),
                     'adapters': list(conf.Model().Adapters()),
-                    'profiles': {k: asdict(v) for k, v in conf.Model().Profiles().items()}},
+                    'profiles': {k: ProfileView(v) for k, v in conf.Model().Profiles().items()}},
                     'tool.conf': {'tools': thaw(conf.Tool().Tools()), 'toolsets': thaw(conf.Tool().Toolsets()),
                                   'backends': thaw(conf.Tool().Backends()), 'session_access': thaw(conf.Tool().AccessMap()),
                                   'purposes': {k: asdict(conf.Tool().Selection(k)) for k in ('main','recall','review')}},

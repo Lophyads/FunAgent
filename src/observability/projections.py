@@ -43,13 +43,27 @@ def Wire(value):
 
 def Usage(value):
     if isinstance(value, Mapping):
-        return value.get('usage') or {}
+        if isinstance(value.get('type'), str) and value['type'].startswith('response.'):
+            value = value.get('response') or {}
+        usage = value.get('usage') or {}
+        if isinstance(usage, Mapping) and any(k in usage for k in ('input_tokens', 'output_tokens')):
+            result = {dest: usage[src] for src, dest in (('input_tokens', 'prompt_tokens'),
+                ('output_tokens', 'completion_tokens'), ('total_tokens', 'total_tokens')) if src in usage}
+            for src, detail, dest in (('input_tokens_details', 'cached_tokens', 'cached_tokens'),
+                                      ('output_tokens_details', 'reasoning_tokens', 'reasoning_tokens')):
+                details = usage.get(src)
+                if isinstance(details, Mapping) and detail in details:
+                    result[dest] = details[detail]
+            return result
+        return usage
     return getattr(value, 'usage', {}) or {}
 
 
 def StreamHasOutput(payload):
     """Role-only and empty packets do not count as first semantic output."""
     try:
+        if payload.get('type') in {'response.output_text.delta', 'response.function_call_arguments.delta'}:
+            return bool(payload.get('delta'))
         return any(choice.get('delta', {}).get('content') or any(
             call.get('function', {}).get('arguments') for call in choice.get('delta', {}).get('tool_calls', ()))
             for choice in payload.get('choices', ()))

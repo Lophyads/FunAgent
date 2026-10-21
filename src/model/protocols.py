@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager
 
 from .contracts import ModelProfile, RerankRequest, RerankResult
-from ..frame.contracts import DomainError, ModelReply, ModelRequest, RunContext, RunInput, RunResult
+from ..frame.contracts import DomainError, Message, ModelReply, ModelRequest, RunContext, RunInput, RunResult
 from ..tool.contracts import ToolSelectionRequest
 
 
@@ -22,6 +22,7 @@ class ProviderRequest:
     payload: Any = field(repr=False)
     # HTTP JSON may execute an explicit finite sequence under the same deadline.
     batch: bool = field(default=False, kw_only=True)
+    operation: str = field(default="chat_completions", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -32,16 +33,26 @@ class ProviderResponse:
 _MODEL_ERROR_CODES = frozenset({
     "TRANSPORT", "TIMEOUT", "RATE_LIMIT", "AUTH", "INVALID_REQUEST",
     "PROTOCOL", "TRUNCATED", "PROVIDER_FATAL", "PROFILES_EXHAUSTED", "MODEL_NOT_FOUND", "EMPTY_REPLY",
+    "AUTH_REQUIRED", "PLAN_PERMISSION_REQUIRED", "SUBSCRIPTION_LIMIT", "ACCESS_DENIED", "AUTH_STORAGE", "UNSUPPORTED",
 })
 
 
+def SafeModelIdentifier(value):
+    return value if isinstance(value, str) and len(value) <= 128 and all(
+        c.isalnum() or c in '_-.' for c in value) else None
+
+
 class ModelError(DomainError):
-    def __init__(self, code: str, *, cause_code: str | None = None, retry_after: float | None = None):
+    def __init__(self, code: str, *, cause_code: str | None = None, retry_after: float | None = None,
+                 http_status=None, remote_code=None, request_id=None):
         safe_code = code if isinstance(code, str) and code in _MODEL_ERROR_CODES else "PROVIDER_FATAL"
         super().__init__(safe_code, "Model request failed")
         self.cause_code = (cause_code if isinstance(cause_code, str) and cause_code in _MODEL_ERROR_CODES
                            else "PROVIDER_FATAL" if cause_code is not None else None)
         self.retry_after = None
+        self.http_status = http_status if type(http_status) is int else None
+        self.remote_code = SafeModelIdentifier(remote_code)
+        self.request_id = SafeModelIdentifier(request_id)
         if type(retry_after) in (int, float) and safe_code in {"RATE_LIMIT", "TRANSPORT", "TIMEOUT"}:
             try:
                 seconds = float(retry_after)
@@ -49,6 +60,39 @@ class ModelError(DomainError):
                     self.retry_after = seconds
             except OverflowError:
                 pass
+
+
+def RemoteError(status=None, remote_code=None, request_id=None, retry_after=None, *, siwc=False):
+    """Stable transport classification; raw remote messages never cross this boundary."""
+    remote_code = remote_code if isinstance(remote_code, str) else None
+    if remote_code in {"subscription_sharing_usage_limit_exceeded", "subscription_sharing_user_not_eligible"}:
+        code = "SUBSCRIPTION_LIMIT"
+    elif remote_code in {"chatpass_v2_scope_not_authorized", "chatpass_v2_invalid_authorization_context"}:
+        code = "PLAN_PERMISSION_REQUIRED"
+    elif remote_code == "subscription_sharing_invalid_user":
+        code = "AUTH_REQUIRED"
+    elif remote_code in {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable", "server_error"}:
+        code = "TRANSPORT"
+    elif remote_code == "rate_limit_exceeded":
+        code = "RATE_LIMIT"
+    elif remote_code == "subscription_sharing_unsupported_capability":
+        code = "INVALID_REQUEST"
+    elif remote_code == "subscription_sharing_route_not_supported":
+        code = "ACCESS_DENIED"
+    elif status in {401, 403}:
+        code = ("AUTH_REQUIRED" if status == 401 else "ACCESS_DENIED") if siwc else "AUTH"
+    elif status == 429:
+        code = "RATE_LIMIT"
+    elif status == 404 and remote_code in (None, "model_not_found", "deployment_not_found", "endpoint_not_found", "DeploymentNotFound"):
+        code = "MODEL_NOT_FOUND"
+    elif status == 408:
+        code = "TIMEOUT"
+    elif (status is not None and status >= 500) or status == 409:
+        code = "TRANSPORT"
+    else:
+        code = "INVALID_REQUEST" if status is not None else "PROVIDER_FATAL"
+    return ModelError(code, http_status=status, remote_code=remote_code, request_id=request_id,
+                      retry_after=retry_after)
 
 
 class Provider(Protocol):
@@ -88,6 +132,10 @@ class Adapter(Generic[RequestT, ResultT], ABC):
     @staticmethod
     @abstractmethod
     def Decode(response: ProviderResponse) -> ResultT: ...
+
+    @staticmethod
+    def BuildMessage(reply, profile):
+        return Message("assistant", reply.content or "", reply.calls)
 
 
 @dataclass(frozen=True)

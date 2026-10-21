@@ -222,6 +222,11 @@ openai = [
 rerank = [
     { name = "httpx" },
 ]
+siwc = [
+    { name = "httpx" },
+    { name = "openai" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
 supabase = [
     { name = "httpx" },
 ]
@@ -240,18 +245,21 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'cognee'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'embedding'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'rerank'", specifier = "==0.28.1" },
+    { name = "httpx", marker = "extra == 'siwc'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'supabase'", specifier = "==0.28.1" },
     { name = "httpx", marker = "extra == 'web'", specifier = "==0.28.1" },
     { name = "jsonschema", specifier = ">=4.18,<5" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==1.30.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.0,<3" },
+    { name = "openai", marker = "extra == 'siwc'", specifier = ">=2.54.0,<3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'supabase-test'", specifier = "==3.3.6" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'siwc'", specifier = ">=2.10,<3" },
     { name = "pypdf", marker = "extra == 'web'", specifier = "==6.20.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4,<10" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "tzdata", specifier = ">=2025.2" },
 ]
-provides-extras = ["openai", "embedding", "rerank", "supabase", "cognee", "supabase-test", "dev", "mcp", "web"]
+provides-extras = ["openai", "siwc", "embedding", "rerank", "supabase", "cognee", "supabase-test", "dev", "mcp", "web"]
 
 [[package]]
 name = "h11"

@@ -8,8 +8,8 @@ import re
 from ..frame.contracts import freeze, thaw
 
 
-_SENSITIVE = re.compile(r'(?:password|passwd|secret|credential|authorization|cookie|api[_-]?key|(?:access|refresh|auth|session|bearer)[_-]?token|^token$|^headers$|^env$)', re.I)
-_KEY = r'(?:[\w.-]*[_-])?(?:password|passwd|secret|credential|api[_-]?key|access[_-]?token|refresh[_-]?token|token)'
+_SENSITIVE = re.compile(r'(?:password|passwd|secret|credential|authorization|cookie|api[_-]?key|(?:access|refresh|auth|session|bearer|id)[_-]?token|encrypted_content|^replay$|^replay_scope$|^token$|^headers$|^env$|code_verifier)', re.I)
+_KEY = r'(?:[\w.-]*[_-])?(?:password|passwd|secret|credential|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|encrypted_content|code_verifier|token)'
 _ASSIGNMENT = re.compile(rf'''(?i)(["']?\b{_KEY}["']?\s*[:=]\s*["']?)([^\s,;"'}}]+)''')
 _QUOTED = re.compile(rf'''(?is)(["']?\b{_KEY}["']?\s*[:=]\s*)(["'])(.*?)(?:\2|$)''')
 _AUTH = re.compile(r'''(?i)(\bauthorization["']?\s*[:=]\s*["']?)(?:Basic|Bearer)\s+[^\s,;"']+''')
@@ -140,6 +140,10 @@ class Redactor:
                 remaining -= _bytes(prefix)
                 return prefix
             if isinstance(item, Mapping):
+                if item.get('type') == 'reasoning':
+                    hidden = {'type': 'reasoning', 'content': '[REDACTED]'}
+                    remaining -= _bytes(hidden)
+                    return hidden
                 result = {}
                 remaining -= 2
                 for index, (key, child) in enumerate(item.items()):

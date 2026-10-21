@@ -39,7 +39,7 @@ class Runtime:
     def Inspect(self):
         return [{"profile_id": profile.profile_id, "provider_id": profile.provider_id,
                  "adapter_id": profile.adapter_id, "model": profile.model, "timeout": profile.timeout,
-                 "streaming": profile.streaming, "task": profile.task,
+                 "streaming": profile.streaming, "task": profile.task, "reasoning_effort": profile.reasoning_effort,
                  "streaming_available": callable(getattr(self._providers[profile.provider_id], "Stream", None)),
                  "max_retries": profile.max_retries, "fallback_profiles": list(profile.fallback_profiles)}
                 for profile in self._profiles.values()]
@@ -156,8 +156,8 @@ class Runtime:
                             for packet in packets:
                                 # Capture receipt before the next control/protocol check.
                                 unprocessed = packet.payload
-                                if isinstance(packet.payload, Mapping) and packet.payload.get('usage') is not None:
-                                    received_usage = packet.payload['usage']
+                                if Usage(packet.payload):
+                                    received_usage = Usage(packet.payload)
                                 if first_output is None and StreamHasOutput(packet.payload):
                                     first_output = time.time()
                                 attempt_context.CheckCancelled()
@@ -180,6 +180,9 @@ class Runtime:
                     mgr.Update(output=lambda: (Wire(response.payload) if profile.task == 'chat' else response.payload),
                                usage=lambda: Usage(response.payload),
                                response_received=True)
+            except ModelError as error:
+                mgr.Update(http_status=error.http_status, remote_code=error.remote_code, request_id=error.request_id)
+                raise
             except (DomainError, ControlError):
                 raise
             except Exception:
@@ -223,7 +226,8 @@ class Runtime:
                     self._emit(context, counts, 'attempt_reset', {'error_code': error.code})
                     context.CheckCancelled()
                     last = error
-                if last.code in {"PROTOCOL", "TRUNCATED", "PROVIDER_FATAL", "INVALID_REQUEST"}:
+                if last.code in {"PROTOCOL", "TRUNCATED", "PROVIDER_FATAL", "INVALID_REQUEST", "UNSUPPORTED",
+                                 "AUTH_REQUIRED", "PLAN_PERMISSION_REQUIRED", "SUBSCRIPTION_LIMIT", "ACCESS_DENIED", "AUTH_STORAGE"}:
                     raise last
                 if last.code in rule.retry_codes and retry < profile.max_retries:
                     delay = Backoff(retry, last.retry_after)
@@ -292,10 +296,10 @@ class Runtime:
         seen = {call.call_id for message in messages for call in message.calls}
         pending = ()
 
-        def finish(status, *, final=None, reason=None, error_code=None):
+        def finish(status, *, final=None, reason=None, error_code=None, replay=None):
             return RunResult(status, final=final, reason=reason, error_code=error_code,
                              tool_results=tuple(results), usage=usage,
-                             iterations=counts["iterations"], attempts=counts["attempts"], profile_id=counts["profile_id"])
+                             iterations=counts["iterations"], attempts=counts["attempts"], profile_id=counts["profile_id"], replay=replay)
 
         try:
             selection = dispatch.Select(allowed if isinstance(allowed, ToolSelectionRequest)
@@ -308,10 +312,11 @@ class Runtime:
                     counts["iterations"] += 1
                     for key, value in reply.usage.items():
                         usage[key] = usage.get(key, 0) + value
-                    if not reply.calls:
-                        return finish("completed", final=reply.content)
                     safe_calls = tuple(replace(call, args={}) if call.argument_error else call for call in reply.calls)
-                    message = Message("assistant", reply.content or "", safe_calls)
+                    profile = self._profiles[route[active]]
+                    message = self._adapters[profile.adapter_id].BuildMessage(replace(reply, calls=safe_calls), profile)
+                    if not reply.calls:
+                        return finish("completed", final=reply.content, replay=message.replay)
                     if persistent:
                         with mgr.Scope('journal.tool_calls', input=lambda: Wire(ModelRequest((message,)))):
                             self._journal.AppendToolCalls(scope, message)

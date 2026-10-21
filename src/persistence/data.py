@@ -33,6 +33,12 @@ def Read(db, table, query, *, detail=False):
     permitted = set(primary) if detail else {"limit", "offset", "sort", "direction", "column", "op", "value"}
     if query.keys() - permitted or any(not isinstance(v, str) or len(v) > 4096 for v in query.values()):
         raise DomainError("INVALID_REQUEST", "Invalid table query")
+    # Project hidden protocol state before filtering, sorting, measuring or clipping.
+    # A projected subquery also prevents filter/count side channels over replay.
+    source = f'"{table}"'
+    if table == "messages":
+        projected = ["json_remove(payload, '$.replay') AS payload" if c["name"] == "payload" else f'"{c["name"]}"' for c in columns]
+        source = '(SELECT ' + ','.join(projected) + ' FROM messages)'
     conditions, parameters = [], []
     if detail:
         if set(query) != set(primary):
@@ -67,9 +73,9 @@ def Read(db, table, query, *, detail=False):
                            f'ELSE "{name}" END AS "{name}"', f'length("{name}") AS "__len_{name}"'))
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     order = f'"{sort}" {direction}' + ''.join(f',"{key}" {direction}' for key in primary if key != sort)
-    total = db.execute(f'SELECT count(*) FROM "{table}"{where}', parameters).fetchone()[0]
+    total = db.execute(f'SELECT count(*) FROM {source}{where}', parameters).fetchone()[0]
     rows = []
-    for row in db.execute(f'SELECT {",".join(selections)} FROM "{table}"{where} ORDER BY {order} LIMIT ? OFFSET ?',
+    for row in db.execute(f'SELECT {",".join(selections)} FROM {source}{where} ORDER BY {order} LIMIT ? OFFSET ?',
                           (*parameters, limit, offset)):
         values, truncated, blobs = {}, [], []
         remaining = cap

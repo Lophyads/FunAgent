@@ -23,7 +23,8 @@ def Preflight(settings):
 
 class SingleModel:
     def __init__(self, settings):
-        from src.model.openai_chat import OpenAIChatAdapter, OpenAIProvider
+        from src.model.openai_chat import OpenAIChatAdapter
+        from src.model.openai_provider import OpenAIProvider
         self.settings, self.adapter = settings, OpenAIChatAdapter
         self.profile = ModelProfile("eval", "eval", "openai_chat", settings["model"], settings.get("timeout", 30))
         self.provider = OpenAIProvider(settings)

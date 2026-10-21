@@ -16,6 +16,8 @@ class ModelProfile:
     fallback_profiles: tuple[str, ...] = ()
     streaming: bool = False
     task: str = 'chat'
+    replay_scope: str = field(default='', kw_only=True, repr=False)
+    reasoning_effort: str | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         object.__setattr__(self, "fallback_profiles", tuple(self.fallback_profiles))

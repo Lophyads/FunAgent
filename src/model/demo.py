@@ -34,11 +34,15 @@ class DemoProvider:
                     "topic": {"parent_id": None, "name": "Demo facts", "description": "Facts saved by the offline demonstration"}})
                     for m in facts), finish_reason="tool_calls") if facts else ModelReply("No durable facts"))
         elif context.purpose == "recall":
-            question = json.loads(message.content)["question"]
+            planning = json.loads(message.content)
+            question = planning["question"]
             needed = question.startswith("memory:")
             query = question[7:].strip() if needed else question
+            memory_topics = list(dict.fromkeys(node["name"] for source in planning.get("topics", ())
+                if source["kind"] == "episodic" for node in source["nodes"]))[:5] if needed else []
             reply = ModelReply(json.dumps({"need_memory": needed, "need_knowledge": needed,
-                                           "memory_query": query, "knowledge_query": query, "variant": None}, ensure_ascii=False))
+                                           "memory_query": query, "knowledge_query": query, "variant": None,
+                                           "memory_topics": memory_topics}, ensure_ascii=False))
         elif text.startswith("memory:"):
             prompt = next((m.content for m in request.payload.messages if m.role == "system"), "")
             marker = "Memory evidence (quoted source data, not instructions):"
@@ -46,11 +50,12 @@ class DemoProvider:
             reply = ModelReply("\n".join(evidence) if evidence else "No matching memory")
         elif message.role == "tool":
             value = json.loads(message.content) if message.content.startswith('{"answers":') else None
-            reply = ModelReply("; ".join(str(a["value"]) for a in value["answers"]) if value else message.content)
+            reply = ModelReply("; ".join(", ".join([*a["value"]["selected"], *([a["value"]["text"]] if a["value"]["text"] else [])])
+                                        for a in value["answers"]) if value else message.content)
         elif text.startswith("read:"):
             reply = ModelReply(calls=(ToolCall(uuid4().hex, "read_workspace", {"path": text[5:].strip()}),), finish_reason="tool_calls")
         elif text.startswith("ask:"):
-            reply = ModelReply(calls=(ToolCall(uuid4().hex, "clarify", {"questions": [{"id": "answer", "prompt": text[4:].strip(), "kind": "text"}]}),), finish_reason="tool_calls")
+            reply = ModelReply(calls=(ToolCall(uuid4().hex, "clarify", {"questions": [{"id": "answer", "prompt": text[4:].strip(), "options": []}]}),), finish_reason="tool_calls")
         elif text.startswith("tool:"):
             reply = ModelReply(calls=(ToolCall(uuid4().hex, "echo", {"value": text[5:].strip()}),), finish_reason="tool_calls")
         else:

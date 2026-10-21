@@ -66,6 +66,17 @@ class ToolDefinition:
 
 
 @dataclass(frozen=True)
+class ModelReplay:
+    version: int
+    format: str
+    scope: str
+    items: tuple = field(repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "items", freeze(self.items))
+
+
+@dataclass(frozen=True)
 class Message:
     role: str
     content: str = ""
@@ -75,6 +86,7 @@ class Message:
     effect: str | None = None
     message_id: int = 0
     task_id: str | None = None
+    replay: ModelReplay | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "calls", tuple(self.calls))
@@ -92,6 +104,7 @@ class ModelReply:
     calls: tuple[ToolCall, ...] = ()
     finish_reason: str = "stop"
     usage: Mapping[str, int] = field(default_factory=dict)
+    replay: ModelReplay | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "calls", tuple(self.calls))
@@ -149,6 +162,7 @@ class RunResult:
     iterations: int = 0
     attempts: int = 0
     profile_id: str | None = None
+    replay: ModelReplay | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "tool_results", tuple(self.tool_results))
