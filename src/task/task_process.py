@@ -79,7 +79,8 @@ class TaskProcess:
                         committed = store.FinishTurn(task_id, failure)
                         mgr.Complete(status=committed.status, output=lambda: TaskOutput(committed))
             mgr.Complete(status=committed.status, output=lambda: TaskOutput(committed))
-        mgr.EndTask(status=committed.status, output=lambda: TaskOutput(committed))
+        mgr.EndTask(status=committed.status, output=lambda: TaskOutput(committed),
+                    **(context.execution_budget.Snapshot() if context.execution_budget is not None else {}))
         try:
             Emit(context, 'phase_finished', {'phase': 'finalize_turn'})
             EventMgr.GetInstance().Publish(RunEvent(task_id, context.run_id, kind='task_committed',

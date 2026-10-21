@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 from ...frame.contracts import ControlError, DomainError, RunContext, thaw
 from ..contracts import Availability, BackendResult, RemoteToolSpec, ToolDecision
 from ...frame.tool_validator import ToolValidator
-from .diagnostics import SDKDiagnostics
+from .diagnostics import SDKDiagnostics, ErrorFields
+from ...observability.observation_mgr import ObservationMgr
 
 
 class MCPBackend:
@@ -74,6 +75,7 @@ class MCPBackend:
         self._active, self._closing, self._closed = 0, False, False
         self._ready = Event()
         self._failure = None
+        self._failure_fields = {}
         self._tasks = set()
         self._specs = {}
         self._diagnostics = SDKDiagnostics()
@@ -90,7 +92,8 @@ class MCPBackend:
     def _run(self):
         try:
             asyncio.run(self._serve())
-        except BaseException:
+        except BaseException as error:
+            self._failure_fields = ErrorFields(error)
             self._failure = "MCP_CONNECTION"
         finally:
             self._ready.set()
@@ -138,6 +141,19 @@ class MCPBackend:
             done.set()
 
     def _call(self, method, args, context):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('tool.mcp.request', transport=self._transport, method=method):
+            try:
+                result = self._call_io(method, args, context)
+                tool_error = getattr(result, 'isError', False) is True
+                mgr.Complete(status='error' if tool_error else 'ok',
+                             **({'error_code': 'MCP_TOOL_ERROR'} if tool_error else {}))
+                return result
+            except BaseException as error:
+                mgr.Update(**dict(ErrorFields(error), **self._failure_fields))
+                raise
+
+    def _call_io(self, method, args, context):
         context.CheckCancelled()
         with self._condition:
             if self._closing or self._failure or not self._thread.is_alive():
@@ -162,7 +178,8 @@ class MCPBackend:
                         raise DomainError("MCP_TIMEOUT", "MCP request timed out") from None
         except (ControlError, DomainError):
             raise
-        except Exception:
+        except Exception as error:
+            ObservationMgr.GetInstance().Update(**ErrorFields(error))
             context.CheckCancelled()
             raise DomainError("MCP_PROTOCOL", "MCP protocol request failed") from None
         finally:

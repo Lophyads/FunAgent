@@ -91,7 +91,11 @@ class InteractionMgr:
                        approval=dict(call_id=binding.call_id, tool_name=binding.tool_name,
                                      arguments_digest=binding.arguments_digest) if binding else None)):
             try:
-                answer = self._wait(kind, prompt, context, binding=binding, questions=questions)
+                try:
+                    answer = self._wait(kind, prompt, context, binding=binding, questions=questions)
+                finally:
+                    if context.execution_budget is not None:
+                        mgr.Update(execution_remaining_ms=context.execution_budget.Remaining() * 1000)
             except DomainError as error:
                 status = ('expired' if error.code == 'INTERACTION_EXPIRED' else 'cancelled' if error.code == 'CANCELLED'
                           else 'timeout' if error.code == 'DEADLINE' else 'failed')
@@ -117,32 +121,33 @@ class InteractionMgr:
             raise DomainError("INVALID_REQUEST", "Invalid approval binding")
         context.CheckCancelled()
         deadline = time.monotonic() + self._timeout
-        if context.deadline is not None:
-            deadline = min(deadline, context.deadline)
         request = Interaction(uuid4().hex, context.task_id, context.run_id, kind, prompt, deadline, binding, questions)
         waiter = _Waiter(request, context)
-        with self._lock:
-            if self._closed:
-                raise DomainError("NOT_READY", "Interactions closed")
-            context.CheckCancelled()
-            if any(w.request.task_id == context.task_id for w in self._pending.values()):
-                raise DomainError("INTERACTION_PENDING", "Task already has a human request")
-            mgr.Update(interaction_id=request.interaction_id, expires_at=deadline,
-                       **({'call_id': binding.call_id} if binding else {}))
-            mgr.Bind(('interaction', request.interaction_id))
-            self._pending[request.interaction_id] = waiter
-        Emit(context, 'interaction_pending', {'interaction_id': request.interaction_id, 'kind': kind})
-        try:
-            while not waiter.event.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
-                with self._lock:
-                    self._expire(request.interaction_id, waiter)
-            if waiter.error is not None:
-                raise waiter.error
-            context.CheckCancelled()
-            return waiter.answer
-        finally:
+        with ExitStack() as waiting:
             with self._lock:
-                self._pending.pop(request.interaction_id, None)
+                if self._closed:
+                    raise DomainError("NOT_READY", "Interactions closed")
+                context.CheckCancelled()
+                if any(w.request.task_id == context.task_id for w in self._pending.values()):
+                    raise DomainError("INTERACTION_PENDING", "Task already has a human request")
+                mgr.Update(interaction_id=request.interaction_id, expires_at=deadline,
+                           **({'call_id': binding.call_id} if binding else {}))
+                mgr.Bind(('interaction', request.interaction_id))
+                if context.execution_budget is not None:
+                    waiting.enter_context(context.execution_budget.Pause())
+                self._pending[request.interaction_id] = waiter
+            try:
+                Emit(context, 'interaction_pending', {'interaction_id': request.interaction_id, 'kind': kind})
+                while not waiter.event.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
+                    with self._lock:
+                        self._expire(request.interaction_id, waiter)
+                if waiter.error is not None:
+                    raise waiter.error
+            finally:
+                with self._lock:
+                    self._pending.pop(request.interaction_id, None)
+        context.CheckCancelled()
+        return waiter.answer
 
     def Pending(self, task_id):
         with self._lock:

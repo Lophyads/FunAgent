@@ -2,7 +2,6 @@
 import base64
 from dataclasses import replace
 import json
-import time
 
 from ..frame.contracts import DomainError
 
@@ -34,7 +33,7 @@ def ReadDirectory(reader, snapshot, query, context, *, topic_id=None, unclassifi
             raise DomainError("INVALID_REQUEST", "Directory cursor does not match this query") from None
     records, scanned, visited = [], 0, set()
     while scanned < SCAN_LIMIT:
-        if context.deadline is not None and time.monotonic() >= context.deadline:
+        if context.Remaining() <= 0:
             break
         context.CheckCancelled()
         page = reader.List(replace(query, limit=PAGE_SIZE, cursor=entry), context)
@@ -48,7 +47,7 @@ def ReadDirectory(reader, snapshot, query, context, *, topic_id=None, unclassifi
                     and (not unclassified or assigned is None)):
                 records.append(record)
             offset = index + 1
-            if len(records) >= query.limit or scanned >= SCAN_LIMIT or (context.deadline is not None and time.monotonic() >= context.deadline):
+            if len(records) >= query.limit or scanned >= SCAN_LIMIT or context.Remaining() <= 0:
                 if offset < len(page.items):
                     return records, _encode(scope, entry, offset)
                 return records, _encode(scope, page.next_cursor, 0) if page.next_cursor is not None else None

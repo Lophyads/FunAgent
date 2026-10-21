@@ -1,8 +1,9 @@
-"""Small immutable values shared by configuration, runtime, and tools."""
+"""Shared values and cooperative execution controls for runtime and tools."""
 from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from threading import Event
+from math import isfinite
+from threading import Event, Lock
 from types import MappingProxyType
 import time
 
@@ -120,6 +121,58 @@ class RunInput:
         object.__setattr__(self, "messages", tuple(self.messages))
 
 
+class ExecutionBudget:
+    """Shared active-time budget; only task-bound human waits may pause it."""
+
+    def __init__(self, timeout):
+        if type(timeout) not in {int, float} or not isfinite(timeout) or timeout <= 0:
+            raise DomainError("INVALID_REQUEST", "Execution timeout must be positive")
+        self._timeout = timeout
+        self._started = time.monotonic()
+        self._lock = Lock()
+        self._paused_at = None
+        self._pause_depth = 0
+        self._human_wait = 0.0
+
+    def _times(self, now):
+        waiting = self._human_wait
+        if self._paused_at is not None:
+            waiting += max(0.0, now - self._paused_at)
+        elapsed = max(0.0, now - self._started - waiting)
+        return elapsed, waiting
+
+    def Remaining(self):
+        with self._lock:
+            elapsed, _ = self._times(time.monotonic())
+            return max(0.0, self._timeout - elapsed)
+
+    @contextmanager
+    def Pause(self):
+        with self._lock:
+            now = time.monotonic()
+            elapsed, _ = self._times(now)
+            if elapsed >= self._timeout:
+                raise ControlError("DEADLINE")
+            if self._pause_depth == 0:
+                self._paused_at = now
+            self._pause_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._pause_depth -= 1
+                if self._pause_depth == 0:
+                    self._human_wait += max(0.0, time.monotonic() - self._paused_at)
+                    self._paused_at = None
+
+    def Snapshot(self):
+        with self._lock:
+            elapsed, waiting = self._times(time.monotonic())
+            return dict(execution_duration_ms=elapsed * 1000,
+                        human_wait_duration_ms=waiting * 1000,
+                        execution_remaining_ms=max(0.0, self._timeout - elapsed) * 1000)
+
+
 @dataclass(frozen=True)
 class RunContext:
     run_id: str = ""
@@ -133,9 +186,10 @@ class RunContext:
     session_id: str = ""
     review_evidence: tuple[str, ...] = ()
     memory_evidence: tuple[str, ...] = ()
+    execution_budget: ExecutionBudget | None = field(default=None, repr=False, compare=False, kw_only=True)
 
     def __post_init__(self):
-        # The Event is intentionally shared for cooperative parent cancellation;
+        # The Event and execution budget are shared across child contexts;
         # permission/evidence collections are copied at this trusted boundary.
         object.__setattr__(self, "access", frozenset(self.access))
         object.__setattr__(self, "review_evidence", tuple(self.review_evidence))
@@ -144,11 +198,12 @@ class RunContext:
     def CheckCancelled(self):
         if self.cancel.is_set():
             raise ControlError("CANCELLED")
-        if self.deadline is not None and time.monotonic() >= self.deadline:
+        if self.Remaining() <= 0:
             raise ControlError("DEADLINE")
 
     def Remaining(self):
-        return float("inf") if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+        local = float("inf") if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+        return min(local, self.execution_budget.Remaining()) if self.execution_budget is not None else local
 
 
 @dataclass(frozen=True)

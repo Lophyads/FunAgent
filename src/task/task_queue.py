@@ -4,7 +4,7 @@ from dataclasses import replace
 from threading import Condition, Thread
 from uuid import uuid4
 import time
-from ..frame.contracts import CancelResult, DomainError, RunContext, RunResult, PageQuery
+from ..frame.contracts import CancelResult, DomainError, ExecutionBudget, RunContext, RunResult, PageQuery
 from ..persistence.db_mgr import DbMgr
 from ..persistence.protocols import TaskStore
 from ..frame.interaction_mgr import InteractionMgr
@@ -136,7 +136,7 @@ class TaskQueue:
                 task_id = self._queue.popleft()
                 context = self._contexts[task_id]
                 timeout = self._timeout
-                context = replace(context, deadline=time.monotonic() + timeout)
+                context = replace(context, execution_budget=ExecutionBudget(timeout))
                 self._running = task_id
             committed = False
             mgr = ObservationMgr.GetInstance()

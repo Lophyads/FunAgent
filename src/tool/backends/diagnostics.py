@@ -1,8 +1,38 @@
 """SDK diagnostics never forward remote payloads or exception wire data."""
 import logging
+import re
 from threading import Lock
 
 _lock, _users, _previous = Lock(), 0, {}
+
+
+def ErrorFields(error):
+    """Only bounded identifiers/statuses, never exception text, bodies or URLs."""
+    import httpx
+
+    fields = {}
+    pending, seen = [error], set()
+    while pending and len(seen) < 16:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            fields['http_status'] = current.response.status_code
+        if isinstance(current, httpx.HTTPError):
+            fields.setdefault('exception_type', type(current).__name__)
+        # MCP JSON-RPC errors use numeric codes, unlike local DomainError codes.
+        code = getattr(getattr(current, 'error', None), 'code', None)
+        if type(code) is int:
+            fields.setdefault('remote_code', code)
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+        pending.extend(list(getattr(current, 'exceptions', ()))[:16])
+    name = type(error).__name__
+    if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', name):
+        fields.setdefault('exception_type', name)
+    return fields
 
 
 class _SafeDiagnostic(logging.Handler):

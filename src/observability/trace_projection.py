@@ -96,5 +96,7 @@ def Summary(root, orphan_nodes=()):
         known += total
         if node['kind'] == 'generation' and node.get('purpose', 'main') == 'main':
             main += total
+    budget = {key: root[key] for key in ('execution_duration_ms', 'human_wait_duration_ms', 'execution_remaining_ms')
+              if root and key in root}
     return dict(known_total_tokens=known, main_model_tokens=main, unknown_usage_calls=unknown,
-                duration_ms=root.get('duration_ms') if root else None, waits=waits, rerank=rerank)
+                duration_ms=root.get('duration_ms') if root else None, waits=waits, rerank=rerank, **budget)

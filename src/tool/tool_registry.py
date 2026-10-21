@@ -166,13 +166,19 @@ class ToolRegistry:
         if call.name not in self._registry:
             return ToolResult(call.call_id, "invalid", "Unknown tool")
         if self._closed:
+            ObservationMgr.GetInstance().Update(denial_reason='registry_closed')
             return ToolResult(call.call_id, "denied", "Tool registry closed")
         selection = allowed_names if isinstance(allowed_names, ToolSelection) else self.Select(allowed_names, context)
         if (selection.registry_id != self._registry_id or call.name not in selection.allowed_names
                 or selection.definitions != tuple(self._definition(name, context) for name in selection.allowed_names
                                                   if name in self._registry)
-                or call.name not in self._requested(selection.request)
-                or not self._available(call.name, context)):
+                or call.name not in self._requested(selection.request)):
+            ObservationMgr.GetInstance().Update(denial_reason='selection_mismatch')
+            return ToolResult(call.call_id, "denied", "Tool not allowed")
+        if not self._available(call.name, context):
+            reason = ('access_denied' if not self._entries[call.name].access <= context.access
+                      else 'tool_unavailable')
+            ObservationMgr.GetInstance().Update(denial_reason=reason)
             return ToolResult(call.call_id, "denied", "Tool not allowed")
         _, _, validator = self._registry[call.name]
         if call.argument_error and not call.args:
@@ -181,6 +187,7 @@ class ToolRegistry:
         # mutations have the same authority result even when schema is bypassed.
         decision = Decide(self._entries[call.name], call, context, call.name in self._approval_names)
         if decision.outcome == "deny":
+            ObservationMgr.GetInstance().Update(denial_reason='operation_denied')
             return ToolResult(call.call_id, "denied", "Operation not allowed")
         if call.argument_error:
             return ToolResult(call.call_id, "invalid", '{"error":"invalid_arguments"}')

@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from ...frame.contracts import ControlError, DomainError, RunContext
 from ..contracts import Availability, BackendResult
 from .managed import ManagedBackend
+from ...observability.observation_mgr import ObservationMgr
 
 
 MCP_ENDPOINT = "https://treg.to/mcp/"
@@ -93,11 +94,13 @@ class TregWebBackend(ManagedBackend):
                 encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
                 if len(encoded.encode("utf8")) > self._max_bytes:
                     raise DomainError("NETWORK_LIMIT", "Treg output exceeds byte limit")
-                return BackendResult("ok", encoded)
+                status = "error" if operation == "web_extract" and not data["pages"] else "ok"
+                return BackendResult(status, encoded)
         except ControlError:
             context.CheckCancelled()
             return BackendResult("error", '{"code":"NETWORK_TIMEOUT"}')
         except DomainError as error:
+            ObservationMgr.GetInstance().Update(error_code=error.code)
             status = "denied" if error.code in {"NETWORK_DENIED", "TREG_COST_POLICY", "NOT_READY"} else "error"
             return BackendResult(status, json.dumps({"code": error.code}))
         except Exception:
@@ -105,6 +108,16 @@ class TregWebBackend(ManagedBackend):
             return BackendResult("error", '{"code":"NETWORK_PROTOCOL"}')
 
     def _request(self, name, args, context):
+        mgr = ObservationMgr.GetInstance()
+        with mgr.Scope('tool.treg.request', method=name, endpoint_id=args['endpoint_id']):
+            data = self._request_data(name, args, context)
+            status = data.get('status')
+            if type(status) is int:
+                mgr.Update(upstream_http_status=status)
+            mgr.Complete(status='ok')
+            return data
+
+    def _request_data(self, name, args, context):
         result = self._mcp.Execute(name, args, context)
         context.CheckCancelled()
         if result.status != "ok":
@@ -112,6 +125,10 @@ class TregWebBackend(ManagedBackend):
                 code = json.loads(result.content).get("code")
             except (ValueError, AttributeError):
                 code = None
+            # Only preserve our known local codes; never copy remote error text.
+            if isinstance(code, str) and code in {'MCP_TIMEOUT', 'MCP_CONNECTION', 'MCP_PROTOCOL',
+                        'MCP_TOOL_ERROR', 'MCP_TOOL_UNAVAILABLE', 'MCP_INTERRUPTED'}:
+                ObservationMgr.GetInstance().Update(cause_code=code)
             raise DomainError("NETWORK_TIMEOUT" if code == "MCP_TIMEOUT" else "TREG_PROTOCOL",
                               "Treg protocol request failed")
         if len(result.content.encode("utf8")) > self._max_bytes:
@@ -153,6 +170,8 @@ class TregWebBackend(ManagedBackend):
                 or str(receipt.get("served_via", "")).startswith("overflow:")):
             raise DomainError("TREG_COST_POLICY", "Treg reported a non-free or relayed call")
         status = receipt.get("status")
+        if type(status) is int:
+            ObservationMgr.GetInstance().Update(upstream_http_status=status)
         if type(status) is not int:
             raise DomainError("TREG_PROTOCOL", "Missing treg upstream status")
         if not 200 <= status < 300:
@@ -210,21 +229,41 @@ class TregWebBackend(ManagedBackend):
         results, errors = body.get("results"), body.get("errors", [])
         if not isinstance(results, list) or not isinstance(errors, list):
             raise DomainError("TREG_PROTOCOL", "Invalid fetch results")
-        if errors:
-            raise DomainError("NETWORK_SOURCE", "Provider could not fetch every requested page")
-        by_url = {}
+        by_url, failures = {}, {}
+        for error in errors:
+            if not isinstance(error, dict) or not isinstance(error.get("url"), str) or error["url"] not in urls:
+                continue
+            code = error.get("error")
+            failure = {"url": error["url"], "code": code[:128] if isinstance(code, str) and code else "NETWORK_SOURCE"}
+            status = error.get("status")
+            if type(status) is int and 100 <= status <= 599:
+                failure["http_status"] = status
+            failures[error["url"]] = failure
         for row in results:
-            if (not isinstance(row, dict) or not isinstance(row.get("url"), str)
-                    or row["url"] not in urls or row["url"] in by_url
-                    or not isinstance(row.get("text"), str) or not row["text"].strip()):
-                raise DomainError("TREG_PROTOCOL", "Invalid fetched page")
-            by_url[row["url"]] = row
-        if set(by_url) != set(urls):
-            raise DomainError("TREG_PROTOCOL", "Provider omitted requested pages")
-        pages = []
+            # Unattributable rows cannot supply evidence for a requested URL.
+            if not isinstance(row, dict) or not isinstance(row.get("url"), str) or row["url"] not in urls:
+                continue
+            by_url.setdefault(row["url"], []).append(row)
+        pages, errors = [], []
         for url in urls:
-            row = by_url[url]
-            pages.append({"url": self._url(row.get("final_url") or url), "text": row["text"][:maximum],
-                          "truncated": len(row["text"]) > maximum,
-                          "artifact": self._artifact("tinyfish.web.fetch", row)})
-        return {"pages": pages}
+            rows = by_url.get(url, [])
+            if not rows:
+                errors.append(failures.get(url, {"url": url, "code": "MISSING_RESULT"}))
+                continue
+            row = rows[0]
+            if (len(rows) != 1 or not isinstance(row.get("text"), str) or not row["text"].strip()
+                    or row.get("final_url") is not None and not isinstance(row["final_url"], str)):
+                errors.append(failures.get(url, {"url": url, "code": "TREG_PROTOCOL"}))
+                continue
+            final_url = self._url(row.get("final_url") or url)
+            try:
+                artifact = self._artifact("tinyfish.web.fetch", row)
+            except (ValueError, TypeError):
+                errors.append({"url": url, "code": "TREG_PROTOCOL"})
+                continue
+            pages.append({"url": final_url, "text": row["text"][:maximum],
+                          "truncated": len(row["text"]) > maximum, "artifact": artifact})
+        data = {"pages": pages, "errors": errors, "partial": bool(pages and errors)}
+        if not pages:
+            data["code"] = "NETWORK_SOURCE"
+        return data
