@@ -63,7 +63,6 @@ FunAgent 将用户输入作为可查询、可取消的任务处理。CLI 和 Web
 
 ![FunAgent 系统架构：接入、应用编排、执行与领域、驱动与存储，以及跨层共享服务](docs/architecture.svg)
 
-架构图使用本地 Excalidraw 绘制，提供[可编辑源文件](docs/architecture.excalidraw)。实线表示主要调用或资源访问，虚线表示跨层支撑；仅展示主要关系，具体执行顺序见下方时序图。`src/app/application.py` 负责构造各域实现、绑定服务，并交给 `Lifecycle` 管理启动与关闭。
 
 ### 架构层次与源码入口
 
@@ -265,7 +264,7 @@ sequenceDiagram
             Scheduler->>Review: 独立 worker 执行固定历史范围
             Review->>DB: 读取上次水位、新历史与只读锚点
             DB-->>Review: expected 水位与已提交消息
-            Review->>Memory: 读取授权来源原文、墓碑、类型与主题
+            Review->>Memory: 读取授权来源现存原文、类型与主题
             Memory-->>Review: 事实原文、删除标记与主题目录
             Review->>Runtime: Run(复盘策略, 临时上下文)
             opt 有值得保存的新事实
@@ -499,7 +498,7 @@ enabled = false
 | `profile` | 首次准备会话提示词时加载画像，并随提示词冻结 |
 | `recall` | 调用指定模型生成召回计划，不调用工具 |
 | `facts` / `knowledge` | 分别检索事实 / 知识，控制来源、候选量、结果量、字符预算和超时 |
-| `rerank` | 可选的候选评分，引用 `task = "rerank"`、`adapter_id = "tei_rerank"` 的 profile |
+| `rerank` | 可选的候选评分，引用 `task = "rerank"` 的 profile；支持 `tei_rerank` 和本机 LM Studio 的 `qwen3_rerank` |
 | `review` | 成功对话达到轮次阈值后后台复盘，目标须为已启用的 facts 来源并具备所需能力 |
 
 启用复盘还需配置复盘模型 profile，并在 `purposes.review` 开放 `memory` 工具。主题目录默认为配置目录下的 `.funagent/memory-topics.json`。所有已声明的来源都会在启动时构造，停用召回策略不会移除对应来源及其依赖。
@@ -529,7 +528,7 @@ extras 可以组合，例如 `uv run --locked --extra openai --extra mcp funagen
 | 入口 | 行为与前置条件 |
 | --- | --- |
 | `uv run --locked funagent --conf-dir <配置目录>` | 按指定配置运行，按所选驱动补充 `--extra` |
-| `bash start.sh` | 安装 `openai/mcp/supabase/embedding/cognee` extras 后启动；不负责启动 Cognee，WSL 下使用宿主机 `uv.exe` |
+| `bash start.sh` | 安装模型、SIWC、记忆、Ragas、重排与 Web extras 后启动；不负责启动 Cognee，WSL 下使用宿主机 `uv.exe` |
 | `.\start.cmd` | 先通过 `ensure-cognee.ps1` 检查、启动并登录 Cognee，再以相同 extras 启动；前置步骤失败则终止 |
 
 `start.cmd` 检查 `127.0.0.1:8000/health`，必要时通过 `evals/services/cognee.compose.yml` 启动 Docker 服务，并将令牌写入 `.funagent/cognee-session.env`。Compose 还依赖宿主机 `1234` 端口的模型与 Embedding 服务；即使传入 `--check-config`，此脚本仍会先执行 Cognee 前置步骤。
@@ -608,5 +607,3 @@ uv run --locked --extra dev python -m pytest evals/tests/test_online_eval.py
 | 工具或记忆不可见 | 检查 purposes、toolsets、session_access、后端和记忆策略；CLI 可运行 `tools doctor`、`connections`、`memory check` |
 | 没有自动生成长期记忆 | 检查 review 开关、轮次阈值、目标 facts 来源、复盘模型及 memory 工具；普通历史持久化不会自动写入长期记忆 |
 | `7777` 端口占用 | 修改所用 `serv.conf` 的 `port` 后重启 |
-
-文档核对日期：2026-10-17。最小配置已在 Python 3.12 下验证 Web / CLI 启动、上述四类 Demo 输入与重启后的持久数据读取；本地记忆示例已验证配置校验和启动。外部模型和远程服务需在对应环境中验证。
